@@ -17,7 +17,13 @@ export type {
   QueryDomMethods,
   QueryDomResult,
 } from "@kitesurf/jsrpc-types/query-dom";
-import type { QueryDomArgs, QueryDomMethod, QueryDomResult } from "@kitesurf/jsrpc-types/query-dom";
+import type {
+  AccessibilityBudgetError,
+  QueryDomArgs,
+  QueryDomMethod,
+  QueryDomResult,
+  ReadStamp,
+} from "@kitesurf/jsrpc-types/query-dom";
 
 export type QueryDomCarrier = Pick<PageScriptSession, "queryDom">;
 
@@ -32,6 +38,8 @@ export function stubQueryDom<M extends QueryDomMethod>(
 // Matches the PageScript RPC call budget; the cap is far above any page the isolate can hold.
 const OUTER_HTML_READ_DEADLINE_MS = 60_000;
 const MAX_OUTER_HTML_BYTES = 512 * 1024 * 1024;
+const ACCESSIBILITY_READ_DEADLINE_MS = 60_000;
+const MAX_ACCESSIBILITY_BYTES = 512 * 1024 * 1024;
 
 type OuterHtmlRequest = (
   args: Pick<QueryDomArgs<"getOuterHTML">, "snapshot">,
@@ -119,6 +127,75 @@ async function readEscapedStream(
   return { escaped, filled };
 }
 
+export type AccessibilityTreeRequest = (
+  buffered: boolean,
+) => Promise<QueryDomResult<"accessibilityTree">>;
+
+export type AccessibilityTreeReply =
+  | { budgetError: AccessibilityBudgetError }
+  | { result: RawJsonResult; readStamp?: ReadStamp };
+
+// A short read keeps no text, so a retry does not hold the discarded pieces.
+type AccessibilityTreeRead =
+  | { complete: true; pieces: string[] }
+  | { complete: false; filled: number; byteLength: number };
+
+export async function accessibilityTreeResponse(
+  request: AccessibilityTreeRequest,
+  method: string,
+): Promise<AccessibilityTreeReply> {
+  const live = await request(false);
+  if ("budgetError" in live) return live;
+  const first = await readAccessibilityTree(live);
+  if (first.complete) return { result: new RawJsonResult(first.pieces), readStamp: live.readStamp };
+
+  // A stream built as the caller pulls can tear if the page mutates; a buffered read cannot.
+  const buffered = await request(true);
+  if ("budgetError" in buffered) return buffered;
+  const retry = await readAccessibilityTree(buffered);
+  if (retry.complete) {
+    return { result: new RawJsonResult(retry.pieces), readStamp: buffered.readStamp };
+  }
+  throw new Error(
+    `${method}: PageScript stream ended after ${retry.filled} of ${retry.byteLength} bytes`,
+  );
+}
+
+async function readAccessibilityTree(
+  result: Extract<QueryDomResult<"accessibilityTree">, { byteLength: number }>,
+): Promise<AccessibilityTreeRead> {
+  const { byteLength } = result;
+  if (!Number.isSafeInteger(byteLength) || byteLength < 0 || byteLength > MAX_ACCESSIBILITY_BYTES) {
+    await result.json.cancel("invalid byteLength").catch(() => {});
+    throw new Error(`Accessibility: PageScript sent an invalid byteLength ${byteLength}`);
+  }
+  const decoder = new TextDecoder("utf-8", { ignoreBOM: true, fatal: true });
+  const pieces: string[] = [];
+  const reader = withDeadline(result.json, ACCESSIBILITY_READ_DEADLINE_MS).getReader();
+  let filled = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.byteLength > byteLength - filled) {
+        throw new Error(`Accessibility: PageScript sent more than ${byteLength} bytes`);
+      }
+      filled += value.byteLength;
+      const piece = decoder.decode(value, { stream: true });
+      if (piece) pieces.push(piece);
+    }
+  } catch (error) {
+    await reader.cancel(error).catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+  if (filled !== byteLength) return { complete: false, filled, byteLength };
+  const tail = decoder.decode();
+  if (tail) pieces.push(tail);
+  return { complete: true, pieces };
+}
+
 type EnsurePageScriptFn = (
   dctx: DispatchCtx,
   target: TargetState | undefined,
@@ -153,6 +230,17 @@ export type SessionOps = {
 export type SessionSoftOps = {
   readonly [M in QueryDomMethod]: (args: QueryDomArgs<M>) => Promise<QueryDomResult<M> | null>;
 };
+
+const RETIRED = "PageScript generation retired";
+const NO_ISOLATE = "No PageScript isolate for target";
+
+/**
+ * Whether `error` is a read that found no live PageScript generation. `call` throws it where
+ * `tryCall` answers `null`, and a caller that retries on `null` reads this as "no document yet".
+ */
+export function isGoneGeneration(error: unknown): boolean {
+  return error instanceof Error && (error.message === RETIRED || error.message === NO_ISOLATE);
+}
 
 export class PageSession {
   readonly #dctx: DispatchCtx;
@@ -196,7 +284,7 @@ export class PageSession {
     if (this.#pinned) {
       const stub = this.live();
       if (!stub) {
-        if (kind === "call") throw new Error("PageScript generation retired");
+        if (kind === "call") throw new Error(RETIRED);
         return null;
       }
       try {
@@ -218,7 +306,7 @@ export class PageSession {
     }
     const stub = await this.ready();
     if (!stub) {
-      if (kind === "call") throw new Error("No PageScript isolate for target");
+      if (kind === "call") throw new Error(NO_ISOLATE);
       return null;
     }
     if (kind === "call") return stubQueryDom(stub, method, args);
