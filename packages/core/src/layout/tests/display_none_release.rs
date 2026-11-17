@@ -9,7 +9,7 @@ fn assert_released(dom: &DomHandle, id: u32) {
     let node = doc.get_node(dom.resolve_node_id(id).unwrap()).unwrap();
     let element = node.element_data().unwrap();
     assert!(
-        element.layout_data.is_none(),
+        element.layout_data.get().is_none(),
         "hidden descendant keeps box data"
     );
     assert!(
@@ -21,7 +21,7 @@ fn assert_released(dom: &DomHandle, id: u32) {
         "hidden descendant keeps its marker"
     );
     assert_eq!(
-        node.layout_parent.get(),
+        node.layout_parent_id(),
         None,
         "hidden descendant keeps a box parent"
     );
@@ -160,10 +160,42 @@ fn a_shown_row_and_flattened_inline_read_as_boxed_again() {
     for (id, what) in [(r, "row"), (s, "flattened inline")] {
         let node = doc.get_node(dom.resolve_node_id(id).unwrap()).unwrap();
         use ::style::values::specified::box_::{DisplayInside, DisplayOutside};
-        let display = *node.display_constructed_as();
+        let display = node.display_constructed_as();
         assert!(
             !(display.outside() == DisplayOutside::None && display.inside() == DisplayInside::None),
             "the shown {what} still records display:none"
         );
     }
+}
+
+/// A flattened inline that becomes visible must keep the layout parent the collect gave it. The
+/// sweep that cleared dropped links used to run after the collect and took that link away, so
+/// every geometry read on the node answered an empty rect.
+#[test]
+fn a_shown_flattened_inline_keeps_its_layout_parent() {
+    let dom = DomHandle::new(
+        "<!DOCTYPE html><div id=r><span id=x style=\"display:none\">Hello</span></div>",
+        "https://test.example/",
+    );
+    dom.set_viewport(800, 600);
+    dom.resolve_layout();
+    let r = dom.query_selector("#r").unwrap() as u32;
+    let x = dom.query_selector("#x").unwrap() as u32;
+    assert!(dom.set_attribute(x, "style", ""));
+    dom.resolve_layout();
+
+    {
+        let doc = dom.doc.borrow();
+        let node = doc.get_node(dom.resolve_node_id(x).unwrap()).unwrap();
+        assert_eq!(
+            node.layout_parent_id(),
+            Some(dom.resolve_node_id(r).unwrap()),
+            "the shown inline lost its layout parent"
+        );
+    }
+    let rect = dom.test_bounding_rect(x);
+    assert!(
+        rect.2 > 0.0 && rect.3 > 0.0,
+        "the shown inline reports no geometry: {rect:?}"
+    );
 }
