@@ -22,7 +22,7 @@ import type {
   QueryDomArgs,
   ReadStamp,
 } from "@kitesurf/jsrpc-types/query-dom";
-import { ensureTargetDom } from "./dom-release.ts";
+import { ensureTargetDom, releasedFallbackError } from "./dom-release.ts";
 import { subtreeBudgetError } from "./dom-frontend.ts";
 import { assertDomReplyGraph } from "./dom.ts";
 
@@ -165,6 +165,7 @@ function accessibilityTreeFallback(
   const dom = ensureTargetDom(target);
   if (!dom) {
     if (args.method === "root") throw new Error("No document loaded");
+    if (target.fallbackHtmlReleased) throw releasedFallbackError(cdpMethod);
     return { result: new RawJsonResult(['{"nodes":[]}']) };
   }
   const start = dom.accessibilityStream(
