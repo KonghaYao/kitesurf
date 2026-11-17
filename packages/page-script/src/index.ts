@@ -7,6 +7,7 @@
 // returned function becomes a live capability that extends the session.
 
 import { WorkerEntrypoint, RpcTarget, abortIsolate } from "cloudflare:workers";
+import { applyWebStorageChange, flushWebStorage } from "./web-storage.ts";
 import type {
   ArgSpec,
   CallFunctionOnOptions,
@@ -4141,6 +4142,7 @@ export class PageScript extends WorkerEntrypoint implements PageScriptSession {
       registerUpstreamSender((message) => {
         const upstreamPromise = upstream(message);
         if (upstreamPromise && upstreamPromise.catch) upstreamPromise.catch(() => {});
+        return upstreamPromise;
       });
     }
     installWasmTerminatedHandler();
@@ -4171,6 +4173,7 @@ export class PageScript extends WorkerEntrypoint implements PageScriptSession {
 
   async unload(): Promise<UnloadReply> {
     dispatchWindowUnload();
+    await flushWebStorage();
     if (state.dom) {
       try {
         state.dom.free();
@@ -5260,6 +5263,32 @@ export class PageScript extends WorkerEntrypoint implements PageScriptSession {
     method: QueryDomMethod,
     args: Record<string, unknown> | undefined,
   ): Promise<QueryDomResult<QueryDomMethod>> {
+    if (method === "flushWebStorage") {
+      await flushWebStorage();
+      return { ok: true };
+    }
+    if (method === "applyWebStorageChange") {
+      const area = args?.area;
+      const key = args?.key;
+      const value = args?.value;
+      if (
+        (area !== "localStorage" && area !== "sessionStorage") ||
+        (key !== null && typeof key !== "string") ||
+        (value !== null && typeof value !== "string")
+      )
+        throw new Error("Invalid storage change");
+      applyWebStorageChange({
+        area,
+        key,
+        value,
+        sequence: Number(args?.sequence),
+        ack: typeof args?.ack === "number" ? args.ack : null,
+        oldValue: typeof args?.oldValue === "string" ? args.oldValue : null,
+        url: String(args?.url ?? ""),
+        notify: args?.notify === true,
+      });
+      return { ok: true };
+    }
     if (method === "setFrameContext") {
       const parentOrigin = String(args?.parentOrigin ?? "");
       getInternalState().frameContext = { parentOrigin };

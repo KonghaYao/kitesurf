@@ -4,6 +4,12 @@ load("@npm//:defs.bzl", "npm_link_all_packages")
 
 npm_link_all_packages(name = "node_modules")
 
+copy_to_bin(
+    name = "release_licenses",
+    srcs = glob(["LICENSE", "NOTICE", "licenses/**"]),
+    visibility = ["//packages/local-browser:__pkg__"],
+)
+
 exports_files([
     "clippy.toml",
     "package.json",
@@ -72,6 +78,7 @@ _CONFIG_PACKAGES = [
     "packages/engine/test/e2e",
     "packages/jsrpc-types",
     "packages/kitesurf-cli",
+    "packages/local-browser",
     "packages/page-renderer",
     "packages/page-script",
     "packages/script-gate",
@@ -178,6 +185,7 @@ test_suite(
         "//packages/engine:types_e2e_demos",
         "//packages/engine:types_fixtures_worker",
         "//packages/jsrpc-types:types",
+        "//packages/local-browser:profile_test",
         "//packages/page-renderer:build",
         "//packages/page-renderer:types",
         "//packages/page-script:build",

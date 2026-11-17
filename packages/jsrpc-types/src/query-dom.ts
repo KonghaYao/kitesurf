@@ -201,6 +201,14 @@ export interface FormStateSnapshot {
  * Node IDs and object handles expire with that generation; read stamps expose snapshot mutations.
  */
 export interface QueryDomMethods {
+  flushWebStorage: {
+    args: Record<string, never>;
+    result: { ok: true };
+  };
+  applyWebStorageChange: {
+    args: import("./web-storage.ts").WebStorageDelivery;
+    result: { ok: true };
+  };
   getDocument: {
     args: ReadStampArgs;
     result: Partial<Protocol.DOM.GetDocumentResponse> & { readStamp?: ReadStamp };

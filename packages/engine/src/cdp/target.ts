@@ -11,6 +11,7 @@ import type { DispatchCtx } from "./dispatch.ts";
 import { buildFrameResourceTree, buildFrameTree, makeMainFrameState } from "./frames.ts";
 import { retireStub } from "./page-script-generation.ts";
 import { createCookieJar, type CookieJar } from "../cookies.ts";
+import { webStorageFor } from "../state/web-storage.ts";
 import { engineWasmBytes, engineWasmInitialBytes } from "../engine-wasm-probe.ts";
 import { isolateRetainedBodyBytesTotal } from "./network-events.ts";
 import { imageStoreStats } from "../eval/resource-store.ts";
@@ -153,6 +154,7 @@ export async function handleTarget(ctx: DispatchCtx, req: CdpRequest): Promise<u
         }
         await Promise.all(closes);
         ctx.browser.contexts.delete(id);
+        webStorageFor(ctx.connectionId)?.closeContext(cookieKeyFor(ctx.connectionId, id));
         unregisterCookieJar(cookieKeyFor(ctx.connectionId, id));
         clearLearnedScripts(ctx.browser.learnedInsertedScripts, id);
       }
@@ -180,6 +182,7 @@ export async function handleTarget(ctx: DispatchCtx, req: CdpRequest): Promise<u
     }
 
     case "Target.closeTarget": {
+      await ctx.browser.flushProfile?.(req.params!.targetId);
       const existed = await closeTargetInternal(ctx, req.params!.targetId);
       return { success: existed };
     }
@@ -249,6 +252,9 @@ export async function handleTarget(ctx: DispatchCtx, req: CdpRequest): Promise<u
       const sessionId = req.params?.sessionId;
       if (sessionId) {
         for (const t of ctx.browser.targets.values()) {
+          t.debuggerEnabledSessions.delete(sessionId);
+          t.domEnabledSessions.delete(sessionId);
+          t.cssEnabledSessions.delete(sessionId);
           if (t.sessions.delete(sessionId)) {
             ctx.browser.networkEvents.setTargetAttribution(
               t.frameId,
@@ -273,9 +279,11 @@ export async function handleTarget(ctx: DispatchCtx, req: CdpRequest): Promise<u
           }
         }
         ctx.browser.networkEvents.forgetSession(sessionId);
+        ctx.browser.runtimeEnabledSessions.delete(sessionId);
         if (sessionId === ctx.browser.rendererSessionId) {
           ctx.browser.rendererSessionId = null;
         }
+        if (sessionId === ctx.browser.engineSessionId) ctx.browser.engineSessionId = null;
       }
       return {};
     }
@@ -413,6 +421,7 @@ export async function closeTargetInternal(ctx: DispatchCtx, id: string): Promise
   }
   releaseParkedForConnection(ctx.connectionId);
   await Promise.all(retirements);
+  webStorageFor(ctx.connectionId)?.closeTab(id);
   return existed;
 }
 

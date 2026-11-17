@@ -46,6 +46,8 @@ A pnpm monorepo. One line per package; read the code for details.
   `packages/engine/public/rbi/`. The scene protocol is documented in `packages/engine/src/rbi.ts`.
 - `packages/kitesurf-cli/`: the complete Rust terminal client, including Browser Run and OAuth
   through public APIs, with its own Cargo workspace and lockfile.
+- `packages/local-browser/`: local Node/workerd host, SQLite profile, CDP connection ownership
+  and single-executable packaging. The local engine entry is `engine/src/local/index.ts`.
 - `packages/engine/test/fixtures-worker/`: the fixtures Worker that serves `/__fixtures/*` in dev
   and tests only.
 - `scripts/`: development and CI tooling, including the WPT runners, the lint rules and the
@@ -61,7 +63,8 @@ Engine-wide invariants. The owning code carries the detail; keep these in sync w
   boa inside the per-target PageScript isolate, in dev and production, never in the parent Worker.
   The loaded worker never gets a native-eval compatibility flag.
 - The CDP WebSocket bounds the session. Per-connection state lives in `handleWebSocket`'s closure;
-  no Durable Object holds it and nothing persists across connections.
+  no Durable Object holds it. The local host keeps this upstream socket alive across client
+  disconnects and persists cookies/localStorage through its profile service binding.
 - Each `Page.navigate` loads a fresh anonymous PageScript worker with `env.LOADER.load` and kills
   the previous one. Use `load()`, never a named `LOADER.get`.
 - Wasm panics unwind (`packages/core/.cargo/config.toml`, symlinked into `renderer-core`), so the
@@ -211,4 +214,4 @@ Use an explicit `KITESURF_PORT` or `--port` when other engines may be running, a
 - Synchronous XHR. workerd has no way to block the JS thread on network I/O.
 - A fake `crypto.subtle`; Workers provide the real one.
 - WebGL, WebGPU, WebAudio, WebRTC, MediaStream and anti-bot fingerprinting.
-- Persistent storage across navigations or connections, and WebDriver; Kitesurf speaks CDP.
+- IndexedDB/Cache Storage persistence, live-heap snapshots, and WebDriver; Kitesurf speaks CDP.

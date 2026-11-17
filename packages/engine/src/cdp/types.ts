@@ -105,6 +105,7 @@ export type CdpEvent = {
 export type EventEmitter = (event: CdpEvent) => void;
 
 export interface BrowserState {
+  flushProfile?: (targetId?: string) => Promise<void>;
   targets: Map<string, TargetState>;
   sandboxOutbound: SandboxOutboundOverride;
   autoAttach: boolean;

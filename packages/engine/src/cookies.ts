@@ -45,8 +45,17 @@ export interface CookieJar {
   clear(): void;
 }
 
-export function createCookieJar(): CookieJar {
+export function createCookieJar(
+  initial: CookieEntry[] = [],
+  changed: () => void = () => {},
+): CookieJar {
   const byHost = new Map<string, CookieEntry[]>();
+  for (const cookie of initial) {
+    if (cookie.expiresAt !== null && cookie.expiresAt <= Date.now()) continue;
+    const entries = byHost.get(cookie.host) ?? [];
+    entries.push({ ...cookie });
+    byHost.set(cookie.host, entries);
+  }
 
   let warned = false;
   function warnOnce(msg: string): void {
@@ -111,6 +120,7 @@ export function createCookieJar(): CookieJar {
       list.push(entry);
     }
     byHost.set(entry.host, list);
+    changed();
     return entry;
   }
 
@@ -483,11 +493,13 @@ export function createCookieJar(): CookieJar {
         else byHost.set(h, kept);
       }
     }
+    if (removed) changed();
     return removed;
   }
 
   function clear(): void {
     byHost.clear();
+    changed();
   }
 
   return {

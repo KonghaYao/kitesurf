@@ -16,6 +16,7 @@ import type { RenderPort } from "./page-renderer.ts";
 import type { WorkerEventParams, WorkerNavigatorInfo } from "./dedicated-worker.ts";
 import type { SandboxRestrictions } from "./sandbox.ts";
 import type { CommittedOrigin } from "./frame-origin.ts";
+import type { WebStorageChange } from "./web-storage.ts";
 
 export interface ModulePreloadPin {
   url: string;
@@ -326,6 +327,7 @@ export type PageScriptEntrypoint = PageScriptSession & {
 export type PageScriptEntrypointStub = Fetcher<PageScriptEntrypoint>;
 
 export interface UpstreamEvents {
+  "kitesurf.webStorageChanged": WebStorageChange;
   "kitesurf.bindingCalled": { name: string; payload: string };
   "kitesurf.diag": { ev: "start" | "end"; op: string; t: number };
   "kitesurf.formSubmitNavigate": NavigatePost;

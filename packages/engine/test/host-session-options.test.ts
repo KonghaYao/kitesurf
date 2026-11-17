@@ -6,6 +6,8 @@ import { describe, expect, it } from "vitest";
 
 import { resolveConnectionOptions } from "../src/host.ts";
 
+const deadlines = { idleTimeoutMs: 600_000, maxSessionMs: 3_600_000 };
+
 describe("resolveConnectionOptions", () => {
   it("uses generic defaults based on the WebSocket path", () => {
     expect(
@@ -13,13 +15,13 @@ describe("resolveConnectionOptions", () => {
         new Request("https://kitesurf.invalid/devtools/page/kitesurf"),
         "connection-1",
       ),
-    ).toEqual({ entrypoint: "devtools", fontDefer: false });
+    ).toEqual({ ...deadlines, entrypoint: "devtools", fontDefer: false });
     expect(
       resolveConnectionOptions(
         new Request("https://kitesurf.invalid/devtools/browser"),
         "connection-2",
       ),
-    ).toEqual({ entrypoint: "puppeteer", fontDefer: false });
+    ).toEqual({ ...deadlines, entrypoint: "puppeteer", fontDefer: false });
   });
 
   it("ignores internal session headers on the public default host", () => {
@@ -31,6 +33,7 @@ describe("resolveConnectionOptions", () => {
     });
 
     expect(resolveConnectionOptions(request, "connection-3")).toEqual({
+      ...deadlines,
       entrypoint: "puppeteer",
       fontDefer: false,
     });
@@ -49,7 +52,7 @@ describe("resolveConnectionOptions", () => {
           return { entrypoint: "host-action", fontDefer: true };
         },
       }),
-    ).toEqual({ entrypoint: "host-action", fontDefer: true });
+    ).toEqual({ ...deadlines, entrypoint: "host-action", fontDefer: true });
     expect(receivedRequest).toBe(request);
     expect(receivedConnectionId).toBe("connection-4");
   });
@@ -61,6 +64,18 @@ describe("resolveConnectionOptions", () => {
       resolveConnectionOptions(request, "connection-5", {
         connectionOptions: () => ({ fontDefer: true }),
       }),
-    ).toEqual({ entrypoint: "devtools", fontDefer: true });
+    ).toEqual({ ...deadlines, entrypoint: "devtools", fontDefer: true });
+  });
+
+  it("allows a trusted local host to remove session deadlines", () => {
+    const options = resolveConnectionOptions(
+      new Request("http://localhost/devtools/browser"),
+      "local",
+      {
+        connectionOptions: () => ({ idleTimeoutMs: 0, maxSessionMs: 0 }),
+      },
+    );
+    expect(options.idleTimeoutMs).toBe(0);
+    expect(options.maxSessionMs).toBe(0);
   });
 });

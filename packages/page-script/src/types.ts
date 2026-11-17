@@ -133,6 +133,7 @@ export type { BuildDocumentResult } from "./dom-shim.js";
 // The page isolate's globalThis as page-script sees it: dom-shim's view plus the keys only this
 // package touches. A key both packages use belongs in DomShimGlobals (dom-shim global-scope.ts).
 export interface PageScriptGlobals extends DomShimGlobals {
+  StorageEvent?: BuildDocumentResult["StorageEvent"];
   // workerd natives that `typeof globalThis` leaves out.
   TextDecoder: typeof TextDecoder;
   Headers: typeof Headers;

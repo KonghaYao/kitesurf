@@ -1,0 +1,114 @@
+name: Release local browser
+
+on:
+  push:
+    tags: ["v0.5.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  engine:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          bazel-cache: "true"
+          bazelflare: "false"
+      - run: pnpm install --frozen-lockfile
+      - name: Bound memory use on standard runners
+        shell: bash
+        run: |
+          cat >> .bazelrc.user <<'EOF'
+          startup --batch
+          startup --host_jvm_args=-Xmx1536m
+          common --jobs=1
+          common --local_test_jobs=1
+          EOF
+      - name: Check and test the local browser
+        run: |
+          pnpm run check
+          bazel test //packages/local-browser:browser_test //packages/local-browser:engine_loss_test --test_output=errors
+      - name: Stage the portable engine and fonts
+        run: bazel run //packages/local-browser:package -- --portable "$PWD/portable"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: browser-engine
+          path: portable/
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    needs: engine
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-x64
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+          - runner: macos-15
+            platform: darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - run: pnpm install --frozen-lockfile
+      - name: Release the build JVM before executable packaging
+        shell: bash
+        run: |
+          cat >> .bazelrc.user <<'EOF'
+          startup --batch
+          startup --host_jvm_args=-Xmx1536m
+          common --jobs=1
+          common --local_test_jobs=1
+          EOF
+      - uses: actions/download-artifact@v4
+        with:
+          name: browser-engine
+          path: portable
+      - name: Build the executable with embedded workerd
+        run: bazel run //packages/local-browser:package_from_dist -- --dist "$PWD/portable/engine" --assets "$PWD/portable/public" --out "$PWD/dist/package"
+      - name: Verify the standalone executable
+        run: bazel test //packages/local-browser:binary_test --test_env=KITESURF_TEST_BINARY="$PWD/dist/package/kitesurf" --test_output=errors
+      - name: Archive and checksum
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          name="kitesurf-0.5.0-$PLATFORM.tar.gz"
+          tar -czf "dist/$name" -C dist/package .
+          (cd dist && shasum -a 256 "$name" > "$name.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: browser-${{ matrix.platform }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push'
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: browser-*
+          merge-multiple: true
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256

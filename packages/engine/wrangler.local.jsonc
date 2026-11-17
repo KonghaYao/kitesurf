@@ -1,0 +1,21 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "kitesurf-local",
+  "main": "src/local/index.ts",
+  "compatibility_date": "2026-09-11",
+  "compatibility_flags": ["global_fetch_strictly_public"],
+  "rules": [
+    { "type": "Text", "globs": ["**/*.glue.js", "**/*.css", "**/*.dat"], "fallthrough": true },
+  ],
+  "vars": {
+    "KITESURF_ENV": "local",
+    "KITESURF_VERSION": "0.5.0",
+    "KITESURF_RESOURCE_DRAIN_QUIET_TURNS": "5",
+  },
+  "worker_loaders": [{ "binding": "LOADER" }],
+  "assets": {
+    "directory": "./public",
+    "binding": "FONT_ASSETS",
+    "run_worker_first": ["/", "/rbi/*"],
+  },
+}

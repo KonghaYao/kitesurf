@@ -356,6 +356,7 @@ describe("PageScriptRpcSession", () => {
   });
 
   it("a destroyed execution context ends the session, not just the call", async () => {
+    let deaths = 0;
     const notices: IsolateLimitNotice[] = [];
     const scriptName = `ks-test-gone-${Math.random().toString(36).slice(2)}`;
     registerIsolateLimitListener(scriptName, (n) => notices.push(n));
@@ -365,7 +366,13 @@ describe("PageScriptRpcSession", () => {
           new Error("The execution context which hosts this callback is no longer running."),
         ),
     });
-    const s = openPageScriptRpcSession(fake.entrypoint, { scriptName });
+    const s = openPageScriptRpcSession(fake.entrypoint, {
+      scriptName,
+      onDead: () => {
+        deaths++;
+      },
+    });
+    expect(s.isAlive()).toBe(true);
 
     await expect(s.queryDom("getDocument", {})).rejects.toThrow(
       /execution context which hosts this/,
@@ -379,6 +386,8 @@ describe("PageScriptRpcSession", () => {
     expect(fake.calls.length, "no further calls reach the dead peer").toBe(callsAfterDeath);
 
     expect(notices.map((n) => n.kind)).toEqual(["gone"]);
+    expect(s.isAlive()).toBe(false);
+    expect(deaths).toBe(1);
   });
 
   it("a teardown of an already-gone isolate reports no crash", async () => {

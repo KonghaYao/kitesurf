@@ -15,8 +15,12 @@ import { resolveInspectorBaseUrl } from "./inspector.ts";
 import { landingPage } from "./landing.ts";
 import type { RequestBlocker } from "./request-blocker.ts";
 import { MemorySessionStore, type SessionStore } from "./state/session-store.ts";
+import type { ProfilePersistence } from "./state/profile.ts";
 
 export interface ConnectionOptions {
+  /** Trusted host policy; zero removes the corresponding application deadline. */
+  idleTimeoutMs?: number;
+  maxSessionMs?: number;
   /**
    * Analytics label for the session entry point.
    * Defaults to "devtools" on /devtools/page/* and "puppeteer" otherwise.
@@ -27,6 +31,8 @@ export interface ConnectionOptions {
 }
 
 export interface EngineHost {
+  /** Loads a profile before the WebSocket can accept any browser commands. */
+  openProfile?(connectionId: string, env: Env): Promise<ProfilePersistence>;
   /** Handles unmatched routes; return `null` to keep the engine's 404 response. */
   serveFallback?(url: URL, env: Env): Promise<Response | null>;
   /** Creates a session telemetry sink; factory and sink errors are reported, not rethrown. */
@@ -93,6 +99,8 @@ export function resolveConnectionOptions(
 ): Required<ConnectionOptions> {
   const overrides = host?.connectionOptions?.(request, connectionId);
   return {
+    idleTimeoutMs: overrides?.idleTimeoutMs ?? 10 * 60_000,
+    maxSessionMs: overrides?.maxSessionMs ?? 60 * 60_000,
     entrypoint: overrides?.entrypoint ?? resolveEntrypoint(request),
     fontDefer: overrides?.fontDefer ?? false,
   };

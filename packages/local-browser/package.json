@@ -1,0 +1,14 @@
+{
+  "name": "@kitesurf/local-browser",
+  "version": "0.5.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "miniflare": "5.20260911.1-alpha",
+    "ws": "8.22.0"
+  },
+  "devDependencies": {
+    "postject": "1.0.0-alpha.6"
+  }
+}

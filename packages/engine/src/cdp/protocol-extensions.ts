@@ -360,6 +360,10 @@ declare module "devtools-protocol/types/protocol-mapping" {
     }
 
     interface Commands {
+      "Kitesurf.flushProfile": {
+        paramsType: [];
+        returnType: { saved: true };
+      };
       "Kitesurf.startSceneStream": {
         paramsType: [Protocol.Kitesurf.StartSceneStreamRequest];
         returnType: void;

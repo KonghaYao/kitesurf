@@ -21,6 +21,7 @@ import type {
 import type { QueryDomArgs, QueryDomMethod, QueryDomResult } from "@kitesurf/jsrpc-types/query-dom";
 import type { RenderPortStub } from "@kitesurf/jsrpc-types/page-renderer";
 import type { PageScriptStub, UpstreamEventHandler } from "./page-script.ts";
+import type { WebStorageChange } from "@kitesurf/jsrpc-types/web-storage";
 import { isIsolateGoneError, notifyIsolateLimit } from "./limit-registry.ts";
 import { collectRetiredWorkers } from "./retired-worker-gc.ts";
 
@@ -36,6 +37,8 @@ export interface RpcSessionEntrypoint {
 }
 
 export interface PageScriptRpcSessionOptions {
+  onDead?: () => void;
+  onStorage?: (change: WebStorageChange) => void;
   defaultTimeoutMs?: number;
   outbound?: SessionOutbound;
   wrapOpen?: (open: () => Promise<RpcSessionCallable>) => Promise<RpcSessionCallable>;
@@ -84,6 +87,7 @@ export class PageScriptRpcSession implements PageScriptStub {
   private session: RpcSessionCallable | null = null;
   private inflight = new Set<InflightCall>();
   private dead = false;
+  private onDead?: () => void;
   private deadReason: string | null = null;
   // An entrypoint call on an evicted or killed isolate starts a fresh one just to serve it, so the
   // kill is sent at most once and never after the isolate is known to be gone.
@@ -99,6 +103,7 @@ export class PageScriptRpcSession implements PageScriptStub {
 
   constructor(entrypoint: RpcSessionEntrypoint, opts: PageScriptRpcSessionOptions = {}) {
     this.entrypoint = entrypoint;
+    this.onDead = opts.onDead;
     this.defaultTimeoutMs = opts.defaultTimeoutMs ?? 60_000;
     this.getTraceParent = opts.getTraceParent;
     this.now = opts.now ?? (() => Date.now());
@@ -113,6 +118,10 @@ export class PageScriptRpcSession implements PageScriptStub {
         ...(outbound ? { outbound } : {}),
         upstream: (e) => {
           if (!e || typeof e.event !== "string") return;
+          if (e.event === "kitesurf.webStorageChanged") {
+            opts.onStorage?.(e.params);
+            return;
+          }
           const params: ReceivedUpstreamParams =
             e.params && typeof e.params === "object" ? e.params : {};
           if (e.event === "kitesurf.wasmTerminated") {
@@ -194,10 +203,15 @@ export class PageScriptRpcSession implements PageScriptStub {
     }
   }
 
+  isAlive(): boolean {
+    return !this.dead;
+  }
+
   private markDead(reason: string): void {
     if (this.dead) return;
     this.dead = true;
     this.deadReason = reason;
+    this.onDead?.();
     if (this.wallCapTimer) {
       clearTimeout(this.wallCapTimer);
       this.wallCapTimer = null;

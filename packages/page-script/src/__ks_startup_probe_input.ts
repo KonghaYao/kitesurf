@@ -9,6 +9,7 @@ export declare const hasHtml: boolean;
 export declare const htmlLength: number;
 export declare const url: string | null;
 export declare const cookies: string;
+export declare const webStorage: import("@kitesurf/jsrpc-types/web-storage").WebStorageSeed;
 export declare const scriptDescriptors: Array<{
   src: string | null;
   kind: "classic" | "module";

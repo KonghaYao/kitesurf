@@ -9,7 +9,7 @@ import type { UpstreamMessage } from "@kitesurf/jsrpc-types/page-script";
 export const DEFAULT_VIEWPORT_WIDTH_PX = 1280;
 export const DEFAULT_VIEWPORT_HEIGHT_PX = 720;
 
-export type UpstreamSender = (message: UpstreamMessage) => void;
+export type UpstreamSender = (message: UpstreamMessage) => Promise<void> | void;
 
 export interface IframePost {
   body: string;
@@ -170,10 +170,15 @@ export function sendUpstreamEvent(message: UpstreamMessage): void {
   const sender = upstreamSender;
   if (!sender) return;
   try {
-    sender(message);
+    void Promise.resolve(sender(message)).catch(() => {});
   } catch {
     // The duplicated session callback may already be disposed during teardown.
   }
+}
+
+export function sendUpstreamEventConfirmed(message: UpstreamMessage): Promise<void> {
+  if (!upstreamSender) return Promise.reject(new Error("Page storage session is closed"));
+  return Promise.resolve(upstreamSender(message));
 }
 
 export function registerUpstreamSender(sender: UpstreamSender): void {

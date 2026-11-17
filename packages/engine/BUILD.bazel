@@ -68,7 +68,7 @@ filegroup(
 
 js_library(
     name = "config",
-    srcs = [":package_json", "tsconfig.json", "wrangler.jsonc"],
+    srcs = [":package_json", "tsconfig.json", "wrangler.jsonc", "wrangler.local.jsonc"],
 )
 
 js_library(
@@ -173,6 +173,18 @@ js_run_binary(
 
 # `bazel run` it before `wrangler dev`: copies the built wasm, bundles and RBI files to the
 # source-tree paths the dev server reads (scripts/stage-dev-build.mjs).
+js_run_binary(
+    name = "local_dist",
+    srcs = [":assets", ":srcs", "//packages/renderer-core:wasm_pkg"],
+    out_dirs = ["local_dist"],
+    args = [
+        "prepare", "--dist", bin_relative("packages/engine/local_dist"),
+        "--config", bin_relative("packages/engine/wrangler.local.jsonc"),
+    ],
+    tool = "//scripts:wpt_engine",
+    visibility = ["//visibility:public"],
+)
+
 js_binary(
     name = "dev_build_tool",
     entry_point = "//scripts:stage_dev_build",

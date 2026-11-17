@@ -52,6 +52,12 @@ import { buildDispatchEnv } from "./dispatch-env.ts";
 import { markArrival } from "./arrival.ts";
 import { StyleCache } from "./style-cache.ts";
 import { makeWallClock } from "../eval/host-clock.ts";
+import {
+  SessionWebStorage,
+  registerWebStorage,
+  unregisterWebStorage,
+} from "../state/web-storage.ts";
+import { ProfileCommitter, flushProfile } from "../state/profile.ts";
 // Wrangler generates the ambient `Env` declaration from wrangler.jsonc.
 
 const NOISY_CDP_METHODS = new Set<string>([
@@ -60,8 +66,6 @@ const NOISY_CDP_METHODS = new Set<string>([
   "Page.screencastFrameAck",
 ]);
 
-const IDLE_SESSION_MS = 10 * 60_000;
-const MAX_SESSION_MS = 60 * 60_000;
 const BACKGROUND_EVENT_DRAIN_INTERVAL_MS = 200;
 const CDP_CONNECTION_ID_LENGTH = 10;
 const CDP_DEBUG_SESSION_ID_PREFIX_CHARS = 6;
@@ -85,6 +89,7 @@ export async function handleWebSocket(
   // Also used as the analytics session ID and log correlation key.
   const connectionId = nanoid(CDP_CONNECTION_ID_LENGTH);
   const options = resolveConnectionOptions(request, connectionId, opts?.host);
+  const persistence = await opts?.host?.openProfile?.(connectionId, env);
 
   // External sessions provide their outbound policy before dispatch; regular
   // WebSocket upgrades use the default policy.
@@ -100,8 +105,8 @@ export async function handleWebSocket(
   let initialUrl: string | null = null;
   let debug = false;
   let cdpDebug = false;
-  let idleMs = IDLE_SESSION_MS;
-  let maxSessionMs = MAX_SESSION_MS;
+  let idleMs = options.idleTimeoutMs || Infinity;
+  let maxSessionMs = options.maxSessionMs || Infinity;
   const isolateCapOverrides: PageIsolateCapOverrides = {};
   let connectionMode: "page" | "browser" = "browser";
   try {
@@ -232,7 +237,20 @@ export async function handleWebSocket(
   const requestBlocker = opts?.host?.requestBlocker;
   if (requestBlocker) registerRequestBlocker(connectionId, requestBlocker);
 
-  const cookies = createCookieJar();
+  let committer: ProfileCommitter | undefined;
+  const changed = () => committer?.changed();
+  const cookies = createCookieJar(persistence?.initial.cookies, changed);
+  const storage = new SessionWebStorage(
+    connectionId,
+    persistence?.initial.localStorage ?? [],
+    changed,
+  );
+  registerWebStorage(connectionId, storage);
+  if (persistence)
+    committer = new ProfileCommitter(persistence, () => ({
+      cookies: cookies.getAll(),
+      localStorage: storage.snapshot(),
+    }));
   registerCookieJar(connectionId, cookies);
   const workerBudget = new DynamicWorkerBudget();
   const browser: BrowserState = {
@@ -295,6 +313,7 @@ export async function handleWebSocket(
     connectionId,
     analytics,
   };
+  browser.flushProfile = (targetId) => flushProfile(dispatchCtx, storage, committer, targetId);
 
   const tracedDispatch = (req: CdpRequest) =>
     NOISY_CDP_METHODS.has(req.method)
@@ -412,6 +431,7 @@ export async function handleWebSocket(
       }
 
       try {
+        if (req.method === "Browser.close") await browser.flushProfile?.();
         const response = await tracedDispatch(req);
         if (debug && !NOISY_CDP_METHODS.has(req.method)) {
           console.log("[cdp ->]", req.id, req.method, "ok");
@@ -441,6 +461,8 @@ export async function handleWebSocket(
   function teardownConnection(): void {
     if (tornDown) return;
     tornDown = true;
+    committer?.stop();
+    unregisterWebStorage(connectionId);
     wsClosing = true;
     browser.wsClosing = true;
     // Stop scene streams before retiring their targets and renderer.

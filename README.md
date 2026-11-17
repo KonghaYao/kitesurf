@@ -2,6 +2,11 @@
 
 # Kitesurf
 
+This fork adds a **v0.5 local browser**: one executable with embedded workerd, SQLite account
+profiles and live sessions that survive CDP disconnects. It runs without a Cloudflare account.
+See [local browser usage and builds](packages/local-browser/README.md). The documentation below
+describes the upstream engine and its optional Cloudflare deployment.
+
 Kitesurf is an experimental browser engine that runs on Cloudflare Workers. It
 parses HTML, applies CSS, runs page JavaScript, and renders screenshots without
 Chrome or a browser container.

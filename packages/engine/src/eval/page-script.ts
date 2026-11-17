@@ -31,6 +31,8 @@ import type {
   PackedResult,
 } from "@kitesurf/jsrpc-types/shared";
 import type { OutboundProps } from "./outbound.ts";
+import { webStorageFor } from "../state/web-storage.ts";
+import type { WebStorageDelivery } from "@kitesurf/jsrpc-types/web-storage";
 import {
   openPageScriptRpcSession,
   type RpcSessionCallable,
@@ -51,6 +53,7 @@ export interface PageScriptStub extends PageScriptSession {
   /** Identity this isolate stamps into its Runtime handles and compiled-script ids. */
   isolateStamp?: string;
   close?(reason?: string): void;
+  isAlive?(): boolean;
   killIsolate?(reason?: string, opts?: { atOnce?: boolean }): Promise<unknown> | void;
   setUpstreamEventHandler?(handler: UpstreamEventHandler | null): void;
   armAwaitLoad?(): void;
@@ -206,6 +209,13 @@ export function getOrCreatePageScript({
   pageIsolate,
 }: GetOrCreatePageScriptOptions): PageScriptStub {
   const cx = ctx as CtxWithExports;
+  const storage = webStorageFor(key.connectionId);
+  const storageContext = key.cookieKey || key.connectionId;
+  const storageOrigin = originOf(pageOrigin);
+  const storageSeed = storage?.seed(storageContext, key.targetId, storageOrigin) ?? {
+    localStorage: [],
+    sessionStorage: [],
+  };
   const wall = makeWallClock(env);
   const name = pageScriptCacheKey(key);
   const caps = pageIsolateCaps(env, capOverrides);
@@ -265,6 +275,7 @@ export const hasHtml = ${JSON.stringify(hasHtml)};
 export const htmlLength = ${JSON.stringify(htmlLength)};
 export const url = ${JSON.stringify(url)};
 export const cookies = ${JSON.stringify(cookies)};
+export const webStorage = ${JSON.stringify(storageSeed)};
 export const scriptDescriptors = ${JSON.stringify(scriptDescriptors)};
 export const userAgent = ${JSON.stringify(userAgent)};
 export const referrer = ${JSON.stringify(referrer)};
@@ -429,7 +440,10 @@ export const manifest = ${JSON.stringify(wasmBake ? wasmBake.manifest : {})};
         }
       }
     : spanWrap;
+  let detachStorage: (() => void) | undefined;
   const session = openPageScriptRpcSession(entrypoint, {
+    onDead: () => detachStorage?.(),
+    onStorage: (change) => storage?.change(storageReceiver, change),
     now: makeWallClock(env),
     outbound: sandboxOutbound.session(outboundProps),
     wallCapMs: caps.wallMs > 0 ? caps.wallMs : undefined,
@@ -438,6 +452,15 @@ export const manifest = ${JSON.stringify(wasmBake ? wasmBake.manifest : {})};
     wrapOpen,
   });
   session.isolateStamp = isolateStamp;
+  const storageReceiver = {
+    context: storageContext,
+    tab: key.targetId,
+    origin: storageOrigin,
+    url: pageOrigin,
+    apply: (change: WebStorageDelivery) => session.queryDom("applyWebStorageChange", change),
+    flush: () => session.queryDom("flushWebStorage", {}),
+  };
+  detachStorage = storage?.register(storageReceiver);
   return session;
 }
 

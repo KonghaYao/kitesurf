@@ -40,6 +40,7 @@ import { createScheduler } from "./scheduler.ts";
 import { installIdleCallbackGlobals, installPageTaskGlobals, queuePortTask } from "./page-tasks.ts";
 import { getBlobMimeType, normalizeBlobType, setBlobMimeType } from "./mime-type.ts";
 import { ksInternals } from "./internals.ts";
+import { makeWebStorage } from "./web-storage.ts";
 
 const MAX_IMAGE_DATA_PIXELS = 4096 * 4096;
 
@@ -3096,33 +3097,11 @@ export function installGlobals(
     }
     installIdleCallbackGlobals();
     if (Object.getOwnPropertyDescriptor(globalThis, "localStorage") === undefined) {
-      const makeStorage = () => {
-        const data = Object.create(null);
-        const api = {
-          getItem(key) {
-            return Object.prototype.hasOwnProperty.call(data, key) ? data[key] : null;
-          },
-          setItem(key, value) {
-            data[String(key)] = String(value);
-          },
-          removeItem(key) {
-            delete data[key];
-          },
-          clear() {
-            for (const key of Object.keys(data)) delete data[key];
-          },
-          key(index) {
-            const keys = Object.keys(data);
-            return index >= 0 && index < keys.length ? keys[index] : null;
-          },
-          get length() {
-            return Object.keys(data).length;
-          },
-        };
-        return api;
+      // Opaque sandbox origins retain the throwing accessor below.
+      const buckets = {
+        localStorage: makeWebStorage("localStorage"),
+        sessionStorage: makeWebStorage("sessionStorage"),
       };
-      // An opaque sandboxed origin has no storage bucket; the accessor throws, as in Chrome.
-      const buckets = { localStorage: makeStorage(), sessionStorage: makeStorage() };
       const storageAccessor =
         (name: keyof typeof buckets): (() => unknown) =>
         () => {
