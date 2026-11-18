@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior};
 
-use crate::attachments::Attachments;
+use crate::attachments::{AttachmentReservation, Attachments, QuarantineResult, Registration};
 use crate::observe::Observer;
 use crate::services::ProfileService;
 use crate::transport::{LeasedMessage, PayloadBudget, PayloadLease, Upstream, UpstreamEvent};
@@ -114,8 +114,7 @@ const MAX_RESERVED: usize = 128;
 const MAX_PENDING_PER_CLIENT: usize = 64;
 const MAX_PENDING_GLOBAL: usize = 512;
 const MAX_INTERNAL_PENDING: usize = 32;
-const MAX_ATTACHMENTS: usize = 1024;
-const MAX_ATTACHMENTS_PER_CLIENT: usize = 256;
+const ATTACH_LIMIT_MESSAGE: &str = "Attachment limit reached";
 const MAX_UNKNOWN: usize = MAX_PENDING_GLOBAL + MAX_INTERNAL_PENDING;
 const MAX_MANAGEMENT_QUEUE: usize = 64;
 const MAX_CONTROL_QUEUE: usize = 8;
@@ -1023,6 +1022,7 @@ enum PendingKind {
     Targets(oneshot::Sender<Result<LeasedTargets, String>>),
     RetirementAuto { id: u64 },
     RetirementDetach { id: u64, session: String },
+    QuarantineDetach { session: String },
 }
 
 struct Unknown {
@@ -1051,6 +1051,9 @@ enum UnknownKind {
         id: u64,
     },
     RetirementDetach {
+        session: String,
+    },
+    QuarantineDetach {
         session: String,
     },
 }
@@ -2223,7 +2226,9 @@ impl Broker {
             return false;
         };
         let params = json!({ "targetId": target, "flatten": true });
-        if !self.attachments.set_intent(target, client_id) {
+        if self.attachments.reserve(target, client_id, client.epoch)
+            != AttachmentReservation::Reserved
+        {
             return false;
         }
         let spec = PendingSpec {
@@ -2300,20 +2305,65 @@ impl Broker {
         self.handle_lost(reason.into());
     }
 
-    /// 事件只有在能证明归属时才投递；无 session 的普通事件不广播。
-    fn own_attachment(
-        &mut self,
-        client: ClientId,
-        epoch: u64,
-        session: &str,
-        target: &str,
-        parent: Option<&str>,
-    ) {
-        if !self.attachments.own(client, epoch, session, target, parent) {
-            self.handle_lost("attachment metadata budget exhausted".into());
+    /// 超限 session 只登记清理身份；容量或预算无法记录时不能静默忘记。
+    fn quarantine_attachment(&mut self, client: ClientId, epoch: u64, session: &str, target: &str) {
+        match self.attachments.quarantine(client, epoch, session, target) {
+            QuarantineResult::Recorded
+            | QuarantineResult::Existing
+            | QuarantineResult::Owned
+            | QuarantineResult::Foreign => {}
+            QuarantineResult::Full => {
+                self.handle_lost("attachment quarantine capacity exhausted".into());
+            }
+            QuarantineResult::Budget => {
+                self.handle_lost("attachment metadata budget exhausted".into());
+            }
         }
     }
 
+    fn auto_overflow(&mut self, client: ClientId) {
+        if self.attachments.auto_owner == Some(client) {
+            self.start_retirement(client);
+        }
+    }
+
+    /// 迟到 attach 回复仍按原 client/epoch 归属；容量不足时转入 quarantine。
+    fn late_attachment(
+        &mut self,
+        client: Option<ClientId>,
+        epoch: u64,
+        session: &str,
+        target: &str,
+    ) {
+        let Some(client) = client else {
+            return;
+        };
+        let outcome = self
+            .attachments
+            .register(client, epoch, session, target, None);
+        self.attachments.clear_intent(target, client);
+        match outcome {
+            Registration::New | Registration::Existing => {}
+            Registration::Full => {
+                self.quarantine_attachment(client, epoch, session, target);
+            }
+            Registration::Foreign | Registration::Quarantined => {}
+            Registration::Budget => {
+                self.handle_lost("attachment metadata budget exhausted".into());
+                return;
+            }
+        }
+        let retired = self
+            .clients
+            .get(&client)
+            .is_none_or(|state| state.closed || state.retired);
+        if retired && matches!(outcome, Registration::New | Registration::Existing) {
+            self.start_retirement(client);
+        }
+        self.pump_quarantine();
+    }
+
+    /// 事件只有在能证明归属时才投递；无 session 的普通事件不广播。
     fn handle_event(&mut self, value: Received) {
         let Some(method) = value.method else {
             return;
@@ -2410,14 +2460,29 @@ impl Broker {
         };
         let epoch = state.epoch;
         let retired = state.closed || state.retired;
-        let known = self.attachments.attachment(session).is_some();
-        if !known
-            && (self.attachments.count() >= MAX_ATTACHMENTS
-                || self.attachments.count_for(owner) >= MAX_ATTACHMENTS_PER_CLIENT)
-        {
-            return;
+        let auto = self.attachments.intent(target).is_none()
+            && outer
+                .and_then(|session| self.attachments.owner(session))
+                .is_none();
+        let outcome = self
+            .attachments
+            .register(owner, epoch, session, target, outer);
+        match outcome {
+            Registration::New | Registration::Existing => {}
+            Registration::Foreign | Registration::Quarantined => return,
+            Registration::Full => {
+                self.quarantine_attachment(owner, epoch, session, target);
+                if auto {
+                    self.auto_overflow(owner);
+                }
+                self.pump_quarantine();
+                return;
+            }
+            Registration::Budget => {
+                self.handle_lost("attachment metadata budget exhausted".into());
+                return;
+            }
         }
-        self.own_attachment(owner, epoch, session, target, outer);
         if retired {
             self.start_retirement(owner);
             return;
@@ -2428,7 +2493,7 @@ impl Broker {
     fn detached_event(&mut self, value: Received) {
         let Some(span) = value.session else { return };
         let budget = self.upstream.handle.budget.clone();
-        let attachment = {
+        let session = {
             let mut scratch = budget.json_scratch();
             let mut buffer = [0; 4096];
             value
@@ -2437,9 +2502,13 @@ impl Broker {
                 .identity_text(&mut buffer, &mut scratch)
                 .ok()
                 .flatten()
-                .and_then(|session| self.attachments.forget(session))
+                .map(str::to_string)
         };
-        let Some(attachment) = attachment else { return };
+        let Some(session) = session else { return };
+        let Some(attachment) = self.attachments.forget(&session) else {
+            self.attachments.release_quarantine(&session);
+            return;
+        };
         let recipient = attachment.client;
         let primary = self
             .clients
@@ -2679,6 +2748,22 @@ impl Broker {
                     );
                 }
             }
+            PendingKind::QuarantineDetach { session } => {
+                if self.attachments.block_quarantine(&session) {
+                    self.record_unknown(
+                        id,
+                        Unknown {
+                            _request: pending.request.clone(),
+                            _internal: pending.internal.clone(),
+                            client: None,
+                            role: None,
+                            epoch,
+                            method,
+                            kind: UnknownKind::QuarantineDetach { session },
+                        },
+                    );
+                }
+            }
             PendingKind::Client => {
                 if let Some(client) = client {
                     self.send_error(
@@ -2715,44 +2800,22 @@ impl Broker {
         }
     }
 
-    fn own_late(&mut self, client: Option<ClientId>, epoch: u64, session: &str, target: &str) {
-        let Some(client) = client else {
-            return;
-        };
-        if let Some(existing) = self.attachments.attachment(session) {
-            if existing.client == client {
-                return;
-            }
-        }
-        if self.attachments.count() >= MAX_ATTACHMENTS
-            || self.attachments.count_for(client) >= MAX_ATTACHMENTS_PER_CLIENT
-        {
-            return;
-        }
-        self.own_attachment(client, epoch, session, target, None);
-        let retired = self
-            .clients
-            .get(&client)
-            .is_none_or(|state| state.closed || state.retired);
-        if retired {
-            self.start_retirement(client);
-        }
-    }
-
     fn complete_unknown(&mut self, id: u64, value: &Received) {
         let Some(unknown) = self.unknown.remove(&id) else {
             return;
         };
         let attached = attach_session(value);
-        if let Some(session) = attached.as_deref() {
-            let target = match &unknown.kind {
+        let target = if unknown.method == "Target.attachToBrowserTarget" {
+            Some("browser".to_string())
+        } else {
+            match &unknown.kind {
                 UnknownKind::PageAttach { target } => Some(target.clone()),
                 UnknownKind::Managed { target, .. } => target.clone(),
                 _ => None,
-            };
-            if let Some(target) = target {
-                self.own_late(unknown.client, unknown.epoch, session, &target);
             }
+        };
+        if let (Some(session), Some(target)) = (attached.as_deref(), target.as_deref()) {
+            self.late_attachment(unknown.client, unknown.epoch, session, target);
         }
         let failed = value.has_error();
         match unknown.kind {
@@ -2765,6 +2828,9 @@ impl Broker {
                     if let Some(target) = target {
                         self.attachments.clear_intent(&target, client);
                     }
+                    if unknown.method == "Target.attachToBrowserTarget" {
+                        self.attachments.clear_intent("browser", client);
+                    }
                     if unknown.method == "Target.detachFromTarget" {
                         if let Some(session) = session {
                             self.attachments.forget(&session);
@@ -2773,11 +2839,18 @@ impl Broker {
                     if let Some(auto) = auto {
                         self.apply_auto_result(client, auto, failed);
                     }
-                    if unknown.method == "Target.attachToBrowserTarget" {
-                        if let Some(session) = attached.as_deref() {
-                            self.own_late(Some(client), unknown.epoch, session, "browser");
-                        }
-                    }
+                }
+            }
+            UnknownKind::PageAttach { target } => {
+                if let Some(client) = unknown.client {
+                    self.attachments.clear_intent(&target, client);
+                }
+            }
+            UnknownKind::QuarantineDetach { session } => {
+                if failed {
+                    self.attachments.block_quarantine(&session);
+                } else {
+                    self.attachments.release_quarantine(&session);
                 }
             }
             UnknownKind::RetirementAuto { id } => {
@@ -2802,7 +2875,7 @@ impl Broker {
                     self.finish_close_success();
                 }
             }
-            UnknownKind::Plain | UnknownKind::PageAttach { .. } | UnknownKind::Flush => {}
+            UnknownKind::Plain | UnknownKind::Flush => {}
         }
         self.pump_after_change();
     }
@@ -2842,6 +2915,9 @@ impl Broker {
             } => {
                 self.retirement_detach_response(retirement, &session, value);
             }
+            PendingKind::QuarantineDetach { session } => {
+                self.quarantine_detach_response(&session, value);
+            }
         }
         self.pump_after_change();
     }
@@ -2862,26 +2938,41 @@ impl Broker {
             return;
         };
         let session = attach_session(value);
-        self.attachments.clear_intent(target, client_id);
         let Some(session) = session else {
+            self.attachments.clear_intent(target, client_id);
             self.disconnect_client(client_id, 1008, "Target expired", true);
             return;
         };
+        let Some(epoch) = self.clients.get(&client_id).map(|state| state.epoch) else {
+            return;
+        };
+        let outcome = self
+            .attachments
+            .register(client_id, epoch, &session, target, None);
+        self.attachments.clear_intent(target, client_id);
+        match outcome {
+            Registration::New | Registration::Existing => {}
+            Registration::Full => {
+                self.quarantine_attachment(client_id, epoch, &session, target);
+                self.disconnect_client(client_id, 1008, "Target expired", true);
+                return;
+            }
+            Registration::Foreign | Registration::Quarantined => {
+                self.disconnect_client(client_id, 1008, "Target expired", true);
+                return;
+            }
+            Registration::Budget => {
+                self.handle_lost("attachment metadata budget exhausted".into());
+                return;
+            }
+        }
         let Some(state) = self.clients.get_mut(&client_id) else {
             return;
         };
-        if self.attachments.count() >= MAX_ATTACHMENTS
-            || self.attachments.count_for(client_id) >= MAX_ATTACHMENTS_PER_CLIENT
-        {
-            self.disconnect_client(client_id, 1008, "Target expired", true);
-            return;
-        }
-        let epoch = state.epoch;
         state.primary = Some(session.clone());
         state.page_ready = true;
         let queued = std::mem::take(&mut state.page_queue);
         state.page_queue_bytes = 0;
-        self.own_attachment(client_id, epoch, &session, target, None);
         for request in queued {
             let external_id = request.id.unwrap_or_default();
             let method = request.method().map(str::to_string).unwrap_or_default();
@@ -2931,48 +3022,67 @@ impl Broker {
             self.finish_managed_reply(active.work, value);
             return;
         }
-        if method == "Target.attachToTarget" {
-            let Some(target) = params.string("targetId") else {
-                self.finish_managed(active.work, Err((-32000, "Invalid target".into())));
-                return;
+        if method == "Target.attachToTarget" || method == "Target.attachToBrowserTarget" {
+            let target = if method == "Target.attachToTarget" {
+                let Some(target) = params.string("targetId") else {
+                    self.finish_managed(active.work, Err((-32000, "Invalid target".into())));
+                    return;
+                };
+                target.to_string()
+            } else {
+                "browser".to_string()
             };
             let Some(session) = attach_session(value) else {
-                self.clear_management_intent(&active);
+                self.attachments.clear_intent(&target, client);
                 self.finish_managed(
                     active.work,
                     Err((-32000, "Target attach returned no session".into())),
                 );
                 return;
             };
-            self.clear_management_intent(&active);
             let epoch = self
                 .clients
                 .get(&client)
                 .map_or(active.work.epoch, |state| state.epoch);
-            self.own_attachment(
-                client,
-                epoch,
-                &session,
-                target,
-                active.work.explicit_session.as_deref(),
-            );
-            self.finish_managed_reply(active.work, value);
+            let parent = active.work.explicit_session.clone();
+            let outcome =
+                self.attachments
+                    .register(client, epoch, &session, &target, parent.as_deref());
+            self.attachments.clear_intent(&target, client);
+            match outcome {
+                Registration::New | Registration::Existing => {
+                    self.finish_managed_reply(active.work, value);
+                }
+                Registration::Full => {
+                    self.quarantine_attachment(client, epoch, &session, &target);
+                    self.finish_managed(active.work, Err((-32000, ATTACH_LIMIT_MESSAGE.into())));
+                }
+                Registration::Foreign | Registration::Quarantined => {
+                    self.finish_managed(
+                        active.work,
+                        Err((
+                            -32000,
+                            "CDP attachment expired or belongs to another connection; attach again"
+                                .into(),
+                        )),
+                    );
+                }
+                Registration::Budget => {
+                    self.handle_lost("attachment metadata budget exhausted".into());
+                    self.finish_managed(
+                        active.work,
+                        Err((
+                            -32000,
+                            "Browser session ended; outcome may be unknown".into(),
+                        )),
+                    );
+                }
+            }
             return;
         }
         if method == "Target.detachFromTarget" {
             if let Some(session) = params.string("sessionId") {
                 self.attachments.forget(session);
-            }
-            self.finish_managed_reply(active.work, value);
-            return;
-        }
-        if method == "Target.attachToBrowserTarget" {
-            if let Some(session) = attach_session(value) {
-                let epoch = self
-                    .clients
-                    .get(&client)
-                    .map_or(active.work.epoch, |state| state.epoch);
-                self.own_attachment(client, epoch, &session, "browser", None);
             }
             self.finish_managed_reply(active.work, value);
             return;
@@ -3171,8 +3281,15 @@ impl Broker {
             (candidate, next)
         };
         let _ = next;
-        if !self.attachments.set_intent(&candidate, client) {
-            return BackfillStep::Failed("Payload budget exhausted".into());
+        match self.attachments.reserve(&candidate, client, epoch) {
+            AttachmentReservation::Reserved => {}
+            AttachmentReservation::Full => {
+                self.auto_overflow(client);
+                return BackfillStep::Failed(ATTACH_LIMIT_MESSAGE.into());
+            }
+            AttachmentReservation::Busy | AttachmentReservation::Budget => {
+                return BackfillStep::Failed("Payload budget exhausted".into());
+            }
         }
         let params = json!({ "targetId": candidate.as_str(), "flatten": true });
         let spec = PendingSpec {
@@ -3208,12 +3325,13 @@ impl Broker {
 
     fn backfill_attach_response(&mut self, active: ActiveManaged, target: &str, value: &Received) {
         let client = active.work.client;
-        self.attachments.clear_intent(target, client);
         if value.has_error() {
+            self.attachments.clear_intent(target, client);
             self.finish_managed_reply(active.work, value);
             return;
         }
         let Some(session) = attach_session(value) else {
+            self.attachments.clear_intent(target, client);
             self.finish_managed(
                 active.work,
                 Err((-32000, "Target attach returned no session".into())),
@@ -3224,16 +3342,51 @@ impl Broker {
             .clients
             .get(&client)
             .map_or(active.work.epoch, |state| state.epoch);
-        self.own_attachment(client, epoch, &session, target, None);
-        self.continue_backfill(active);
+        let outcome = self
+            .attachments
+            .register(client, epoch, &session, target, None);
+        self.attachments.clear_intent(target, client);
+        match outcome {
+            Registration::New | Registration::Existing => self.continue_backfill(active),
+            Registration::Full => {
+                self.quarantine_attachment(client, epoch, &session, target);
+                self.auto_overflow(client);
+                self.finish_managed(active.work, Err((-32000, ATTACH_LIMIT_MESSAGE.into())));
+            }
+            Registration::Foreign | Registration::Quarantined => {
+                self.finish_managed(
+                    active.work,
+                    Err((
+                        -32000,
+                        "CDP attachment expired or belongs to another connection; attach again"
+                            .into(),
+                    )),
+                );
+            }
+            Registration::Budget => {
+                self.handle_lost("attachment metadata budget exhausted".into());
+                self.finish_managed(
+                    active.work,
+                    Err((
+                        -32000,
+                        "Browser session ended; outcome may be unknown".into(),
+                    )),
+                );
+            }
+        }
     }
 
     fn clear_management_intent(&mut self, active: &ActiveManaged) {
-        if active.work.method != "Target.attachToTarget" {
-            return;
-        }
-        if let Some(target) = active.work.params.string("targetId") {
-            self.attachments.clear_intent(target, active.work.client);
+        match active.work.method.as_str() {
+            "Target.attachToTarget" => {
+                if let Some(target) = active.work.params.string("targetId") {
+                    self.attachments.clear_intent(target, active.work.client);
+                }
+            }
+            "Target.attachToBrowserTarget" => {
+                self.attachments.clear_intent("browser", active.work.client);
+            }
+            _ => {}
         }
     }
 
@@ -3357,18 +3510,16 @@ impl Broker {
         }
         let target = work.params.string("targetId").map(str::to_string);
         let session = work.explicit_session.clone();
-        let prepared = self.prepare_managed(&work, target.as_deref());
-        let Ok(()) = prepared else {
-            let message = "This connection does not own that attachment".to_string();
+        if let Err(message) = self.prepare_managed(&work, target.as_deref()) {
             self.send_error(
                 work.client,
                 work.external_id,
                 -32000,
-                &message,
+                message,
                 work.explicit_session.clone(),
             );
             return false;
-        };
+        }
         let spec = PendingSpec {
             client: Some(work.client),
             role: self.clients.get(&work.client).map(|state| state.role),
@@ -3448,22 +3599,23 @@ impl Broker {
         }
     }
 
-    fn prepare_managed(&mut self, work: &ManagedWork, target: Option<&str>) -> Result<(), ()> {
+    fn prepare_managed(
+        &mut self,
+        work: &ManagedWork,
+        target: Option<&str>,
+    ) -> Result<(), &'static str> {
         match work.method.as_str() {
             "Target.attachToTarget" => {
-                let target = target.ok_or(())?;
-                if self.attachments.intent(target).is_some() {
-                    return Err(());
-                }
-                self.attachments
-                    .set_intent(target, work.client)
-                    .then_some(())
-                    .ok_or(())
+                let target = target.ok_or("Invalid target")?;
+                self.reserve_attachment(target, work.client, work.epoch)
+            }
+            "Target.attachToBrowserTarget" => {
+                self.reserve_attachment("browser", work.client, work.epoch)
             }
             "Target.detachFromTarget" => {
-                let session = work.params.string("sessionId").ok_or(())?;
+                let session = work.params.string("sessionId").ok_or("Invalid target")?;
                 if self.attachments.owner(session) != Some(work.client) {
-                    return Err(());
+                    return Err("This connection does not own that attachment");
                 }
                 Ok(())
             }
@@ -3477,13 +3629,29 @@ impl Broker {
                 }
                 Ok(())
             }
-            "Target.attachToBrowserTarget" => Ok(()),
             _ => Ok(()),
         }
     }
 
+    fn reserve_attachment(
+        &mut self,
+        target: &str,
+        client: ClientId,
+        epoch: u64,
+    ) -> Result<(), &'static str> {
+        match self.attachments.reserve(target, client, epoch) {
+            AttachmentReservation::Reserved => Ok(()),
+            AttachmentReservation::Full => Err(ATTACH_LIMIT_MESSAGE),
+            AttachmentReservation::Busy | AttachmentReservation::Budget => {
+                Err("This connection does not own that attachment")
+            }
+        }
+    }
+
     fn clear_intent_for_work(&mut self, work: &ManagedWork) {
-        if let Some(target) = work.params.string("targetId") {
+        if work.method == "Target.attachToBrowserTarget" {
+            self.attachments.clear_intent("browser", work.client);
+        } else if let Some(target) = work.params.string("targetId") {
             self.attachments.clear_intent(target, work.client);
         }
     }
@@ -3718,6 +3886,58 @@ impl Broker {
             return;
         }
         self.attachments.forget(session);
+    }
+
+    fn quarantine_detach_response(&mut self, session: &str, value: &Received) {
+        if value.has_error() {
+            self.attachments.block_quarantine(session);
+        } else {
+            self.attachments.release_quarantine(session);
+        }
+    }
+
+    /// quarantine 清理只用不占 attachment 槽的内部 reserve；容量不足时留待下次 tick。
+    fn pump_quarantine(&mut self) {
+        if matches!(self.lifecycle, Lifecycle::Lost | Lifecycle::Closed) {
+            return;
+        }
+        loop {
+            let Some((session, owner)) = self.attachments.next_quarantine() else {
+                return;
+            };
+            // 自动溢出先确认禁用 autoattach，再清理该 session。
+            if self
+                .retirements
+                .iter()
+                .any(|retire| retire.client == owner && retire.stage == RetireStage::Auto)
+            {
+                return;
+            }
+            let Some(id) = self.spawn_quarantine_detach(&session) else {
+                return;
+            };
+            if !self.attachments.set_quarantine_pending(&session, Some(id)) {
+                return;
+            }
+        }
+    }
+
+    fn spawn_quarantine_detach(&mut self, session: &str) -> Option<u64> {
+        let params = json!({ "sessionId": session });
+        let spec = PendingSpec {
+            client: None,
+            role: None,
+            external_id: None,
+            explicit_session: None,
+            epoch: self.control_epoch,
+            method: "Target.detachFromTarget".to_string(),
+            kind: PendingKind::QuarantineDetach {
+                session: session.to_string(),
+            },
+            deadline: self.internal_deadline,
+        };
+        self.send_request("Target.detachFromTarget", Some(&params), None, spec)
+            .ok()
     }
 
     fn pump_control(&mut self) {
@@ -4331,6 +4551,7 @@ impl Broker {
     fn pump_after_change(&mut self) {
         self.pump_control();
         self.pump_retirements();
+        self.pump_quarantine();
         self.pump_management();
         self.pump_flush();
         self.pump_close();
@@ -4353,6 +4574,7 @@ impl Broker {
         }
         self.pump_control();
         self.pump_retirements();
+        self.pump_quarantine();
         self.pump_management();
         self.pump_flush();
         self.pump_close();

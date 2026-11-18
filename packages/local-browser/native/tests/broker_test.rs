@@ -1154,6 +1154,34 @@ fn request_id(value: &Value) -> u64 {
     value.get("id").and_then(Value::as_u64).expect("request id")
 }
 
+async fn fill_attachments(
+    engine: &mut FakeEngine,
+    broker: &BrokerHandle,
+    client: &mut TestClient,
+    prefix: &str,
+    count: usize,
+) {
+    for index in 0..count {
+        let target = format!("{prefix}-target-{index}");
+        let session = format!("{prefix}-session-{index}");
+        let id = index as u64 + 1;
+        let request = json!({
+          "id": id,
+          "method": "Target.attachToTarget",
+          "params": { "targetId": target, "flatten": true }
+        })
+        .to_string();
+        send(client, broker, &request).await;
+        let attach = next_request(engine).await;
+        assert_eq!(attach["method"], "Target.attachToTarget");
+        assert_eq!(attach["params"]["targetId"], target);
+        engine.reply(request_id(&attach), json!({ "sessionId": session }));
+        let reply = next_frame(client).await;
+        assert_eq!(reply["id"], id);
+        assert_eq!(reply["result"]["sessionId"], session);
+    }
+}
+
 fn message(value: &Value) -> &str {
     value
         .get("error")
@@ -3245,4 +3273,513 @@ async fn page_auto_attachments_detach_without_closing_targets() {
         detached,
         vec!["automatic".to_string(), "page-session".to_string()]
     );
+}
+
+#[tokio::test]
+async fn attachment_limit_rejects_257th_and_releases_after_detach() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut client = connect(&broker, Endpoint::Browser, Role::Viewer, "viewer").await;
+    fill_attachments(&mut engine, &broker, &mut client, "one", 256).await;
+    send(
+        &client,
+        &broker,
+        r#"{"id":300,"method":"Target.attachToTarget","params":{"targetId":"over","flatten":true}}"#,
+    )
+    .await;
+    if let Ok(Some(request)) = timeout(QUIET, engine.receive.recv()).await {
+        engine.reply(request_id(&request), json!({ "sessionId": "over-session" }));
+        panic!(
+            "257th attachment was authorized: {}",
+            next_frame(&mut client).await
+        );
+    }
+    let rejected = next_frame(&mut client).await;
+    assert_eq!(rejected["id"], 300);
+    assert!(message(&rejected).contains("limit"));
+    send(
+        &client,
+        &broker,
+        r#"{"id":301,"method":"Target.detachFromTarget","params":{"sessionId":"one-session-0"}}"#,
+    )
+    .await;
+    let detach = next_request(&mut engine).await;
+    assert_eq!(detach["method"], "Target.detachFromTarget");
+    assert_eq!(detach["params"]["sessionId"], "one-session-0");
+    engine.reply(request_id(&detach), json!({}));
+    assert_eq!(next_frame(&mut client).await["id"], 301);
+    send(
+        &client,
+        &broker,
+        r#"{"id":302,"method":"Target.attachToTarget","params":{"targetId":"reused","flatten":true}}"#,
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["method"], "Target.attachToTarget");
+    engine.reply(
+        request_id(&attach),
+        json!({ "sessionId": "reused-session" }),
+    );
+    let attached = next_frame(&mut client).await;
+    assert_eq!(attached["result"]["sessionId"], "reused-session");
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn early_attached_and_reply_share_one_reserved_attachment_slot() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut client = connect(&broker, Endpoint::Browser, Role::Viewer, "viewer").await;
+    fill_attachments(&mut engine, &broker, &mut client, "two", 255).await;
+    send(
+        &client,
+        &broker,
+        r#"{"id":256,"method":"Target.attachToTarget","params":{"targetId":"two-target-256","flatten":true}}"#,
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.event(json!({
+      "method": "Target.attachedToTarget",
+      "params": { "sessionId": "two-session-256", "targetInfo": { "targetId": "two-target-256" } }
+    }));
+    let early = next_frame(&mut client).await;
+    assert_eq!(early["method"], "Target.attachedToTarget");
+    engine.reply(
+        request_id(&attach),
+        json!({ "sessionId": "two-session-256" }),
+    );
+    assert_eq!(next_frame(&mut client).await["id"], 256);
+    engine.event(json!({
+      "sessionId": "two-session-0",
+      "method": "Target.attachedToTarget",
+      "params": { "sessionId": "two-session-256", "targetInfo": { "targetId": "two-target-256" } }
+    }));
+    assert_eq!(
+        next_frame(&mut client).await["method"],
+        "Target.attachedToTarget"
+    );
+    send(
+        &client,
+        &broker,
+        r#"{"id":257,"method":"Target.attachToTarget","params":{"targetId":"two-target-257","flatten":true}}"#,
+    )
+    .await;
+    if let Ok(Some(request)) = timeout(QUIET, engine.receive.recv()).await {
+        engine.reply(
+            request_id(&request),
+            json!({ "sessionId": "two-session-257" }),
+        );
+        panic!(
+            "early event and reply consumed two slots: {}",
+            next_frame(&mut client).await
+        );
+    }
+    let rejected = next_frame(&mut client).await;
+    assert_eq!(rejected["id"], 257);
+    assert!(message(&rejected).contains("limit"));
+    send(
+        &client,
+        &broker,
+        r#"{"id":258,"method":"Target.detachFromTarget","params":{"sessionId":"two-session-256"}}"#,
+    )
+    .await;
+    let detach = next_request(&mut engine).await;
+    assert_eq!(detach["method"], "Target.detachFromTarget");
+    engine.reply(request_id(&detach), json!({}));
+    assert_eq!(next_frame(&mut client).await["id"], 258);
+    send(
+        &client,
+        &broker,
+        r#"{"id":259,"method":"Target.attachToTarget","params":{"targetId":"two-target-259","flatten":true}}"#,
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["method"], "Target.attachToTarget");
+    engine.reply(
+        request_id(&attach),
+        json!({ "sessionId": "two-session-259" }),
+    );
+    assert_eq!(next_frame(&mut client).await["id"], 259);
+    engine.event(json!({
+      "sessionId": "two-session-0",
+      "method": "Target.attachedToTarget",
+      "params": { "sessionId": "two-session-259", "targetInfo": { "targetId": "two-target-259" } }
+    }));
+    assert_eq!(
+        next_frame(&mut client).await["method"],
+        "Target.attachedToTarget"
+    );
+    send(
+        &client,
+        &broker,
+        r#"{"id":260,"method":"Target.attachToTarget","params":{"targetId":"two-target-260","flatten":true}}"#,
+    )
+    .await;
+    if let Ok(Some(request)) = timeout(QUIET, engine.receive.recv()).await {
+        engine.reply(
+            request_id(&request),
+            json!({ "sessionId": "two-session-260" }),
+        );
+        panic!(
+            "reply-first and event consumed two slots: {}",
+            next_frame(&mut client).await
+        );
+    }
+    let rejected = next_frame(&mut client).await;
+    assert_eq!(rejected["id"], 260);
+    assert!(message(&rejected).contains("limit"));
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn browser_attach_reserves_and_reports_the_limit_before_dispatch() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut client = connect(&broker, Endpoint::Browser, Role::Controller, "viewer").await;
+    fill_attachments(&mut engine, &broker, &mut client, "four", 256).await;
+    send(
+        &client,
+        &broker,
+        r#"{"id":257,"method":"Target.attachToBrowserTarget"}"#,
+    )
+    .await;
+    if let Ok(Some(request)) = timeout(QUIET, engine.receive.recv()).await {
+        panic!("browser attach was dispatched at the limit: {request}");
+    }
+    let rejected = next_frame(&mut client).await;
+    assert_eq!(rejected["id"], 257);
+    assert!(message(&rejected).contains("limit"));
+    send(
+        &client,
+        &broker,
+        r#"{"id":258,"method":"Target.detachFromTarget","params":{"sessionId":"four-session-0"}}"#,
+    )
+    .await;
+    let detach = next_request(&mut engine).await;
+    assert_eq!(detach["method"], "Target.detachFromTarget");
+    engine.reply(request_id(&detach), json!({}));
+    assert_eq!(next_frame(&mut client).await["id"], 258);
+    send(
+        &client,
+        &broker,
+        r#"{"id":259,"method":"Target.attachToBrowserTarget"}"#,
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["method"], "Target.attachToBrowserTarget");
+    engine.reply(
+        request_id(&attach),
+        json!({ "sessionId": "browser-session" }),
+    );
+    assert_eq!(
+        next_frame(&mut client).await["result"]["sessionId"],
+        "browser-session"
+    );
+    send(
+        &client,
+        &broker,
+        r#"{"id":260,"method":"Target.attachToBrowserTarget"}"#,
+    )
+    .await;
+    if let Ok(Some(request)) = timeout(QUIET, engine.receive.recv()).await {
+        panic!("browser attach intent was not cleared: {request}");
+    }
+    let rejected = next_frame(&mut client).await;
+    assert_eq!(rejected["id"], 260);
+    assert!(message(&rejected).contains("limit"));
+    send(
+        &client,
+        &broker,
+        r#"{"id":261,"method":"Target.detachFromTarget","params":{"sessionId":"browser-session"}}"#,
+    )
+    .await;
+    let detach = next_request(&mut engine).await;
+    assert_eq!(detach["method"], "Target.detachFromTarget");
+    engine.reply(request_id(&detach), json!({}));
+    assert_eq!(next_frame(&mut client).await["id"], 261);
+    send(
+        &client,
+        &broker,
+        r#"{"id":262,"method":"Target.attachToBrowserTarget"}"#,
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({ "sessionId": "browser-two" }));
+    assert_eq!(
+        next_frame(&mut client).await["result"]["sessionId"],
+        "browser-two"
+    );
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn auto_attachment_overflow_quarantines_before_owner_retirement() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut client = connect(&broker, Endpoint::Browser, Role::Controller, "viewer").await;
+    fill_attachments(&mut engine, &broker, &mut client, "three", 256).await;
+    send(
+        &client,
+        &broker,
+        r#"{"id":300,"method":"Target.setAutoAttach","params":{"autoAttach":true,"flatten":true}}"#,
+    )
+    .await;
+    let auto = next_request(&mut engine).await;
+    assert_eq!(auto["method"], "Target.setAutoAttach");
+    engine.reply(request_id(&auto), json!({}));
+    let targets = next_request(&mut engine).await;
+    assert_eq!(targets["method"], "Target.getTargets");
+    engine.reply(request_id(&targets), json!({ "targetInfos": [] }));
+    assert_eq!(next_frame(&mut client).await["id"], 300);
+    engine.event(json!({
+      "method": "Target.attachedToTarget",
+      "params": { "sessionId": "overflow-session", "targetInfo": { "targetId": "overflow-target" } }
+    }));
+    expect_silence(&mut client).await;
+    let disable = next_request(&mut engine).await;
+    assert_eq!(disable["method"], "Target.setAutoAttach");
+    assert_eq!(disable["params"]["autoAttach"], false);
+    engine.reply(request_id(&disable), json!({}));
+    let mut quarantined = false;
+    for _ in 0..2 {
+        let request = next_request(&mut engine).await;
+        assert_eq!(request["method"], "Target.detachFromTarget");
+        if request["params"]["sessionId"] == "overflow-session" {
+            quarantined = true;
+        }
+        engine.reply(request_id(&request), json!({}));
+    }
+    assert!(quarantined, "overflow session was not queued for cleanup");
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn global_attachment_limit_counts_the_page_attach_reservation() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut clients = Vec::new();
+    for owner in ["alpha", "beta", "gamma", "delta"] {
+        let mut client = connect(&broker, Endpoint::Browser, Role::Viewer, owner).await;
+        fill_attachments(&mut engine, &broker, &mut client, owner, 256).await;
+        clients.push(client);
+    }
+    let mut refused = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "implicit-page".into(),
+        },
+        Role::Viewer,
+        "page-one",
+    )
+    .await;
+    assert_eq!(
+        next_close(&mut refused).await,
+        (1008, "Target expired".to_string())
+    );
+    expect_no_request(&mut engine).await;
+    send(
+        &clients[0],
+        &broker,
+        r#"{"id":300,"method":"Target.detachFromTarget","params":{"sessionId":"alpha-session-0"}}"#,
+    )
+    .await;
+    let detach = next_request(&mut engine).await;
+    assert_eq!(detach["method"], "Target.detachFromTarget");
+    engine.reply(request_id(&detach), json!({}));
+    assert_eq!(next_frame(&mut clients[0]).await["id"], 300);
+    let mut page = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "implicit-page-2".into(),
+        },
+        Role::Viewer,
+        "page-two",
+    )
+    .await;
+    let page_attach = next_request(&mut engine).await;
+    assert_eq!(page_attach["method"], "Target.attachToTarget");
+    assert_eq!(page_attach["params"]["targetId"], "implicit-page-2");
+    let mut fifth = connect(&broker, Endpoint::Browser, Role::Viewer, "epsilon").await;
+    send(
+        &fifth,
+        &broker,
+        r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"global-over","flatten":true}}"#,
+    )
+    .await;
+    if let Ok(Some(request)) = timeout(QUIET, engine.receive.recv()).await {
+        engine.reply(
+            request_id(&request),
+            json!({ "sessionId": "global-over-session" }),
+        );
+        panic!(
+            "page reservation was not counted: {}",
+            next_frame(&mut fifth).await
+        );
+    }
+    let rejected = next_frame(&mut fifth).await;
+    assert_eq!(rejected["id"], 1);
+    assert!(message(&rejected).contains("limit"));
+    engine.reply(
+        request_id(&page_attach),
+        json!({ "sessionId": "page-session-2" }),
+    );
+    send(&page, &broker, r#"{"id":1,"method":"Page.enable"}"#).await;
+    let enable = next_request(&mut engine).await;
+    assert_eq!(enable["method"], "Page.enable");
+    assert_eq!(enable["sessionId"], "page-session-2");
+    engine.reply(request_id(&enable), json!({}));
+    assert!(next_frame(&mut page).await.get("result").is_some());
+    send(
+        &fifth,
+        &broker,
+        r#"{"id":2,"method":"Target.attachToTarget","params":{"targetId":"global-over-2","flatten":true}}"#,
+    )
+    .await;
+    if let Ok(Some(request)) = timeout(QUIET, engine.receive.recv()).await {
+        engine.reply(
+            request_id(&request),
+            json!({ "sessionId": "global-over-two" }),
+        );
+        panic!(
+            "1025th attachment was authorized: {}",
+            next_frame(&mut fifth).await
+        );
+    }
+    let rejected = next_frame(&mut fifth).await;
+    assert_eq!(rejected["id"], 2);
+    assert!(message(&rejected).contains("limit"));
+    send(
+        &clients[0],
+        &broker,
+        r#"{"id":301,"method":"Target.detachFromTarget","params":{"sessionId":"alpha-session-1"}}"#,
+    )
+    .await;
+    let detach = next_request(&mut engine).await;
+    assert_eq!(detach["method"], "Target.detachFromTarget");
+    engine.reply(request_id(&detach), json!({}));
+    assert_eq!(next_frame(&mut clients[0]).await["id"], 301);
+    send(
+        &fifth,
+        &broker,
+        r#"{"id":3,"method":"Target.attachToTarget","params":{"targetId":"global-reused","flatten":true}}"#,
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["method"], "Target.attachToTarget");
+    engine.reply(
+        request_id(&attach),
+        json!({ "sessionId": "global-reused-session" }),
+    );
+    let attached = next_frame(&mut fifth).await;
+    assert_eq!(attached["result"]["sessionId"], "global-reused-session");
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn quarantined_overflow_survives_cleanup_timeout_and_detached_event() {
+    let mut engine = fake_engine().await;
+    let broker =
+        broker_with_deadlines(&engine, Duration::from_secs(30), Duration::from_millis(400)).await;
+    let mut owner = connect(&broker, Endpoint::Browser, Role::Viewer, "owner").await;
+    fill_attachments(&mut engine, &broker, &mut owner, "six", 256).await;
+    let mut other = connect(&broker, Endpoint::Browser, Role::Viewer, "other").await;
+    let overflow = json!({
+      "sessionId": "six-session-0",
+      "method": "Target.attachedToTarget",
+      "params": { "sessionId": "overflow-a", "targetInfo": { "targetId": "overflow-page-a" } }
+    });
+    engine.event(overflow.clone());
+    let first = next_request(&mut engine).await;
+    assert_eq!(first["method"], "Target.detachFromTarget");
+    assert_eq!(first["params"]["sessionId"], "overflow-a");
+    let discovery = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.targets().await })
+    };
+    let targets = next_request(&mut engine).await;
+    assert_eq!(targets["method"], "Target.getTargets");
+    let expired = timeout(WAIT, discovery)
+        .await
+        .expect("target discovery timeout")
+        .expect("target discovery task");
+    let error = expired.err().expect("target discovery should time out");
+    assert!(error.contains("timed out"), "{error}");
+    engine.event(overflow.clone());
+    expect_no_request(&mut engine).await;
+    expect_silence(&mut owner).await;
+    engine.reply(request_id(&first), json!({}));
+    engine.event(overflow.clone());
+    let second = next_request(&mut engine).await;
+    assert_eq!(second["method"], "Target.detachFromTarget");
+    assert_eq!(second["params"]["sessionId"], "overflow-a");
+    engine.event(json!({
+      "method": "Target.detachedFromTarget",
+      "params": { "sessionId": "overflow-a" }
+    }));
+    engine.event(overflow.clone());
+    let third = next_request(&mut engine).await;
+    assert_eq!(third["method"], "Target.detachFromTarget");
+    assert_eq!(third["params"]["sessionId"], "overflow-a");
+    send(&other, &broker, r#"{"id":1,"method":"Browser.getVersion"}"#).await;
+    let version = next_request(&mut engine).await;
+    assert_eq!(version["method"], "Browser.getVersion");
+    engine.reply(request_id(&version), json!({ "userAgent": "fake" }));
+    assert_eq!(next_frame(&mut other).await["id"], 1);
+    send(
+        &other,
+        &broker,
+        r#"{"id":2,"method":"DOM.getDocument","sessionId":"overflow-a"}"#,
+    )
+    .await;
+    let rejected = next_frame(&mut other).await;
+    assert!(
+        message(&rejected).contains("attachment expired or belongs to another"),
+        "{}",
+        message(&rejected)
+    );
+    expect_no_request(&mut engine).await;
+    engine.reply(request_id(&third), json!({}));
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn autoattach_backfill_reserves_before_creating_attachment() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut client = connect(&broker, Endpoint::Browser, Role::Controller, "viewer").await;
+    fill_attachments(&mut engine, &broker, &mut client, "five", 256).await;
+    send(
+        &client,
+        &broker,
+        r#"{"id":300,"method":"Target.setAutoAttach","params":{"autoAttach":true,"flatten":true}}"#,
+    )
+    .await;
+    let auto = next_request(&mut engine).await;
+    assert_eq!(auto["method"], "Target.setAutoAttach");
+    engine.reply(request_id(&auto), json!({}));
+    let targets = next_request(&mut engine).await;
+    assert_eq!(targets["method"], "Target.getTargets");
+    engine.reply(
+        request_id(&targets),
+        json!({ "targetInfos": [{ "targetId": "backfill-page", "type": "page" }] }),
+    );
+    if let Ok(Some(request)) = timeout(QUIET, engine.receive.recv()).await {
+        assert_ne!(
+            request["method"], "Target.attachToTarget",
+            "autoattach backfill created the 257th attachment"
+        );
+        assert_eq!(request["method"], "Target.setAutoAttach");
+        assert_eq!(request["params"]["autoAttach"], false);
+    }
+    let rejected = next_frame(&mut client).await;
+    assert_eq!(rejected["id"], 300);
+    assert!(message(&rejected).contains("limit"));
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
 }
