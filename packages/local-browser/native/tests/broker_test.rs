@@ -3783,3 +3783,221 @@ async fn autoattach_backfill_reserves_before_creating_attachment() {
     engine.kill();
     assert!(!broker.wait_terminal().await);
 }
+
+// 真实 actor 的 internal deadline 超时后仍把 backfill attach 挂起，返回待回复的上游请求。
+async fn start_held_backfill(
+    engine: &mut FakeEngine,
+    broker: &BrokerHandle,
+    client: &mut TestClient,
+    external_id: u64,
+    target: &str,
+) -> Value {
+    let request = json!({
+      "id": external_id,
+      "method": "Target.setAutoAttach",
+      "params": { "autoAttach": true, "flatten": true }
+    })
+    .to_string();
+    send(client, broker, &request).await;
+    let auto = next_request(engine).await;
+    assert_eq!(auto["method"], "Target.setAutoAttach");
+    engine.reply(request_id(&auto), json!({}));
+    let targets = next_request(engine).await;
+    assert_eq!(targets["method"], "Target.getTargets");
+    engine.reply(
+        request_id(&targets),
+        json!({ "targetInfos": [{ "targetId": target, "type": "page" }] }),
+    );
+    let attach = next_request(engine).await;
+    assert_eq!(attach["method"], "Target.attachToTarget");
+    assert_eq!(attach["params"]["targetId"], target);
+    attach
+}
+
+#[tokio::test]
+async fn backfill_attach_timeout_late_success_registers_and_releases_the_intent() {
+    let mut engine = fake_engine().await;
+    let broker = broker_with_deadlines(
+        &engine,
+        Duration::from_secs(120),
+        Duration::from_millis(400),
+    )
+    .await;
+    let mut owner = connect(&broker, Endpoint::Browser, Role::Controller, "owner").await;
+    fill_attachments(&mut engine, &broker, &mut owner, "late", 2).await;
+    let mut other = connect(&broker, Endpoint::Browser, Role::Viewer, "other").await;
+    let backfill = start_held_backfill(&mut engine, &broker, &mut owner, 300, "late-target").await;
+    let expired = next_frame(&mut owner).await;
+    assert_eq!(expired["id"], 300);
+    assert!(
+        message(&expired).contains("outcome may be unknown"),
+        "{expired}"
+    );
+    send(
+        &other,
+        &broker,
+        r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"late-target","flatten":true}}"#,
+    )
+    .await;
+    // timeout 后 target 仍由预约 intent 占住；新 attach 只排队，不派发。
+    expect_no_request(&mut engine).await;
+    engine.reply(
+        request_id(&backfill),
+        json!({ "sessionId": "late-session" }),
+    );
+    // 迟到成功登记到原 owner，释放预约后排队的新 attach 才派发。
+    let queued = next_request(&mut engine).await;
+    assert_eq!(queued["method"], "Target.attachToTarget");
+    assert_eq!(queued["params"]["targetId"], "late-target");
+    engine.reply(request_id(&queued), json!({ "sessionId": "other-session" }));
+    let attached = next_frame(&mut other).await;
+    assert_eq!(attached["id"], 1);
+    assert_eq!(attached["result"]["sessionId"], "other-session");
+    send(
+        &owner,
+        &broker,
+        r#"{"id":401,"method":"DOM.getDocument","sessionId":"late-session","params":{"depth":1}}"#,
+    )
+    .await;
+    let evaluate = next_request(&mut engine).await;
+    assert_eq!(evaluate["method"], "DOM.getDocument");
+    assert_eq!(evaluate["sessionId"], "late-session");
+    engine.reply(request_id(&evaluate), json!({ "root": { "nodeId": 1 } }));
+    assert_eq!(next_frame(&mut owner).await["id"], 401);
+    send(
+        &other,
+        &broker,
+        r#"{"id":2,"method":"DOM.getDocument","sessionId":"late-session","params":{}}"#,
+    )
+    .await;
+    let foreign = next_frame(&mut other).await;
+    assert!(
+        message(&foreign).contains("expired or belongs to another"),
+        "{foreign}"
+    );
+    expect_no_request(&mut engine).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn backfill_attach_timeout_late_error_releases_the_intent_without_attachment() {
+    let mut engine = fake_engine().await;
+    let broker = broker_with_deadlines(
+        &engine,
+        Duration::from_secs(120),
+        Duration::from_millis(400),
+    )
+    .await;
+    let mut owner = connect(&broker, Endpoint::Browser, Role::Controller, "owner").await;
+    let mut other = connect(&broker, Endpoint::Browser, Role::Viewer, "other").await;
+    let backfill = start_held_backfill(&mut engine, &broker, &mut owner, 300, "error-target").await;
+    let expired = next_frame(&mut owner).await;
+    assert_eq!(expired["id"], 300);
+    assert!(
+        message(&expired).contains("outcome may be unknown"),
+        "{expired}"
+    );
+    send(
+        &other,
+        &broker,
+        r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"error-target","flatten":true}}"#,
+    )
+    .await;
+    expect_no_request(&mut engine).await;
+    engine.push(json!({
+      "id": request_id(&backfill),
+      "error": { "code": -32000, "message": "late attach failed" }
+    }));
+    let queued = next_request(&mut engine).await;
+    assert_eq!(queued["method"], "Target.attachToTarget");
+    assert_eq!(queued["params"]["targetId"], "error-target");
+    engine.reply(
+        request_id(&queued),
+        json!({ "sessionId": "after-error-session" }),
+    );
+    let attached = next_frame(&mut other).await;
+    assert_eq!(attached["id"], 1);
+    assert_eq!(attached["result"]["sessionId"], "after-error-session");
+    // 迟到 error 不创建 attachment，也不产生清理 detach。
+    expect_no_request(&mut engine).await;
+    send(
+        &owner,
+        &broker,
+        r#"{"id":401,"method":"DOM.getDocument","sessionId":"failed-backfill-session","params":{"depth":1}}"#,
+    )
+    .await;
+    let rejected = next_frame(&mut owner).await;
+    assert!(
+        message(&rejected).contains("expired or belongs to another"),
+        "{rejected}"
+    );
+    expect_no_request(&mut engine).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn backfill_attach_late_success_after_client_close_never_reaches_a_new_client() {
+    let mut engine = fake_engine().await;
+    let broker = broker_with_deadlines(
+        &engine,
+        Duration::from_secs(120),
+        Duration::from_millis(500),
+    )
+    .await;
+    let mut owner = connect(&broker, Endpoint::Browser, Role::Controller, "owner").await;
+    let backfill =
+        start_held_backfill(&mut engine, &broker, &mut owner, 300, "orphan-target").await;
+    let expired = next_frame(&mut owner).await;
+    assert_eq!(expired["id"], 300);
+    assert!(
+        message(&expired).contains("outcome may be unknown"),
+        "{expired}"
+    );
+    broker.closed(owner.id);
+    let auto = next_request(&mut engine).await;
+    assert_eq!(auto["method"], "Target.setAutoAttach");
+    assert_eq!(auto["params"]["autoAttach"], false);
+    engine.reply(
+        request_id(&backfill),
+        json!({ "sessionId": "orphan-session" }),
+    );
+    // 迟到成功仍按旧 owner 清理：先退役 autoattach，再 detach 上游 session。
+    engine.reply(request_id(&auto), json!({}));
+    let detach = next_request(&mut engine).await;
+    assert_eq!(detach["method"], "Target.detachFromTarget");
+    assert_eq!(detach["params"]["sessionId"], "orphan-session");
+    let mut newcomer = connect(&broker, Endpoint::Browser, Role::Viewer, "newcomer").await;
+    send(
+        &newcomer,
+        &broker,
+        r#"{"id":1,"method":"DOM.getDocument","sessionId":"orphan-session","params":{"depth":1}}"#,
+    )
+    .await;
+    let rejected = next_frame(&mut newcomer).await;
+    assert!(
+        message(&rejected).contains("expired or belongs to another"),
+        "{rejected}"
+    );
+    engine.reply(request_id(&detach), json!({}));
+    send(
+        &newcomer,
+        &broker,
+        r#"{"id":2,"method":"Target.attachToTarget","params":{"targetId":"orphan-target","flatten":true}}"#,
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["method"], "Target.attachToTarget");
+    assert_eq!(attach["params"]["targetId"], "orphan-target");
+    engine.reply(
+        request_id(&attach),
+        json!({ "sessionId": "newcomer-session" }),
+    );
+    let attached = next_frame(&mut newcomer).await;
+    assert_eq!(attached["id"], 2);
+    assert_eq!(attached["result"]["sessionId"], "newcomer-session");
+    expect_no_request(&mut engine).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}

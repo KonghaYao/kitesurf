@@ -2664,7 +2664,14 @@ impl Broker {
                         .clients
                         .get(&managed_client)
                         .map_or(role, |state| Some(state.role));
-                    let target = active.work.params.string("targetId").map(str::to_string);
+                    let target = match &active.stage {
+                        // backfill 的 work 是 setAutoAttach，候选 target 只在 stage 里。
+                        ManagedStage::BackfillAttach {
+                            target: Some(target),
+                            ..
+                        } => Some(target.as_str().to_string()),
+                        _ => active.work.params.string("targetId").map(str::to_string),
+                    };
                     let session = active.work.params.string("sessionId").map(str::to_string);
                     let auto = active.work.params.auto_attach;
                     // 迟到回复仍可能改变归属，所以保留 intent 与 auto owner 直到它到达。
