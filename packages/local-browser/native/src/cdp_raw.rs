@@ -4,7 +4,6 @@
 
 use std::fmt;
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
@@ -16,97 +15,10 @@ use crate::transport::{JsonScratchGuard, PayloadBudget, PayloadLease, MAX_FRAME_
 const STRING_CHUNK: usize = 4096;
 const IDENTITY_BYTES: usize = 4096;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RawError {
-    Invalid,
-    Limit,
-    Budget,
-    Duplicate,
-}
-
-impl fmt::Display for RawError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("invalid or unbudgeted CDP payload")
-    }
-}
-impl std::error::Error for RawError {}
-
+pub use crate::transport::{LeasedRaw, RawError, RawSpan};
 type Result<T> = std::result::Result<T, RawError>;
 
-// owner token 只分配不回收；溢出 fail-closed，绝不 wrap 后复用旧 token。
-static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
-
-fn next_owner_token() -> Result<u64> {
-    NEXT_OWNER
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
-            token.checked_add(1)
-        })
-        .map_err(|_| RawError::Limit)
-}
-
-// token 是每个 owner 固定 8 字节 metadata；无全局注册表，span 复制不分配。
-// client 由 RequestLease 的 fixed accounting 覆盖；后继 raw owner 仍须接线计费。
-struct RawOwner {
-    token: u64,
-    text: String,
-    _lease: PayloadLease,
-}
-
-// client 的 64 KiB fixed accounting 为每个 owner（含 Arc 头）保留 128 bytes。
-const _: () = assert!(std::mem::size_of::<RawOwner>() + 2 * std::mem::size_of::<usize>() <= 128);
-
-/// clone 只共享 backing、lease 与 token；复制必须经 copy_span_to_ordinary 先取得普通预算。
-#[derive(Clone)]
-pub struct LeasedRaw(Arc<RawOwner>);
-
 impl LeasedRaw {
-    pub fn new(text: String, lease: PayloadLease) -> Result<Self> {
-        if text.len() > MAX_FRAME_BYTES || text.capacity() > lease.bytes() {
-            return Err(RawError::Limit);
-        }
-        Ok(Self(Arc::new(RawOwner {
-            token: next_owner_token()?,
-            text,
-            _lease: lease,
-        })))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0.text
-    }
-
-    pub fn full_span(&self) -> RawSpan {
-        RawSpan {
-            owner: self.0.token,
-            start: 0,
-            end: self.0.text.len() as u32,
-        }
-    }
-
-    pub fn text(&self, span: RawSpan) -> Result<&str> {
-        if span.owner != self.0.token {
-            return Err(RawError::Invalid);
-        }
-        self.as_str()
-            .get(span.start as usize..span.end as usize)
-            .ok_or(RawError::Invalid)
-    }
-
-    pub fn copy_span_to_ordinary(
-        &self,
-        span: RawSpan,
-        budget: &PayloadBudget,
-        _scratch: &mut JsonScratchGuard<'_>,
-    ) -> Result<Self> {
-        let text = self.text(span)?;
-        let lease = budget
-            .try_acquire(text.len(), false)
-            .ok_or(RawError::Budget)?;
-        let mut copy = String::with_capacity(text.len());
-        copy.push_str(text);
-        Self::new(copy, lease)
-    }
-
     pub fn raw<'a>(
         &'a self,
         span: RawSpan,
@@ -116,31 +28,6 @@ impl LeasedRaw {
         preflight(text, ParsePolicy::ClientOpaque)?;
         serde_json::from_str(text).map_err(|_| RawError::Invalid)
     }
-
-    pub fn span_of(&self, raw: &RawValue) -> Result<RawSpan> {
-        let start = (raw.get().as_ptr() as usize)
-            .checked_sub(self.as_str().as_ptr() as usize)
-            .ok_or(RawError::Invalid)?;
-        let end = start
-            .checked_add(raw.get().len())
-            .ok_or(RawError::Invalid)?;
-        if end > self.as_str().len() {
-            return Err(RawError::Invalid);
-        }
-        Ok(RawSpan {
-            owner: self.0.token,
-            start: start as u32,
-            end: end as u32,
-        })
-    }
-}
-
-/// 16 bytes：owner token 加范围。clone 共享 token，跨 owner 一律拒绝。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RawSpan {
-    owner: u64,
-    start: u32,
-    end: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -222,6 +109,192 @@ impl RawEnvelope {
             .position(|field| *field == name)
             .map(|index| self.fields[index])
             .unwrap_or_default()
+    }
+}
+
+/// 固定 span view；只借用 owner 和同步 scratch，扫描结束后才能读取下一层。
+#[derive(Clone, Copy)]
+pub struct RawNode<'a> {
+    backing: &'a LeasedRaw,
+    span: RawSpan,
+}
+
+impl RawEnvelope {
+    pub fn node(&self, name: &str) -> Option<RawNode<'_>> {
+        self.field(name).span().map(|span| RawNode {
+            backing: &self.backing,
+            span,
+        })
+    }
+
+    pub fn id(&self, scratch: &mut JsonScratchGuard<'_>) -> Option<u64> {
+        self.node("id")?.u64(scratch)
+    }
+
+    pub fn has_error(&self) -> bool {
+        self.field("error") != RawPresence::Missing
+    }
+}
+
+impl LeasedRaw {
+    pub fn node(&self) -> RawNode<'_> {
+        RawNode {
+            backing: self,
+            span: self.full_span(),
+        }
+    }
+}
+
+impl<'a> RawNode<'a> {
+    pub fn span(self) -> RawSpan {
+        self.span
+    }
+
+    pub fn field(self, name: &str, scratch: &mut JsonScratchGuard<'_>) -> Option<Self> {
+        let [field] = select_fields(
+            self.backing,
+            self.span,
+            [name],
+            DuplicatePolicy::LastWins,
+            scratch,
+        )
+        .ok()?;
+        field.span().map(|span| Self {
+            backing: self.backing,
+            span,
+        })
+    }
+
+    pub fn raw(self, scratch: &mut JsonScratchGuard<'_>) -> Result<&'a RawValue> {
+        self.backing.raw(self.span, scratch)
+    }
+
+    pub fn text(self) -> Result<&'a str> {
+        self.backing.text(self.span)
+    }
+
+    pub fn string(
+        self,
+        budget: &PayloadBudget,
+        scratch: &mut JsonScratchGuard<'_>,
+    ) -> Result<Option<LeasedIdentity>> {
+        if !self.text()?.starts_with('"') {
+            return Ok(None);
+        }
+        decode_identity(self.raw(scratch)?, budget, scratch).map(Some)
+    }
+
+    pub fn equals(self, expected: &str, scratch: &mut JsonScratchGuard<'_>) -> bool {
+        self.raw(scratch)
+            .and_then(|raw| TextScratch { _private: () }.equals(raw, expected))
+            .unwrap_or(false)
+    }
+
+    pub fn u64(self, scratch: &mut JsonScratchGuard<'_>) -> Option<u64> {
+        upstream_id(self.raw(scratch).ok()?, scratch)
+    }
+
+    pub fn is_array(self) -> bool {
+        self.text().is_ok_and(|text| text.starts_with('['))
+    }
+
+    pub fn copy(
+        self,
+        budget: &PayloadBudget,
+        scratch: &mut JsonScratchGuard<'_>,
+    ) -> Result<LeasedRaw> {
+        self.backing
+            .copy_span_to_ordinary(self.span, budget, scratch)
+    }
+}
+
+pub struct RawText<'a> {
+    raw: &'a str,
+}
+
+impl RawNode<'_> {
+    pub fn decoded(&self) -> RawText<'_> {
+        let raw = self.text().unwrap_or("\"\"");
+        RawText {
+            raw: if raw.starts_with('"') { raw } else { "\"\"" },
+        }
+    }
+}
+
+impl Serialize for RawText<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl fmt::Display for RawText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        string_chunks(self.raw, |chunk| {
+            f.write_str(chunk).map_err(|_| RawError::Limit)
+        })
+        .map_err(|_| fmt::Error)
+    }
+}
+
+pub struct RawArray<'a> {
+    backing: &'a LeasedRaw,
+    remaining: &'a str,
+}
+
+impl<'a> RawNode<'a> {
+    pub fn array(self, scratch: &mut JsonScratchGuard<'_>) -> Option<RawArray<'a>> {
+        let validated = self.raw(scratch).ok()?;
+        let text = validated.get().strip_prefix('[')?;
+        Some(RawArray {
+            backing: self.backing,
+            remaining: text,
+        })
+    }
+}
+
+impl<'a> RawArray<'a> {
+    pub fn next(&mut self, _scratch: &mut JsonScratchGuard<'_>) -> Result<Option<RawNode<'a>>> {
+        let text = self.remaining.trim_start();
+        if text.starts_with(']') {
+            return Ok(None);
+        }
+        let mut stream = serde_json::Deserializer::from_str(text).into_iter::<&RawValue>();
+        let raw = stream
+            .next()
+            .ok_or(RawError::Invalid)?
+            .map_err(|_| RawError::Invalid)?;
+        self.remaining = text[stream.byte_offset()..].trim_start();
+        if let Some(rest) = self.remaining.strip_prefix(',') {
+            self.remaining = rest;
+        }
+        Ok(Some(RawNode {
+            backing: self.backing,
+            span: self.backing.span_of(raw)?,
+        }))
+    }
+}
+
+impl fmt::Display for LeasedIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+impl Serialize for LeasedIdentity {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl std::ops::Deref for LeasedIdentity {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
     }
 }
 
@@ -548,6 +621,16 @@ struct IdentityOwner {
     _lease: PayloadLease,
 }
 impl LeasedIdentity {
+    pub fn literal(text: &str, budget: &PayloadBudget) -> Result<Self> {
+        let charged =
+            text.len() + std::mem::size_of::<IdentityOwner>() + 2 * std::mem::size_of::<usize>();
+        let lease = budget.try_acquire(charged, false).ok_or(RawError::Budget)?;
+        Ok(Self(Arc::new(IdentityOwner {
+            text: text.to_owned(),
+            _lease: lease,
+        })))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0.text
     }
@@ -556,17 +639,27 @@ impl LeasedIdentity {
 pub fn decode_identity(
     raw: &RawValue,
     budget: &PayloadBudget,
+    scratch: &mut JsonScratchGuard<'_>,
+) -> Result<LeasedIdentity> {
+    decode_text(raw, budget, IDENTITY_BYTES, scratch)
+}
+
+pub fn decode_text(
+    raw: &RawValue,
+    budget: &PayloadBudget,
+    limit: usize,
     _scratch: &mut JsonScratchGuard<'_>,
 ) -> Result<LeasedIdentity> {
     let mut length = 0usize;
     string_chunks(raw.get(), |chunk| {
         length = length
             .checked_add(chunk.len())
-            .filter(|n| *n <= IDENTITY_BYTES)
+            .filter(|n| *n <= limit)
             .ok_or(RawError::Limit)?;
         Ok(())
     })?;
-    let lease = budget.try_acquire(length, false).ok_or(RawError::Budget)?;
+    let charged = length + std::mem::size_of::<IdentityOwner>() + 2 * std::mem::size_of::<usize>();
+    let lease = budget.try_acquire(charged, false).ok_or(RawError::Budget)?;
     let mut text = String::with_capacity(length);
     string_chunks(raw.get(), |chunk| {
         if text.len() + chunk.len() > text.capacity() {
@@ -729,6 +822,70 @@ pub fn safe_integer(raw: &RawValue, _scratch: &mut JsonScratchGuard<'_>) -> Opti
 
 pub fn upstream_id(raw: &RawValue, _scratch: &mut JsonScratchGuard<'_>) -> Option<u64> {
     number(raw)?.as_u64()
+}
+
+/// 两遍同步输出：先计长再租用固定容量，callback 不得重入 JSON 扫描。
+pub fn serialize_event(
+    envelope: &RawEnvelope,
+    page: bool,
+    budget: &PayloadBudget,
+    scratch: &mut JsonScratchGuard<'_>,
+) -> Result<(String, PayloadLease)> {
+    fn emit(
+        raw: &LeasedRaw,
+        page: bool,
+        scratch: &mut JsonScratchGuard<'_>,
+        out: &mut dyn Write,
+    ) -> Result<()> {
+        if !page {
+            return out
+                .write_all(raw.as_str().as_bytes())
+                .map_err(|_| RawError::Limit);
+        }
+        out.write_all(b"{").map_err(|_| RawError::Limit)?;
+        let mut first = true;
+        visit_object(raw, raw.full_span(), scratch, |key, value, text| {
+            if text.equals(key, "sessionId")? {
+                return Ok(());
+            }
+            if !first {
+                out.write_all(b",").map_err(|_| RawError::Limit)?;
+            }
+            first = false;
+            out.write_all(key.get().as_bytes())
+                .map_err(|_| RawError::Limit)?;
+            out.write_all(b":").map_err(|_| RawError::Limit)?;
+            out.write_all(value.get().as_bytes())
+                .map_err(|_| RawError::Limit)
+        })?;
+        out.write_all(b"}").map_err(|_| RawError::Limit)
+    }
+    struct Count(usize);
+    impl Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .filter(|n| *n <= MAX_FRAME_BYTES)
+                .ok_or_else(|| std::io::Error::other("payload limit exceeded"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    emit(envelope.backing(), page, scratch, &mut count)?;
+    let lease = budget.try_acquire(count.0, false).ok_or(RawError::Budget)?;
+    let mut writer = FixedWriter {
+        bytes: Vec::with_capacity(count.0),
+        limit: count.0,
+    };
+    emit(envelope.backing(), page, scratch, &mut writer)?;
+    Ok((
+        String::from_utf8(writer.bytes).map_err(|_| RawError::Invalid)?,
+        lease,
+    ))
 }
 
 struct FixedWriter {

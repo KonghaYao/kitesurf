@@ -341,20 +341,7 @@ async fn run() -> HostResult<bool> {
         let session = upstream
             .request("Kitesurf.getSessionInfo", None, Duration::from_secs(30))
             .await?;
-        let session = SessionInfo {
-            session_id: session["sessionId"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-            build_version: session["buildVersion"]
-                .as_str()
-                .unwrap_or(VERSION)
-                .to_string(),
-            environment: session["environment"]
-                .as_str()
-                .unwrap_or("local")
-                .to_string(),
-        };
+        let session = SessionInfo::from_raw(&session, &upstream.handle.budget, VERSION)?;
         if session.session_id.is_empty() {
             return Err("engine returned no session id".into());
         }

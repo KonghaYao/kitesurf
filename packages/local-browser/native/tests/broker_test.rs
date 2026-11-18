@@ -86,7 +86,7 @@ fn client_raw_fixed_accounting_and_failure_release() {
         + size_of::<RequestLease>()
         + size_of::<ObservedParams>()
         + 16 * size_of::<crate::cdp_raw::RawSpan>()
-        + 16 * 128;
+        + 16 * 256;
     assert!(fixed + 12 * 4096 < 64 * 1024);
     println!("client metadata fixed={fixed}, identity copies<=49152, lease=65536");
     let budget = PayloadBudget::default();
@@ -339,6 +339,112 @@ mod request_allocations {
     static ALLOCATOR: Allocator = Allocator;
 
     #[test]
+    fn production_received_allocations_cover_raw_reply_and_event_outputs() {
+        use crate::cdp_raw::{self, LeasedRaw, ParsePolicy, RawEnvelope};
+        use crate::transport::{PayloadBudget, MAX_FRAME_BYTES};
+        use super::super::Received;
+        let budget = PayloadBudget::default();
+        drop(budget.json_scratch());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        drop(runtime.block_on(budget.receive(true)));
+        let warm = LeasedRaw::literal("{}", &budget).unwrap();
+        let warm = RawEnvelope::parse(
+            warm,
+            ParsePolicy::UpstreamStrict,
+            &mut budget.json_scratch(),
+        )
+        .unwrap();
+        drop(cdp_raw::serialize_event(&warm, true, &budget, &mut budget.json_scratch()).unwrap());
+        drop(warm);
+        let warm =
+            LeasedRaw::accounted("{}".into(), runtime.block_on(budget.receive(true)), &budget)
+                .unwrap();
+        let warm = RawEnvelope::parse(
+            warm,
+            ParsePolicy::UpstreamStrict,
+            &mut budget.json_scratch(),
+        )
+        .unwrap();
+        drop(Received::parse(warm, &budget).unwrap());
+        let fixtures = [
+            (
+                "result",
+                format!(
+                    r#"{{"id":1,"result":{{"data":"{}"}}}}"#,
+                    "\\u0061".repeat(500_000)
+                ),
+                false,
+            ),
+            (
+                "nodes",
+                format!(
+                    r#"{{"method":"Runtime.consoleAPICalled","sessionId":"s","params":[{}0]}}"#,
+                    "{\"x\":[1,2]},".repeat(100_000)
+                ),
+                true,
+            ),
+            (
+                "key",
+                format!(
+                    r#"{{"method":"Runtime.consoleAPICalled","sessionId":"s","{}":0}}"#,
+                    "\\u0061".repeat(500_000)
+                ),
+                true,
+            ),
+            (
+                "unknown",
+                format!(
+                    r#"{{"method":"Runtime.consoleAPICalled","sessionId":"s","unknown":{{{}"end":0}}}}"#,
+                    "\"x\":{},".repeat(100_000)
+                ),
+                true,
+            ),
+        ];
+        for (name, text, page) in fixtures {
+            let wire = text.len();
+            let lease = runtime.block_on(budget.receive(true));
+            TRACK.with(|track| {
+                let mut track = track.borrow_mut();
+                track.stats = Stats::default();
+                track.slots.fill((0, 0));
+                track.active = true;
+            });
+            let raw = LeasedRaw::accounted(text, lease, &budget).unwrap();
+            let envelope = {
+                let mut scratch = budget.json_scratch();
+                RawEnvelope::parse(raw, ParsePolicy::UpstreamStrict, &mut scratch).unwrap()
+            };
+            let received = Received::parse(envelope, &budget).unwrap();
+            let output = if name == "result" {
+                received
+                    .serialize_reply(&budget, 42, Some("external"))
+                    .unwrap()
+            } else {
+                let mut scratch = budget.json_scratch();
+                cdp_raw::serialize_event(&received.raw, page, &budget, &mut scratch).unwrap()
+            };
+            let held = budget.used();
+            assert!(held.0 >= MAX_FRAME_BYTES + output.0.capacity());
+            assert!(held.1 >= wire);
+            drop(received);
+            assert_eq!(budget.used().1, 0);
+            drop(output);
+            let stats = TRACK.with(|track| {
+                let mut track = track.borrow_mut();
+                track.active = false;
+                track.stats
+            });
+            println!("production upstream {name}: {stats:?}; held ordinary/internal={held:?}");
+            assert!(!stats.overflow);
+            assert_eq!(stats.live, 0);
+            assert!(stats.peak < wire + 64 * 1024, "{name}: {stats:?}");
+            assert_eq!(budget.used(), (MAX_FRAME_BYTES, 0));
+        }
+    }
+
+    #[test]
     fn production_request_has_no_params_tree_or_copy() {
         use crate::transport::{PayloadBudget, MAX_FRAME_BYTES};
         use super::super::Request;
@@ -385,6 +491,184 @@ mod request_allocations {
             assert_eq!(budget.used().0, MAX_FRAME_BYTES);
         }
     }
+}
+
+#[test]
+fn upstream_accessors_match_pre_migration_value_policy() {
+    use crate::cdp_raw::{LeasedRaw, ParsePolicy, RawEnvelope};
+    use crate::transport::{PayloadBudget, MAX_FRAME_BYTES};
+    let budget = PayloadBudget::default();
+    let mut messages = Vec::new();
+    for id in [
+        "0",
+        "-0",
+        "1.0",
+        "1e0",
+        "-1",
+        "9007199254740991",
+        "9007199254740992",
+        "18446744073709551615",
+        "18446744073709551616",
+        "1e400",
+        "null",
+    ] {
+        messages.push(format!(r#"{{"id":{id},"result":{{"sessionId":"s"}}}}"#));
+    }
+    messages.extend([
+        r#"{"id":1,"\u0069d":2,"method":"x","\u006dethod":"Target.attachedToTarget","sessionId":"old","session\u0049d":"parent","params":{"sessionId":"old","\u0073essionId":"child","targetInfo":{"targetId":"bad","target\u0049d":"target"}},"result":{"sessionId":"old","session\u0049d":"new"},"error":{},"\u0065rror":null}"#.into(),
+        r#"{"id":1,"result":{},"\u0072esult":null}"#.into(),
+        r#"{"id":1,"error":null}"#.into(),
+        r#"{"id":1,"unknown":"\uD800"}"#.into(),
+        r#"{"id":1,"unknown":1e400}"#.into(),
+        r#"{"id":1,"unknown":[1,]}"#.into(),
+    ]);
+    for depth in [125, 126, 127, 128] {
+        messages.push(format!(
+            r#"{{"id":1,"unknown":{}0{}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        ));
+    }
+    for text in messages {
+        // HEAD^ transport 的原路径：serde Value + as_u64/get，绝不用于生产。
+        let old = serde_json::from_str::<Value>(&text);
+        let lease = budget.try_acquire(text.capacity(), false).unwrap();
+        let raw = LeasedRaw::accounted(text, lease, &budget).unwrap();
+        let parsed = {
+            let mut scratch = budget.json_scratch();
+            RawEnvelope::parse(raw, ParsePolicy::UpstreamStrict, &mut scratch)
+        };
+        assert_eq!(parsed.is_ok(), old.is_ok());
+        if let (Ok(raw), Ok(old)) = (parsed, old) {
+            let value = super::Received::parse(raw, &budget).unwrap();
+            let mut scratch = budget.json_scratch();
+            assert_eq!(
+                value.raw.id(&mut scratch),
+                old.get("id").and_then(Value::as_u64)
+            );
+            assert_eq!(value.has_error(), old.get("error").is_some());
+            for (path, expected) in [
+                (vec!["method"], old.get("method")),
+                (vec!["sessionId"], old.get("sessionId")),
+                (
+                    vec!["params", "sessionId"],
+                    old.pointer("/params/sessionId"),
+                ),
+                (
+                    vec!["params", "targetInfo", "targetId"],
+                    old.pointer("/params/targetInfo/targetId"),
+                ),
+                (
+                    vec!["result", "sessionId"],
+                    old.pointer("/result/sessionId"),
+                ),
+            ] {
+                let mut node = value.raw.node(path[0]);
+                for key in &path[1..] {
+                    node = node.and_then(|node| node.field(key, &mut scratch));
+                }
+                let actual = node.and_then(|node| node.string(&budget, &mut scratch).unwrap());
+                assert_eq!(actual.as_deref(), expected.and_then(Value::as_str));
+            }
+        }
+        assert_eq!(budget.used(), (MAX_FRAME_BYTES, 0));
+    }
+}
+
+#[tokio::test]
+async fn upstream_receive_owner_releases_on_parse_drop_and_backfill_handoff() {
+    use crate::transport::{PayloadBudget, MAX_FRAME_BYTES};
+    use crate::cdp_raw::{LeasedRaw, ParsePolicy, RawEnvelope};
+    let budget = PayloadBudget::default();
+    let lease = budget.receive(true).await;
+    let raw = LeasedRaw::accounted("{invalid".into(), lease, &budget).unwrap();
+    assert!(
+        RawEnvelope::parse(raw, ParsePolicy::UpstreamStrict, &mut budget.json_scratch()).is_err()
+    );
+    assert_eq!(budget.used(), (MAX_FRAME_BYTES, 0));
+    let lease = budget.receive(true).await;
+    let raw = LeasedRaw::accounted(
+        r#"{"result":{"large":"discard","sessionId":"keep"}}"#.into(),
+        lease,
+        &budget,
+    )
+    .unwrap();
+    let saved = {
+        let mut scratch = budget.json_scratch();
+        let envelope = RawEnvelope::parse(raw, ParsePolicy::UpstreamStrict, &mut scratch).unwrap();
+        let saved = envelope
+            .node("result")
+            .unwrap()
+            .field("sessionId", &mut scratch)
+            .unwrap()
+            .copy(&budget, &mut scratch)
+            .unwrap();
+        assert_eq!(saved.as_str(), r#""keep""#);
+        saved
+    };
+    assert_eq!(budget.used().1, 0);
+    drop(timeout(WAIT, budget.receive(true)).await.unwrap());
+    drop(saved);
+    assert_eq!(budget.used(), (MAX_FRAME_BYTES, 0));
+
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut client = connect(&broker, Endpoint::Browser, Role::Controller, "owner").await;
+    send(
+        &client,
+        &broker,
+        r#"{"id":1,"method":"Target.setAutoAttach","params":{"autoAttach":true}}"#,
+    )
+    .await;
+    let request = next_request(&mut engine).await;
+    engine.raw("{invalid".into());
+    engine.raw(r#"{"id":999999,"result":{"unknown":true}}"#.into());
+    engine.raw(format!(
+        r#"{{"id":{},"result":{{"opaque":"{}"}}}}"#,
+        request_id(&request),
+        "x".repeat(256 * 1024)
+    ));
+    let targets = next_request(&mut engine).await;
+    engine.raw(format!(r#"{{"id":{},"result":{{"targetInfos":[{{"type":"page","targetId":"old","target\u0049d":"tab"}}]}}}}"#, request_id(&targets)));
+    let attached = next_request(&mut engine).await;
+    assert_eq!(attached["params"]["targetId"], "tab");
+    engine.reply(request_id(&attached), json!({"sessionId":"attached"}));
+    assert_eq!(
+        next_frame(&mut client).await["result"]["opaque"]
+            .as_str()
+            .unwrap()
+            .len(),
+        256 * 1024
+    );
+    engine.event(json!({"method":"Runtime.consoleAPICalled","sessionId":"attached","params":{}}));
+    assert_eq!(
+        next_frame(&mut client).await["method"],
+        "Runtime.consoleAPICalled"
+    );
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[test]
+fn upstream_raw_sentinel_is_only_an_application_field() {
+    use crate::cdp_raw::{LeasedRaw, ParsePolicy, RawEnvelope};
+    let budget = crate::transport::PayloadBudget::default();
+    let text =
+        r#"{"id":1,"result":{"$serde_json::private::RawValue":"{\"sessionId\":\"hidden\"}"}}"#;
+    let raw = LeasedRaw::literal(text, &budget).unwrap();
+    let envelope = {
+        let mut scratch = budget.json_scratch();
+        RawEnvelope::parse(raw, ParsePolicy::UpstreamStrict, &mut scratch).unwrap()
+    };
+    let value = super::Received::parse(envelope, &budget).unwrap();
+    assert!(value.attached.is_none());
+    let mut scratch = budget.json_scratch();
+    assert!(value
+        .raw
+        .node("result")
+        .unwrap()
+        .field("$serde_json::private::RawValue", &mut scratch)
+        .is_some());
 }
 
 const WAIT: Duration = Duration::from_secs(2);
@@ -458,9 +742,84 @@ async fn client_dispatch_preserves_opaque_params_and_drops_extra_fields() {
     assert!(!broker.wait_terminal().await);
 }
 
+#[tokio::test]
+async fn raw_upstream_reply_and_page_event_use_production_ingress() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut browser = connect(&broker, Endpoint::Browser, Role::Controller, "owner").await;
+    let mut page = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "tab".into(),
+        },
+        Role::Viewer,
+        "viewer",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"page-session"}));
+    send(&page, &broker, r#"{"id":1,"method":"Page.enable"}"#).await;
+    let enabled = next_request(&mut engine).await;
+    engine.reply(request_id(&enabled), json!({}));
+    assert_eq!(next_frame(&mut page).await["id"], 1);
+    let event = r#"{ "method":"Runtime.consoleAPICalled", "sessionId":"wrong", "session\u0049d":"page-session", "params":{"x":1}, "$serde_json::private::RawValue":"opaque" }"#;
+    engine.raw(event.into());
+    let frame = next_frame(&mut page).await;
+    assert!(frame.get("sessionId").is_none());
+    assert_eq!(frame["params"]["x"], 1);
+    assert_eq!(frame["$serde_json::private::RawValue"], "opaque");
+    expect_silence(&mut browser).await;
+    send(
+        &browser,
+        &broker,
+        r#"{"id":9,"method":"Browser.getVersion"}"#,
+    )
+    .await;
+    let request = next_request(&mut engine).await;
+    let id = request_id(&request);
+    engine.raw(format!(
+        r#"{{"id":{id}.0,"method":"Runtime.consoleAPICalled","params":{{"secret":true}}}}"#
+    ));
+    engine.raw(r#"{"id":999999,"result":{"secret":true}}"#.to_string());
+    engine.raw(format!(
+        r#"{{"id":999998,"\u0069d":{id},"result":{{ "opaque" : "\u0061", "sessionId":"{}" }},"error":null}}"#,
+        "x".repeat(8192),
+    ));
+    let command = timeout(WAIT, browser.frames.recv()).await.unwrap().unwrap();
+    let ClientCommand::Text(text, _lease) = command else {
+        panic!("expected reply")
+    };
+    assert!(text.contains(r#"{ "opaque" : "\u0061", "sessionId":""#));
+    let reply: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(reply["id"], 9);
+    assert_eq!(reply["result"]["opaque"], "a");
+    assert!(reply.get("error").is_some_and(Value::is_null));
+    expect_silence(&mut browser).await;
+    expect_silence(&mut page).await;
+    send(
+        &browser,
+        &broker,
+        r#"{"id":10,"method":"Target.setDiscoverTargets","params":{"discover":true}}"#,
+    )
+    .await;
+    let discover = next_request(&mut engine).await;
+    engine.reply(request_id(&discover), json!({}));
+    assert_eq!(next_frame(&mut browser).await["id"], 10);
+    let exact = r#" { "method" : "Target.targetCreated", "params" : {"targetInfo":{"type":"page","targetId":"next"}}, "unknown" : [1, 2] } "#;
+    engine.raw(exact.into());
+    let command = timeout(WAIT, browser.frames.recv()).await.unwrap().unwrap();
+    let ClientCommand::Text(text, _lease) = command else {
+        panic!("expected browser event")
+    };
+    assert_eq!(text, exact);
+    expect_silence(&mut page).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
 struct FakeEngine {
     address: SocketAddr,
-    send: mpsc::UnboundedSender<Value>,
+    send: mpsc::UnboundedSender<String>,
     receive: mpsc::UnboundedReceiver<Value>,
     kill: mpsc::UnboundedSender<()>,
 }
@@ -475,7 +834,11 @@ impl FakeEngine {
     }
 
     fn push(&self, value: Value) {
-        self.send.send(value).expect("fake engine outbound");
+        self.raw(value.to_string());
+    }
+
+    fn raw(&self, text: String) {
+        self.send.send(text).expect("fake engine outbound");
     }
 
     fn kill(&self) {
@@ -488,7 +851,7 @@ async fn fake_engine() -> FakeEngine {
         .await
         .expect("bind fake engine");
     let address = listener.local_addr().expect("fake engine address");
-    let (send, mut outbound) = mpsc::unbounded_channel::<Value>();
+    let (send, mut outbound) = mpsc::unbounded_channel::<String>();
     let (inbound, receive) = mpsc::unbounded_channel::<Value>();
     let (kill, mut killed) = mpsc::unbounded_channel::<()>();
     tokio::spawn(async move {
@@ -510,7 +873,7 @@ async fn fake_engine() -> FakeEngine {
 
 async fn serve_fake(
     socket: tokio_tungstenite::WebSocketStream<TcpStream>,
-    outbound: &mut mpsc::UnboundedReceiver<Value>,
+    outbound: &mut mpsc::UnboundedReceiver<String>,
     inbound: &mpsc::UnboundedSender<Value>,
     killed: &mut mpsc::UnboundedReceiver<()>,
 ) {
@@ -518,8 +881,7 @@ async fn serve_fake(
     loop {
         tokio::select! {
           _ = killed.recv() => return,
-          Some(value) = outbound.recv() => {
-            let text = value.to_string();
+          Some(text) = outbound.recv() => {
             if sink.send(Message::Text(text.into())).await.is_err() {
               return;
             }
@@ -1184,11 +1546,16 @@ async fn http_close_redacts_sensitive_upstream_failure_and_retries() {
     let host = HostServer::bind(
         0,
         broker.clone(),
-        SessionInfo {
-            session_id: "fake-session".into(),
-            build_version: "test".into(),
-            environment: "local".into(),
-        },
+        SessionInfo::from_raw(
+            &crate::cdp_raw::LeasedRaw::literal(
+                r#"{"sessionId":"fake-session","buildVersion":"test","environment":"local"}"#,
+                &broker.payload_budget(),
+            )
+            .unwrap(),
+            &broker.payload_budget(),
+            "test",
+        )
+        .unwrap(),
         "generation".into(),
         "new-profile".into(),
         profile,

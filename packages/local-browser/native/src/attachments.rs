@@ -53,13 +53,13 @@ impl Attachments {
         epoch: u64,
         session: &str,
         target: &str,
-        parent: Option<String>,
+        parent: Option<&str>,
     ) -> bool {
         let bytes = session
             .len()
             .saturating_mul(2)
             .saturating_add(target.len())
-            .saturating_add(parent.as_ref().map_or(0, String::len));
+            .saturating_add(parent.map_or(0, str::len));
         let Some(payload) = self.budget.try_acquire(bytes, false) else {
             return false;
         };
@@ -69,7 +69,7 @@ impl Attachments {
                 _payload: payload,
                 session: session.to_string(),
                 target: target.to_string(),
-                parent,
+                parent: parent.map(str::to_owned),
                 client,
                 epoch,
             },

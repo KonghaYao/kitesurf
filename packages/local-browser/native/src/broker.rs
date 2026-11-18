@@ -25,6 +25,64 @@ use crate::observe::Observer;
 use crate::services::ProfileService;
 use crate::transport::{LeasedMessage, PayloadBudget, PayloadLease, Upstream, UpstreamEvent};
 
+impl Upstream {
+    /// 启动探测只复制必要 result，receive lease 在返回普通 owner 前释放。
+    pub async fn request(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        deadline: Duration,
+    ) -> crate::HostResult<LeasedRaw> {
+        let id = self
+            .handle
+            .allocate_id()
+            .ok_or("CDP request ids are exhausted")?;
+        let mut payload = json!({ "id": id, "method": method });
+        if let Some(params) = params {
+            payload["params"] = params;
+        }
+        if !self.handle.send_value(&payload) {
+            return Err("engine connection is closed".into());
+        }
+        let wait = async {
+            loop {
+                let event = tokio::select! {
+                    event = self.events.recv() => event,
+                    _ = self.lost.changed() => return Err("engine connection lost while waiting for a reply".into()),
+                };
+                match event {
+                    Some(UpstreamEvent::Raw(raw)) => {
+                        let mut scratch = self.handle.budget.json_scratch();
+                        let Ok(value) =
+                            RawEnvelope::parse(raw, ParsePolicy::UpstreamStrict, &mut scratch)
+                        else {
+                            continue;
+                        };
+                        if value.id(&mut scratch) != Some(id) {
+                            continue;
+                        }
+                        if value.has_error() {
+                            return Err("CDP command failed".into());
+                        }
+                        return Ok(match value.node("result") {
+                            Some(node) => node.copy(&self.handle.budget, &mut scratch)?,
+                            None => LeasedRaw::literal("null", &self.handle.budget)?,
+                        });
+                    }
+                    Some(UpstreamEvent::Lost(reason)) => return Err(reason.into()),
+                    None => return Err("engine connection closed while waiting for a reply".into()),
+                    _ => {}
+                }
+            }
+        };
+        tokio::time::timeout(deadline, wait)
+            .await
+            .unwrap_or_else(
+                |_| Err(format!("CDP timeout: {method}; outcome may be unknown").into()),
+            )
+    }
+}
+
 pub type ClientId = u64;
 
 const VIEW_METHODS: &[&str] = &[
@@ -123,8 +181,95 @@ pub enum CloseKind {
 }
 
 pub struct LeasedTargets {
-    pub values: Vec<Value>,
-    pub lease: PayloadLease,
+    pub raw: LeasedRaw,
+}
+
+struct Received {
+    raw: RawEnvelope,
+    method: Option<LeasedIdentity>,
+    outer: Option<LeasedIdentity>,
+    session: Option<LeasedIdentity>,
+    target: Option<LeasedIdentity>,
+    attached: Option<LeasedIdentity>,
+}
+
+impl Received {
+    fn parse(raw: RawEnvelope, budget: &PayloadBudget) -> Result<Self, cdp_raw::RawError> {
+        let mut scratch = budget.json_scratch();
+        let response = raw.id(&mut scratch).is_some();
+        let mut string = |path: &[&str]| {
+            let mut node = raw.node(path[0]);
+            for key in &path[1..] {
+                node = node.and_then(|node| node.field(key, &mut scratch));
+            }
+            node.map(|node| node.string(budget, &mut scratch))
+                .transpose()
+                .map(Option::flatten)
+        };
+        let method = if response { None } else { string(&["method"])? };
+        let outer = if response {
+            None
+        } else {
+            string(&["sessionId"])?
+        };
+        let attachment = method.as_deref() == Some("Target.attachedToTarget");
+        let detached = method.as_deref() == Some("Target.detachedFromTarget");
+        let session = if attachment || detached {
+            string(&["params", "sessionId"])?
+        } else {
+            None
+        };
+        let target = if attachment {
+            string(&["params", "targetInfo", "targetId"])?
+        } else {
+            None
+        };
+        let attached = None;
+        Ok(Self {
+            raw,
+            method,
+            outer,
+            session,
+            target,
+            attached,
+        })
+    }
+
+    fn has_error(&self) -> bool {
+        self.raw.has_error()
+    }
+
+    fn serialize_reply(
+        &self,
+        budget: &PayloadBudget,
+        external_id: i64,
+        session: Option<&str>,
+    ) -> Option<(String, PayloadLease)> {
+        #[derive(serde::Serialize)]
+        struct Reply<'a> {
+            id: i64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            result: Option<&'a RawValue>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            error: Option<&'a RawValue>,
+            #[serde(rename = "sessionId", skip_serializing_if = "Option::is_none")]
+            session: Option<&'a str>,
+        }
+        let mut scratch = budget.json_scratch();
+        let reply = Reply {
+            id: external_id,
+            result: self
+                .raw
+                .node("result")
+                .and_then(|node| node.raw(&mut scratch).ok()),
+            error: self
+                .raw
+                .node("error")
+                .and_then(|node| node.raw(&mut scratch).ok()),
+            session,
+        };
+        crate::transport::serialize_payload(budget, &reply, false)
+    }
 }
 
 pub struct SessionSnapshot {
@@ -779,7 +924,7 @@ struct Client {
     role: Role,
     epoch: u64,
     endpoint: Endpoint,
-    primary: Option<String>,
+    primary: Option<LeasedIdentity>,
     page_ready: bool,
     page_queue: VecDeque<Request>,
     page_queue_bytes: usize,
@@ -861,16 +1006,20 @@ struct ManagedWork {
     explicit_session: Option<String>,
     method: String,
     params: ObservedParams,
-    retained: Vec<PayloadLease>,
 }
 
 struct ActiveManaged {
     stage: ManagedStage,
-    response: Value,
+    response: Option<LeasedRaw>,
     work: ManagedWork,
 }
 
-#[derive(Clone)]
+struct BackfillSelection {
+    raw: LeasedRaw,
+    spans: Vec<RawSpan>,
+    _lease: PayloadLease,
+}
+
 enum ManagedStage {
     Sent {
         id: u64,
@@ -880,9 +1029,9 @@ enum ManagedStage {
     },
     BackfillAttach {
         id: u64,
-        targets: Vec<String>,
+        targets: BackfillSelection,
         index: usize,
-        target: String,
+        target: Option<LeasedIdentity>,
     },
 }
 
@@ -1466,7 +1615,7 @@ impl Broker {
                 self.send_error(client_id, external_id, -32000, "Target expired", session);
                 return None;
             }
-            return Some(primary);
+            return Some(primary.as_deref().map(str::to_owned));
         }
         Some(None)
     }
@@ -1537,7 +1686,7 @@ impl Broker {
                 .session()
                 .map(str::to_string)
                 .or_else(|| match &client.endpoint {
-                    Endpoint::Page { .. } => client.primary.clone(),
+                    Endpoint::Page { .. } => client.primary.as_deref().map(str::to_owned),
                     Endpoint::Browser => None,
                 });
         // 入队时校验顶层与 detach 参数 session；排队期间归属可能变化，派发前再校验。
@@ -1554,7 +1703,6 @@ impl Broker {
             return;
         }
         let work = ManagedWork {
-            retained: Vec::new(),
             client: client_id,
             epoch: client.epoch,
             external_id,
@@ -1678,17 +1826,17 @@ impl Broker {
         true
     }
 
-    fn send_reply(
+    fn send_reply<T: serde::Serialize>(
         &mut self,
         client: ClientId,
         external_id: i64,
-        result: Value,
+        result: T,
         session: Option<String>,
     ) {
         #[derive(serde::Serialize)]
-        struct Reply<'a> {
+        struct Reply<'a, T> {
             id: i64,
-            result: &'a Value,
+            result: &'a T,
             #[serde(rename = "sessionId", skip_serializing_if = "Option::is_none")]
             session: Option<&'a str>,
         }
@@ -1711,34 +1859,21 @@ impl Broker {
         client: ClientId,
         external_id: i64,
         session: Option<String>,
-        response: &Value,
+        response: &Received,
     ) {
-        #[derive(serde::Serialize)]
-        struct Reply<'a> {
-            id: i64,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            result: Option<&'a Value>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            error: Option<&'a Value>,
-            #[serde(rename = "sessionId", skip_serializing_if = "Option::is_none")]
-            session: Option<&'a str>,
-        }
-        let reply = Reply {
-            id: external_id,
-            result: response.get("result"),
-            error: response.get("error"),
-            session: session.as_deref(),
-        };
-        let Some((text, lease)) =
-            crate::transport::serialize_payload(&self.upstream.handle.budget, &reply, false)
-        else {
+        let serialized = response.serialize_reply(
+            &self.upstream.handle.budget,
+            external_id,
+            session.as_deref(),
+        );
+        let Some((text, lease)) = serialized else {
             self.disconnect_client(client, 1011, "Payload budget exhausted", true);
             return;
         };
         self.enqueue(client, text, lease);
     }
 
-    fn deliver_event(&mut self, client: ClientId, value: &Value) {
+    fn deliver_event(&mut self, client: ClientId, value: &Received) {
         let Some(state) = self.clients.get(&client) else {
             return;
         };
@@ -1747,25 +1882,22 @@ impl Broker {
         }
         if matches!(state.endpoint, Endpoint::Page { .. }) {
             let primary = state.primary.clone();
-            let outer = value
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            if primary.is_none() || outer.as_deref() != primary.as_deref() {
+            let outer = value.outer.as_deref();
+            if primary.is_none() || outer != primary.as_deref() {
                 return;
             }
         }
-        // 只重写 envelope；大 params/result 始终借用，广播不 clone Value。
-        let filtered = value.as_object().map(|map| {
-            map.iter()
-                .filter(|(key, _)| {
-                    key.as_str() != "sessionId" || !matches!(state.endpoint, Endpoint::Page { .. })
-                })
-                .collect::<std::collections::BTreeMap<_, _>>()
-        });
-        let Some((text, lease)) =
-            crate::transport::serialize_payload(&self.upstream.handle.budget, &filtered, false)
-        else {
+        let budget = self.upstream.handle.budget.clone();
+        let serialized = {
+            let mut scratch = budget.json_scratch();
+            cdp_raw::serialize_event(
+                &value.raw,
+                matches!(state.endpoint, Endpoint::Page { .. }),
+                &budget,
+                &mut scratch,
+            )
+        };
+        let Ok((text, lease)) = serialized else {
             self.disconnect_client(client, 1011, "Payload budget exhausted", true);
             return;
         };
@@ -2045,31 +2177,36 @@ impl Broker {
             self.handle_lost("upstream metadata budget exhausted".into());
             return;
         };
-        if let UpstreamEvent::Response(value, _) | UpstreamEvent::Event(value, _) = &event {
-            let params = value.get("params");
-            let result = value.get("result");
-            let fields = [
-                value.get("method"),
-                value.get("sessionId"),
-                params.and_then(|p| p.get("sessionId")),
-                params
-                    .and_then(|p| p.get("targetInfo"))
-                    .and_then(|p| p.get("targetId")),
-                result.and_then(|p| p.get("sessionId")),
-            ];
-            if fields
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .any(|s| s.len() > 4096)
-            {
-                self.handle_lost("upstream identity limit exceeded".into());
+        if let UpstreamEvent::Raw(raw) = event {
+            let parsed = {
+                let budget = self.upstream.handle.budget.clone();
+                let mut scratch = budget.json_scratch();
+                RawEnvelope::parse(raw, ParsePolicy::UpstreamStrict, &mut scratch)
+            };
+            let Ok(raw) = parsed else {
                 return;
+            };
+            let response = {
+                let budget = self.upstream.handle.budget.clone();
+                let mut scratch = budget.json_scratch();
+                raw.id(&mut scratch).is_some()
+            };
+            let value = match Received::parse(raw, &self.upstream.handle.budget) {
+                Ok(value) => value,
+                Err(_) => {
+                    self.handle_lost("upstream identity limit exceeded".into());
+                    return;
+                }
+            };
+            if response {
+                self.handle_response(value);
+            } else {
+                self.handle_event(value);
             }
+            return;
         }
         match event {
-            UpstreamEvent::Response(value, _lease) => self.handle_response(value),
-            UpstreamEvent::Event(value, _lease) => self.handle_event(value),
+            UpstreamEvent::Raw(_) => unreachable!(),
             UpstreamEvent::Written { bytes } => {
                 self.upstream_bytes = self.upstream_bytes.saturating_sub(bytes);
             }
@@ -2084,30 +2221,23 @@ impl Broker {
         epoch: u64,
         session: &str,
         target: &str,
-        parent: Option<String>,
+        parent: Option<&str>,
     ) {
         if !self.attachments.own(client, epoch, session, target, parent) {
             self.handle_lost("attachment metadata budget exhausted".into());
         }
     }
 
-    fn handle_event(&mut self, value: Value) {
-        let Some(method) = value
-            .get("method")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-        else {
+    fn handle_event(&mut self, value: Received) {
+        let Some(method) = value.method.clone() else {
             return;
         };
-        let outer = value
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        if method == "Target.attachedToTarget" {
+        let outer = value.outer.clone();
+        if method.as_str() == "Target.attachedToTarget" {
             self.attached_event(value, outer);
             return;
         }
-        if method == "Target.detachedFromTarget" {
+        if method.as_str() == "Target.detachedFromTarget" {
             self.detached_event(value);
             return;
         }
@@ -2142,21 +2272,11 @@ impl Broker {
         self.deliver_event(owner, &value);
     }
 
-    fn attached_event(&mut self, value: Value, outer: Option<String>) {
-        let params = value.get("params");
-        let Some(session) = params
-            .and_then(|params| params.get("sessionId"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-        else {
+    fn attached_event(&mut self, value: Received, outer: Option<LeasedIdentity>) {
+        let Some(session) = value.session.clone() else {
             return;
         };
-        let Some(target) = params
-            .and_then(|params| params.get("targetInfo"))
-            .and_then(|info| info.get("targetId"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-        else {
+        let Some(target) = value.target.clone() else {
             return;
         };
         let Some(owner) = self.attachments.resolve_owner(outer.as_deref(), &target) else {
@@ -2174,7 +2294,7 @@ impl Broker {
         {
             return;
         }
-        self.own_attachment(owner, epoch, &session, &target, outer);
+        self.own_attachment(owner, epoch, &session, &target, outer.as_deref());
         if retired {
             self.start_retirement(owner);
             return;
@@ -2182,13 +2302,8 @@ impl Broker {
         self.deliver_event(owner, &value);
     }
 
-    fn detached_event(&mut self, value: Value) {
-        let Some(session) = value
-            .get("params")
-            .and_then(|params| params.get("sessionId"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-        else {
+    fn detached_event(&mut self, value: Received) {
+        let Some(session) = value.session.clone() else {
             return;
         };
         let Some(recipient) = self.attachments.owner(&session) else {
@@ -2206,10 +2321,42 @@ impl Broker {
         self.deliver_event(recipient, &value);
     }
 
-    fn handle_response(&mut self, value: Value) {
-        let Some(id) = value.get("id").and_then(Value::as_u64) else {
+    fn handle_response(&mut self, mut value: Received) {
+        let id = {
+            let budget = self.upstream.handle.budget.clone();
+            let mut scratch = budget.json_scratch();
+            value.raw.id(&mut scratch)
+        };
+        let Some(id) = id else {
             return;
         };
+        let method = self
+            .pending
+            .get(&id)
+            .map(|pending| pending.method.as_str())
+            .or_else(|| self.unknown.get(&id).map(|unknown| unknown.method.as_str()));
+        let Some(method) = method else { return };
+        if matches!(
+            method,
+            "Target.attachToTarget" | "Target.attachToBrowserTarget"
+        ) {
+            let budget = self.upstream.handle.budget.clone();
+            let mut scratch = budget.json_scratch();
+            let attached = value
+                .raw
+                .node("result")
+                .and_then(|node| node.field("sessionId", &mut scratch));
+            value.attached = match attached
+                .map(|node| node.string(&budget, &mut scratch))
+                .transpose()
+            {
+                Ok(attached) => attached.flatten(),
+                Err(_) => {
+                    self.handle_lost("upstream identity limit exceeded".into());
+                    return;
+                }
+            };
+        }
         if self.pending.contains_key(&id) {
             self.complete_pending(id, &value);
             return;
@@ -2461,7 +2608,7 @@ impl Broker {
         }
     }
 
-    fn complete_unknown(&mut self, id: u64, value: &Value) {
+    fn complete_unknown(&mut self, id: u64, value: &Received) {
         let Some(unknown) = self.unknown.remove(&id) else {
             return;
         };
@@ -2476,7 +2623,7 @@ impl Broker {
                 self.own_late(unknown.client, unknown.epoch, session, &target);
             }
         }
-        let failed = value.get("error").is_some();
+        let failed = value.has_error();
         match unknown.kind {
             UnknownKind::Managed {
                 target,
@@ -2529,7 +2676,7 @@ impl Broker {
         self.pump_after_change();
     }
 
-    fn complete_pending(&mut self, id: u64, value: &Value) {
+    fn complete_pending(&mut self, id: u64, value: &Received) {
         let Some(pending) = self.pending.remove(&id) else {
             return;
         };
@@ -2579,7 +2726,7 @@ impl Broker {
         }
     }
 
-    fn page_attach_response(&mut self, client: Option<ClientId>, target: &str, value: &Value) {
+    fn page_attach_response(&mut self, client: Option<ClientId>, target: &str, value: &Received) {
         let Some(client_id) = client else {
             return;
         };
@@ -2611,19 +2758,7 @@ impl Broker {
         }
     }
 
-    fn managed_response(&mut self, id: u64, value: &Value) {
-        // 回调中的错误 message/result 副本先收费；长期 backfill 持有自己的 lease。
-        let Some(_copy) = crate::transport::payload_size(value)
-            .and_then(|bytes| self.upstream.handle.budget.try_acquire(bytes, false))
-        else {
-            if let Some(active) = self.management_active.take() {
-                self.finish_managed(
-                    active.work,
-                    Err((-32000, "Payload budget exhausted".into())),
-                );
-            }
-            return;
-        };
+    fn managed_response(&mut self, id: u64, value: &Received) {
         let Some(mut active) = self.management_active.take() else {
             return;
         };
@@ -2647,7 +2782,7 @@ impl Broker {
                     index,
                     target: target.clone(),
                 };
-                self.backfill_attach_response(active, &target, value);
+                self.backfill_attach_response(active, target.as_deref().unwrap_or_default(), value);
             }
             stage => {
                 active.stage = stage;
@@ -2656,33 +2791,15 @@ impl Broker {
         }
     }
 
-    fn managed_sent_response(&mut self, mut active: ActiveManaged, value: &Value) {
+    fn managed_sent_response(&mut self, mut active: ActiveManaged, value: &Received) {
         let method = active.work.method.clone();
         let client = active.work.client;
         let params = active.work.params.clone();
-        if let Some(error) = value.get("error") {
+        if value.has_error() {
             self.clear_management_intent(&active);
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("CDP command failed")
-                .to_string();
-            let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
-            self.finish_managed(active.work, Err((code, message)));
+            self.finish_managed_reply(active.work, value);
             return;
         }
-        let result_ref = value.get("result").unwrap_or(&Value::Null);
-        let Some(retained) = crate::transport::payload_size(result_ref)
-            .and_then(|bytes| self.upstream.handle.budget.try_acquire(bytes, false))
-        else {
-            self.finish_managed(
-                active.work,
-                Err((-32000, "Payload budget exhausted".into())),
-            );
-            return;
-        };
-        active.work.retained.push(retained);
-        let result = result_ref.clone();
         if method == "Target.attachToTarget" {
             let Some(target) = params.string("targetId") else {
                 self.finish_managed(active.work, Err((-32000, "Invalid target".into())));
@@ -2706,16 +2823,16 @@ impl Broker {
                 epoch,
                 &session,
                 target,
-                active.work.explicit_session.clone(),
+                active.work.explicit_session.as_deref(),
             );
-            self.finish_managed(active.work, Ok(result));
+            self.finish_managed_reply(active.work, value);
             return;
         }
         if method == "Target.detachFromTarget" {
             if let Some(session) = params.string("sessionId") {
                 self.attachments.forget(session);
             }
-            self.finish_managed(active.work, Ok(result));
+            self.finish_managed_reply(active.work, value);
             return;
         }
         if method == "Target.attachToBrowserTarget" {
@@ -2726,17 +2843,34 @@ impl Broker {
                     .map_or(active.work.epoch, |state| state.epoch);
                 self.own_attachment(client, epoch, &session, "browser", None);
             }
-            self.finish_managed(active.work, Ok(result));
+            self.finish_managed_reply(active.work, value);
             return;
         }
         let auto_attach = params.auto_attach.unwrap_or(false);
         let backfill = auto_attach && active.work.explicit_session.is_none();
-        active.response = result;
-        if backfill && self.start_backfill(&mut active).is_ok() {
-            self.management_active = Some(active);
-            return;
+        if backfill {
+            let saved = {
+                let budget = self.upstream.handle.budget.clone();
+                let mut scratch = budget.json_scratch();
+                match value.raw.node("result") {
+                    Some(result) => result.copy(&budget, &mut scratch),
+                    None => LeasedRaw::literal("null", &budget),
+                }
+            };
+            let Ok(saved) = saved else {
+                self.finish_managed(
+                    active.work,
+                    Err((-32000, "Payload budget exhausted".into())),
+                );
+                return;
+            };
+            active.response = Some(saved);
+            if self.start_backfill(&mut active).is_ok() {
+                self.management_active = Some(active);
+                return;
+            }
         }
-        self.finish_managed(active.work, Ok(active.response));
+        self.finish_managed_reply(active.work, value);
     }
 
     fn start_backfill(&mut self, active: &mut ActiveManaged) -> Result<(), ()> {
@@ -2759,58 +2893,98 @@ impl Broker {
         Ok(())
     }
 
-    fn backfill_targets(&mut self, mut active: ActiveManaged, value: &Value) {
-        if let Some(error) = value.get("error") {
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("CDP command failed")
-                .to_string();
-            self.finish_managed(active.work, Err((-32000, message)));
+    fn backfill_targets(&mut self, mut active: ActiveManaged, value: &Received) {
+        if value.has_error() {
+            self.finish_managed_reply(active.work, value);
             return;
         }
-        let infos = value
-            .get("result")
-            .and_then(|result| result.get("targetInfos"))
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        if infos
-            .iter()
-            .filter_map(|info| info.get("targetId"))
-            .filter_map(Value::as_str)
-            .any(|id| id.len() > 4096)
-        {
-            self.handle_lost("upstream identity limit exceeded".into());
-            return;
-        }
-        let Some(retained) = crate::transport::payload_size(&infos).and_then(|bytes| {
-            self.upstream
-                .handle
-                .budget
-                .try_acquire(bytes.saturating_mul(4), false)
-        }) else {
-            self.finish_managed(
-                active.work,
-                Err((-32000, "Payload budget exhausted".into())),
-            );
-            return;
+        let selected = self.select_backfill(value, active.work.client);
+        let targets = match selected {
+            Ok(targets) => targets,
+            Err(cdp_raw::RawError::Limit) => {
+                self.handle_lost("upstream identity limit exceeded".into());
+                return;
+            }
+            Err(_) => {
+                self.finish_managed(
+                    active.work,
+                    Err((-32000, "Payload budget exhausted".into())),
+                );
+                return;
+            }
         };
-        active.work.retained.push(retained);
-        let targets = infos
-            .iter()
-            .filter(|info| info.get("type").and_then(Value::as_str) == Some("page"))
-            .filter_map(|info| info.get("targetId").and_then(Value::as_str))
-            .filter(|target| !self.attachments.has_target(active.work.client, target))
-            .map(str::to_string)
-            .collect::<Vec<_>>();
         active.stage = ManagedStage::BackfillAttach {
             id: 0,
             targets,
             index: 0,
-            target: String::new(),
+            target: None,
         };
         self.continue_backfill(active);
+    }
+
+    fn select_backfill(
+        &self,
+        value: &Received,
+        client: ClientId,
+    ) -> Result<BackfillSelection, cdp_raw::RawError> {
+        let budget = &self.upstream.handle.budget;
+        let mut scratch = budget.json_scratch();
+        let raw = target_infos(value, budget, &mut scratch)?;
+        let mut count = 0usize;
+        for pass in 0..2 {
+            let mut array = raw
+                .node()
+                .array(&mut scratch)
+                .ok_or(cdp_raw::RawError::Invalid)?;
+            let mut spans = if pass == 1 {
+                let bytes = count
+                    .checked_mul(std::mem::size_of::<RawSpan>())
+                    .ok_or(cdp_raw::RawError::Limit)?;
+                let lease = budget
+                    .try_acquire(bytes, false)
+                    .ok_or(cdp_raw::RawError::Budget)?;
+                Some((Vec::with_capacity(count), lease))
+            } else {
+                None
+            };
+            while let Some(info) = array.next(&mut scratch)? {
+                let id = info
+                    .field("targetId", &mut scratch)
+                    .map(|node| node.string(budget, &mut scratch))
+                    .transpose()?
+                    .flatten();
+                let page = info
+                    .field("type", &mut scratch)
+                    .is_some_and(|node| node.equals("page", &mut scratch));
+                if !page
+                    || !id
+                        .as_ref()
+                        .is_some_and(|id| !self.attachments.has_target(client, id))
+                {
+                    continue;
+                }
+                if let Some((spans, _)) = spans.as_mut() {
+                    if spans.len() >= spans.capacity() {
+                        return Err(cdp_raw::RawError::Limit);
+                    }
+                    spans.push(
+                        info.field("targetId", &mut scratch)
+                            .ok_or(cdp_raw::RawError::Invalid)?
+                            .span(),
+                    );
+                } else {
+                    count += 1;
+                }
+            }
+            if let Some((spans, lease)) = spans {
+                return Ok(BackfillSelection {
+                    raw,
+                    spans,
+                    _lease: lease,
+                });
+            }
+        }
+        Err(cdp_raw::RawError::Invalid)
     }
 
     fn continue_backfill(&mut self, mut active: ActiveManaged) {
@@ -2839,8 +3013,18 @@ impl Broker {
             };
             let mut next = *index;
             let mut candidate = None;
-            while next < targets.len() {
-                let current = targets[next].clone();
+            while next < targets.spans.len() {
+                let budget = self.upstream.handle.budget.clone();
+                let decoded = {
+                    let mut scratch = budget.json_scratch();
+                    targets
+                        .raw
+                        .raw(targets.spans[next], &mut scratch)
+                        .and_then(|raw| cdp_raw::decode_identity(raw, &budget, &mut scratch))
+                };
+                let Ok(current) = decoded else {
+                    return BackfillStep::Failed("Payload budget exhausted".into());
+                };
                 next += 1;
                 if self.attachments.has_target(client, &current) {
                     continue;
@@ -2852,14 +3036,14 @@ impl Broker {
                 return BackfillStep::Done;
             };
             *index = next;
-            *target = candidate.clone();
+            *target = Some(candidate.clone());
             (candidate, next)
         };
         let _ = next;
         if !self.attachments.set_intent(&candidate, client) {
             return BackfillStep::Failed("Payload budget exhausted".into());
         }
-        let params = json!({ "targetId": candidate, "flatten": true });
+        let params = json!({ "targetId": candidate.as_str(), "flatten": true });
         let spec = PendingSpec {
             client: Some(client),
             role: self.clients.get(&client).map(|state| state.role),
@@ -2891,16 +3075,11 @@ impl Broker {
         }
     }
 
-    fn backfill_attach_response(&mut self, active: ActiveManaged, target: &str, value: &Value) {
+    fn backfill_attach_response(&mut self, active: ActiveManaged, target: &str, value: &Received) {
         let client = active.work.client;
         self.attachments.clear_intent(target, client);
-        if let Some(error) = value.get("error") {
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("CDP command failed")
-                .to_string();
-            self.finish_managed(active.work, Err((-32000, message)));
+        if value.has_error() {
+            self.finish_managed_reply(active.work, value);
             return;
         }
         let Some(session) = attach_session(value) else {
@@ -2927,19 +3106,62 @@ impl Broker {
         }
     }
 
-    fn finish_managed(&mut self, work: ManagedWork, result: Result<Value, (i64, String)>) {
+    fn finish_managed_reply(&mut self, work: ManagedWork, value: &Received) {
+        if !value.has_error() && value.raw.node("result").is_none() {
+            self.send_reply(
+                work.client,
+                work.external_id,
+                Option::<&RawValue>::None,
+                work.explicit_session.clone(),
+            );
+        } else {
+            self.send_upstream_reply(
+                work.client,
+                work.external_id,
+                work.explicit_session.clone(),
+                value,
+            );
+        }
+        self.management_active = None;
+        self.pump_management();
+    }
+
+    fn finish_managed(
+        &mut self,
+        work: ManagedWork,
+        result: Result<Option<LeasedRaw>, (i64, String)>,
+    ) {
         let exists = self
             .clients
             .get(&work.client)
             .is_some_and(|state| !state.closed);
         if exists {
             match result {
-                Ok(value) => self.send_reply(
-                    work.client,
-                    work.external_id,
-                    value,
-                    work.explicit_session.clone(),
-                ),
+                Ok(value) => {
+                    let serialized = {
+                        let budget = self.upstream.handle.budget.clone();
+                        let mut scratch = budget.json_scratch();
+                        value
+                            .as_ref()
+                            .map(|raw| raw.raw(raw.full_span(), &mut scratch))
+                            .transpose()
+                    };
+                    match serialized {
+                        Ok(raw) => self.send_reply(
+                            work.client,
+                            work.external_id,
+                            raw,
+                            work.explicit_session.clone(),
+                        ),
+                        Err(_) => self.send_error(
+                            work.client,
+                            work.external_id,
+                            -32000,
+                            "Payload budget exhausted",
+                            work.explicit_session.clone(),
+                        ),
+                    }
+                }
                 Err((code, message)) => self.send_error(
                     work.client,
                     work.external_id,
@@ -3044,7 +3266,7 @@ impl Broker {
                 self.management_active = Some(ActiveManaged {
                     work,
                     stage: ManagedStage::Sent { id },
-                    response: Value::Null,
+                    response: None,
                 });
                 true
             }
@@ -3151,12 +3373,8 @@ impl Broker {
     }
 }
 
-fn attach_session(value: &Value) -> Option<String> {
-    value
-        .get("result")
-        .and_then(|result| result.get("sessionId"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
+fn attach_session(value: &Received) -> Option<LeasedIdentity> {
+    value.attached.clone()
 }
 
 fn stage_id(stage: &ManagedStage) -> Option<u64> {
@@ -3167,31 +3385,29 @@ fn stage_id(stage: &ManagedStage) -> Option<u64> {
     }
 }
 
-fn targets_from(value: &Value, budget: &PayloadBudget) -> Result<LeasedTargets, String> {
-    if let Some(error) = value.get("error") {
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("Target discovery failed");
-        return Err(message.to_string());
-    }
+fn target_infos(
+    value: &Received,
+    budget: &PayloadBudget,
+    scratch: &mut crate::transport::JsonScratchGuard<'_>,
+) -> Result<LeasedRaw, cdp_raw::RawError> {
     let infos = value
-        .get("result")
-        .and_then(|result| result.get("targetInfos"))
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let lease = crate::transport::payload_size(&infos)
-        .and_then(|bytes| budget.try_acquire(bytes, false))
-        .ok_or("Target discovery budget exhausted")?;
-    Ok(LeasedTargets {
-        values: infos
-            .iter()
-            .filter(|target| target.get("type").and_then(Value::as_str) == Some("page"))
-            .cloned()
-            .collect(),
-        lease,
-    })
+        .raw
+        .node("result")
+        .and_then(|node| node.field("targetInfos", scratch));
+    match infos.filter(|node| node.is_array()) {
+        Some(infos) => infos.copy(budget, scratch),
+        None => LeasedRaw::literal("[]", budget),
+    }
+}
+
+fn targets_from(value: &Received, budget: &PayloadBudget) -> Result<LeasedTargets, String> {
+    if value.has_error() {
+        return Err("Target discovery failed".into());
+    }
+    let mut scratch = budget.json_scratch();
+    let raw = target_infos(value, budget, &mut scratch)
+        .map_err(|_| "Target discovery budget exhausted")?;
+    Ok(LeasedTargets { raw })
 }
 impl Broker {
     fn start_retirement(&mut self, client: ClientId) {
@@ -3338,7 +3554,7 @@ impl Broker {
         }
     }
 
-    fn retirement_auto_response(&mut self, retirement: u64, value: &Value) {
+    fn retirement_auto_response(&mut self, retirement: u64, value: &Received) {
         let Some(retire) = self
             .retirements
             .iter_mut()
@@ -3347,7 +3563,7 @@ impl Broker {
             return;
         };
         retire.pending = None;
-        if value.get("error").is_some() {
+        if value.has_error() {
             retire.blocked = true;
             return;
         }
@@ -3357,7 +3573,7 @@ impl Broker {
         retire.stage = RetireStage::Detach;
     }
 
-    fn retirement_detach_response(&mut self, retirement: u64, session: &str, value: &Value) {
+    fn retirement_detach_response(&mut self, retirement: u64, session: &str, value: &Received) {
         let Some(retire) = self
             .retirements
             .iter_mut()
@@ -3366,7 +3582,7 @@ impl Broker {
             return;
         };
         retire.pending = None;
-        if value.get("error").is_some() {
+        if value.has_error() {
             retire.blocked = true;
             return;
         }
@@ -3550,8 +3766,8 @@ impl Broker {
         }
     }
 
-    fn flush_response(&mut self, value: &Value) {
-        if value.get("error").is_some() {
+    fn flush_response(&mut self, value: &Received) {
+        if value.has_error() {
             // 宿主/数据库错误不把引擎文本或路径回传；会话仍可重试。
             self.fail_flush("Profile flush failed".to_string());
             return;
@@ -3717,7 +3933,7 @@ impl Broker {
         }
     }
 
-    fn close_response(&mut self, value: &Value) {
+    fn close_response(&mut self, value: &Received) {
         let Some(state) = self.close.as_ref() else {
             return;
         };
@@ -3727,7 +3943,7 @@ impl Broker {
             CloseStage::Drain => 0,
         };
         if stage == 2 {
-            if value.get("error").is_some() {
+            if value.has_error() {
                 self.fail_close("Browser close failed".to_string());
             } else {
                 self.finish_close_success();
@@ -3737,7 +3953,7 @@ impl Broker {
         if stage != 1 {
             return;
         }
-        if value.get("error").is_some() {
+        if value.has_error() {
             // 与 /flush 一致：宿主/数据库失败只返回固定类别。
             self.fail_close("Profile flush failed".to_string());
             return;

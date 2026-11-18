@@ -33,6 +33,129 @@ use tokio_tungstenite::WebSocketStream;
 use crate::observe::Observer;
 use crate::HostResult;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawError {
+    Invalid,
+    Limit,
+    Budget,
+    Duplicate,
+}
+impl fmt::Display for RawError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("invalid or unbudgeted CDP payload")
+    }
+}
+impl std::error::Error for RawError {}
+type RawResult<T> = Result<T, RawError>;
+
+static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+struct RawOwner {
+    token: u64,
+    text: String,
+    _lease: PayloadLease,
+    _metadata: Option<PayloadLease>,
+}
+const _: () = assert!(std::mem::size_of::<RawOwner>() + 2 * std::mem::size_of::<usize>() <= 256);
+
+/// clone 只共享 backing、lease 和唯一 token；不复制 payload。
+#[derive(Clone)]
+pub struct LeasedRaw(Arc<RawOwner>);
+
+/// owner token 与范围共 16 bytes，foreign span 永远拒绝。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawSpan {
+    owner: u64,
+    start: u32,
+    end: u32,
+}
+
+impl LeasedRaw {
+    pub fn new(text: String, lease: PayloadLease) -> RawResult<Self> {
+        if text.len() > MAX_FRAME_BYTES || text.capacity() > lease.bytes() {
+            return Err(RawError::Limit);
+        }
+        let token = NEXT_OWNER
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+                token.checked_add(1)
+            })
+            .map_err(|_| RawError::Limit)?;
+        Ok(Self(Arc::new(RawOwner {
+            token,
+            text,
+            _lease: lease,
+            _metadata: None,
+        })))
+    }
+    pub fn accounted(text: String, lease: PayloadLease, budget: &PayloadBudget) -> RawResult<Self> {
+        let metadata = budget
+            .try_acquire(256, lease.is_internal())
+            .ok_or(RawError::Budget)?;
+        let mut raw = Self::new(text, lease)?;
+        Arc::get_mut(&mut raw.0).ok_or(RawError::Invalid)?._metadata = Some(metadata);
+        Ok(raw)
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0.text
+    }
+    pub fn full_span(&self) -> RawSpan {
+        RawSpan {
+            owner: self.0.token,
+            start: 0,
+            end: self.0.text.len() as u32,
+        }
+    }
+    pub fn text(&self, span: RawSpan) -> RawResult<&str> {
+        if span.owner != self.0.token {
+            return Err(RawError::Invalid);
+        }
+        self.as_str()
+            .get(span.start as usize..span.end as usize)
+            .ok_or(RawError::Invalid)
+    }
+    pub fn copy_span_to_ordinary(
+        &self,
+        span: RawSpan,
+        budget: &PayloadBudget,
+        _scratch: &mut JsonScratchGuard<'_>,
+    ) -> RawResult<Self> {
+        let text = self.text(span)?;
+        let lease = budget
+            .try_acquire(text.len(), false)
+            .ok_or(RawError::Budget)?;
+        let metadata = budget.try_acquire(256, false).ok_or(RawError::Budget)?;
+        let mut copy = String::with_capacity(text.len());
+        copy.push_str(text);
+        let mut raw = Self::new(copy, lease)?;
+        Arc::get_mut(&mut raw.0).ok_or(RawError::Invalid)?._metadata = Some(metadata);
+        Ok(raw)
+    }
+    pub fn span_of(&self, raw: &serde_json::value::RawValue) -> RawResult<RawSpan> {
+        let start = (raw.get().as_ptr() as usize)
+            .checked_sub(self.as_str().as_ptr() as usize)
+            .ok_or(RawError::Invalid)?;
+        let end = start
+            .checked_add(raw.get().len())
+            .ok_or(RawError::Invalid)?;
+        if end > self.as_str().len() {
+            return Err(RawError::Invalid);
+        }
+        Ok(RawSpan {
+            owner: self.0.token,
+            start: start as u32,
+            end: end as u32,
+        })
+    }
+    pub fn literal(text: &str, budget: &PayloadBudget) -> RawResult<Self> {
+        let lease = budget
+            .try_acquire(text.len(), false)
+            .ok_or(RawError::Budget)?;
+        let metadata = budget.try_acquire(256, false).ok_or(RawError::Budget)?;
+        let mut raw = Self::new(text.to_owned(), lease)?;
+        Arc::get_mut(&mut raw.0).ok_or(RawError::Invalid)?._metadata = Some(metadata);
+        Ok(raw)
+    }
+}
+
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const READ_BUFFER_BYTES: usize = 32 * 1024;
 pub const CODEC_BYTES: usize = 64 * 1024;
@@ -109,7 +232,7 @@ impl PayloadBudget {
         }
     }
 
-    async fn receive(&self, upstream: bool) -> PayloadLease {
+    pub(crate) async fn receive(&self, upstream: bool) -> PayloadLease {
         if !upstream {
             return self.acquire(MAX_FRAME_BYTES, false).await;
         }
@@ -444,12 +567,9 @@ impl fmt::Display for UpstreamAddress {
 trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
 
-#[derive(Debug)]
 pub enum UpstreamEvent {
-    /// 带 id 的 engine 回复；映射与归属由 broker 决定。
-    Response(Value, PayloadLease),
-    /// 无 id 的事件；是否可见由 broker 决定。
-    Event(Value, PayloadLease),
+    /// 接收 lease 与 raw owner 一起移动，broker 负责严格解析和分类。
+    Raw(LeasedRaw),
     /// 一条出站帧已被 socket 接受，用于释放队列字节预算。
     Written { bytes: usize },
     /// 连接结束；保证只发送一次。
@@ -591,19 +711,15 @@ impl Upstream {
                     })) => {
                         // 唯一 receive lease 随消息到 actor；下一次最大接收必须等其释放。
                         // 同步解析副本与 codec 共用已扣除的 copy 额度，不借给长期队列。
-                        let value = {
-                            let _copy = reader_budget.copy.lock().unwrap();
-                            let parsed = serde_json::from_str::<Value>(&text);
+                        let parsed = {
+                            let _scratch = reader_budget.json_scratch();
+                            let owned = text.to_string();
                             drop(text);
-                            parsed
+                            LeasedRaw::accounted(owned, lease, &reader_budget)
+                                .map(UpstreamEvent::Raw)
                         };
-                        let Ok(value) = value else {
+                        let Ok(event) = parsed else {
                             continue;
-                        };
-                        let event = if value.get("id").and_then(Value::as_u64).is_some() {
-                            UpstreamEvent::Response(value, lease)
-                        } else {
-                            UpstreamEvent::Event(value, lease)
                         };
                         if event_tx.send(event).await.is_err() {
                             return;
@@ -647,60 +763,6 @@ impl Upstream {
             tasks,
             observer,
         })
-    }
-
-    /// 启动阶段的一次性宿主请求；客户端尚未接入，事件被丢弃。
-    pub async fn request(
-        &mut self,
-        method: &str,
-        params: Option<Value>,
-        deadline: Duration,
-    ) -> HostResult<Value> {
-        let Some(id) = self.handle.allocate_id() else {
-            return Err("CDP request ids are exhausted".into());
-        };
-        let mut payload = json!({ "id": id, "method": method });
-        if let Some(params) = params {
-            payload["params"] = params;
-        }
-        if !self.handle.send_value(&payload) {
-            return Err("engine connection is closed".into());
-        }
-        let wait = async {
-            loop {
-                let event = tokio::select! {
-                    event = self.events.recv() => event,
-                    _ = self.lost.changed() => {
-                        return Err("engine connection lost while waiting for a reply".into());
-                    }
-                };
-                let Some(event) = event else {
-                    break;
-                };
-                match event {
-                    UpstreamEvent::Response(value, _lease) => {
-                        if value.get("id").and_then(Value::as_u64) != Some(id) {
-                            continue;
-                        }
-                        if let Some(error) = value.get("error") {
-                            let message = error
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("CDP command failed");
-                            return Err(message.to_string().into());
-                        }
-                        return Ok(value.get("result").cloned().unwrap_or(Value::Null));
-                    }
-                    UpstreamEvent::Lost(reason) => return Err(reason.into()),
-                    _ => {}
-                }
-            }
-            Err("engine connection closed while waiting for a reply".into())
-        };
-        match timeout(deadline, wait).await {
-            Ok(result) => result,
-            Err(_) => Err(format!("CDP timeout: {method}; outcome may be unknown").into()),
-        }
     }
 
     pub fn handle(&self) -> UpstreamHandle {

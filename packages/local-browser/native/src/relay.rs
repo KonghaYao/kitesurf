@@ -52,9 +52,37 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct SessionInfo {
-    pub session_id: String,
-    pub build_version: String,
-    pub environment: String,
+    pub session_id: crate::cdp_raw::LeasedIdentity,
+    pub build_version: crate::cdp_raw::LeasedIdentity,
+    pub environment: crate::cdp_raw::LeasedIdentity,
+}
+
+impl SessionInfo {
+    pub fn from_raw(
+        raw: &crate::cdp_raw::LeasedRaw,
+        budget: &crate::transport::PayloadBudget,
+        version: &str,
+    ) -> HostResult<Self> {
+        let mut scratch = budget.json_scratch();
+        let mut field = |name, fallback: &str| -> HostResult<crate::cdp_raw::LeasedIdentity> {
+            if let Some(node) = raw.node().field(name, &mut scratch) {
+                if node.text()?.starts_with('"') {
+                    return Ok(crate::cdp_raw::decode_text(
+                        node.raw(&mut scratch)?,
+                        budget,
+                        crate::transport::MAX_FRAME_BYTES,
+                        &mut scratch,
+                    )?);
+                }
+            }
+            Ok(crate::cdp_raw::LeasedIdentity::literal(fallback, budget)?)
+        };
+        Ok(Self {
+            session_id: field("sessionId", "")?,
+            build_version: field("buildVersion", version)?,
+            environment: field("environment", "local")?,
+        })
+    }
 }
 
 struct HostContext {
@@ -423,15 +451,13 @@ async fn session_body(context: &HostContext) -> Response<Full<Bytes>> {
         Ok(tabs) => tabs,
         Err(message) => return error_response(StatusCode::CONFLICT, &message),
     };
-    let _tabs_lease = tabs.lease;
-    let tabs = tabs.values;
     let profile = match context.profile.status().await {
         Ok(status) => status,
         Err(_) => return error_response(StatusCode::CONFLICT, "Profile status unavailable"),
     };
     #[derive(serde::Serialize)]
     #[serde(rename_all = "camelCase")]
-    struct SessionBody<'a> {
+    struct SessionBody<'a, T> {
         version: &'a str,
         session_id: &'a str,
         generation: &'a str,
@@ -440,8 +466,15 @@ async fn session_body(context: &HostContext) -> Response<Full<Bytes>> {
         profile: &'a Value,
         controller: &'a Option<String>,
         control_epoch: u64,
-        tabs: &'a [Value],
+        tabs: &'a T,
     }
+    let budget = context.broker.payload_budget();
+    let mut scratch = budget.json_scratch();
+    let tabs_view = TargetsView {
+        tabs: &tabs,
+        scratch: std::cell::RefCell::new(&mut scratch),
+        port: None,
+    };
     budgeted_json(
         context,
         &SessionBody {
@@ -453,7 +486,7 @@ async fn session_body(context: &HostContext) -> Response<Full<Bytes>> {
             profile: &profile,
             controller: &snapshot.controller,
             control_epoch: snapshot.control_epoch,
-            tabs: &tabs,
+            tabs: &tabs_view,
         },
     )
 }
@@ -463,38 +496,186 @@ async fn targets_body(context: &HostContext) -> Response<Full<Bytes>> {
         Ok(tabs) => tabs,
         Err(message) => return error_response(StatusCode::CONFLICT, &message),
     };
-    let _tabs_lease = tabs.lease;
-    let entries = tabs
-        .values
-        .iter()
-        .map(|target| {
-            let id = target["targetId"].as_str().unwrap_or_default();
-            #[derive(serde::Serialize)]
-            struct Entry<'a> {
-                id: &'a str,
-                #[serde(rename = "type")]
-                kind: &'static str,
-                title: &'a Value,
-                url: &'a Value,
-                #[serde(rename = "webSocketDebuggerUrl")]
-                websocket: String,
-                #[serde(rename = "devtoolsFrontendUrl")]
-                devtools: String,
+    let budget = context.broker.payload_budget();
+    let mut scratch = budget.json_scratch();
+    let view = TargetsView {
+        tabs: &tabs,
+        scratch: std::cell::RefCell::new(&mut scratch),
+        port: Some(context.port),
+    };
+    budgeted_json(context, &view)
+}
+
+struct TargetsView<'a, 'b> {
+    tabs: &'a crate::broker::LeasedTargets,
+    scratch: std::cell::RefCell<&'a mut crate::transport::JsonScratchGuard<'b>>,
+    port: Option<u16>,
+}
+
+struct TargetUrl<'a> {
+    id: crate::cdp_raw::RawText<'a>,
+    port: u16,
+    inspector: bool,
+}
+impl std::fmt::Display for TargetUrl<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.inspector {
+            write!(
+                f,
+                "devtools://devtools/bundled/inspector.html?ws=127.0.0.1:{}/devtools/page/{}",
+                self.port, self.id
+            )
+        } else {
+            write!(f, "ws://127.0.0.1:{}/devtools/page/{}", self.port, self.id)
+        }
+    }
+}
+impl serde::Serialize for TargetUrl<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl serde::Serialize for TargetsView<'_, '_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error, SerializeSeq};
+        let mut scratch = self.scratch.borrow_mut();
+        let mut array = self
+            .tabs
+            .raw
+            .node()
+            .array(&mut scratch)
+            .ok_or_else(|| S::Error::custom("invalid targets"))?;
+        let mut seq = serializer.serialize_seq(None)?;
+        while let Some(target) = array.next(&mut scratch).map_err(S::Error::custom)? {
+            if !target
+                .field("type", &mut scratch)
+                .is_some_and(|node| node.equals("page", &mut scratch))
+            {
+                continue;
             }
-            Entry {
-                id,
-                kind: "page",
-                title: &target["title"],
-                url: &target["url"],
-                websocket: format!("ws://127.0.0.1:{}/devtools/page/{id}", context.port),
-                devtools: format!(
-                    "devtools://devtools/bundled/inspector.html?ws=127.0.0.1:{}/devtools/page/{id}",
-                    context.port
-                ),
+            let Some(port) = self.port else {
+                seq.serialize_element(target.raw(&mut scratch).map_err(S::Error::custom)?)?;
+                continue;
+            };
+            serialize_target(&mut seq, target, port, &mut scratch)?;
+        }
+        seq.end()
+    }
+}
+
+fn serialize_target<S: serde::ser::SerializeSeq>(
+    seq: &mut S,
+    target: crate::cdp_raw::RawNode<'_>,
+    port: u16,
+    scratch: &mut crate::transport::JsonScratchGuard<'_>,
+) -> Result<(), S::Error> {
+    use serde::ser::Error;
+    #[derive(serde::Serialize)]
+    struct Entry<'a> {
+        id: crate::cdp_raw::RawText<'a>,
+        #[serde(rename = "type")]
+        kind: &'static str,
+        title: Option<&'a serde_json::value::RawValue>,
+        url: Option<&'a serde_json::value::RawValue>,
+        #[serde(rename = "webSocketDebuggerUrl")]
+        websocket: TargetUrl<'a>,
+        #[serde(rename = "devtoolsFrontendUrl")]
+        devtools: TargetUrl<'a>,
+    }
+    let id_node = target.field("targetId", scratch).unwrap_or(target);
+    let title = target
+        .field("title", scratch)
+        .map(|node| node.raw(scratch))
+        .transpose()
+        .map_err(S::Error::custom)?;
+    let url = target
+        .field("url", scratch)
+        .map(|node| node.raw(scratch))
+        .transpose()
+        .map_err(S::Error::custom)?;
+    seq.serialize_element(&Entry {
+        id: id_node.decoded(),
+        kind: "page",
+        title,
+        url,
+        websocket: TargetUrl {
+            id: id_node.decoded(),
+            port,
+            inspector: false,
+        },
+        devtools: TargetUrl {
+            id: id_node.decoded(),
+            port,
+            inspector: true,
+        },
+    })
+}
+
+#[cfg(all(test, feature = "test-faults"))]
+mod raw_output_tests {
+    use super::*;
+    use crate::cdp_raw::LeasedRaw;
+    use crate::transport::{PayloadBudget, MAX_FRAME_BYTES};
+
+    #[test]
+    fn session_fields_drop_unknown_raw_and_lease_long_decoded_text() {
+        let budget = PayloadBudget::default();
+        let long = "x".repeat(8192);
+        let text = format!(
+            r#"{{"sessionId":"{long}","environment":null,"unknown":"{}"}}"#,
+            "z".repeat(128 * 1024)
+        );
+        let raw = LeasedRaw::literal(&text, &budget).unwrap();
+        let session = SessionInfo::from_raw(&raw, &budget, "fallback").unwrap();
+        drop(raw);
+        assert_eq!(session.session_id.as_str(), long);
+        assert_eq!(session.build_version.as_str(), "fallback");
+        assert_eq!(session.environment.as_str(), "local");
+        assert!(budget.used().0 < MAX_FRAME_BYTES + 16 * 1024);
+        drop(session);
+        assert_eq!(budget.used(), (MAX_FRAME_BYTES, 0));
+    }
+
+    #[test]
+    fn targets_stream_preserves_last_wins_null_and_long_escaped_text() {
+        let budget = PayloadBudget::default();
+        let title = "\\u0061".repeat(20_000);
+        let text = format!(
+            r#"[{{"type":"worker","targetId":"skip"}},{{"type":"worker","\u0074ype":"page","targetId":"old","target\u0049d":"t\u0061b","title":"{title}","url":null}},{{"type":"page"}}]"#
+        );
+        let tabs = crate::broker::LeasedTargets {
+            raw: LeasedRaw::literal(&text, &budget).unwrap(),
+        };
+        for port in [None, Some(9222)] {
+            let output = {
+                let mut scratch = budget.json_scratch();
+                let view = TargetsView {
+                    tabs: &tabs,
+                    scratch: std::cell::RefCell::new(&mut scratch),
+                    port,
+                };
+                crate::transport::serialize_payload(&budget, &view, false).unwrap()
+            };
+            let parsed: Value = serde_json::from_str(&output.0).unwrap();
+            assert_eq!(parsed.as_array().unwrap().len(), 2);
+            assert_eq!(parsed[0]["title"].as_str().unwrap().len(), 20_000);
+            assert!(parsed[0]["url"].is_null());
+            if port.is_some() {
+                assert_eq!(parsed[0]["id"], "tab");
+                assert_eq!(
+                    parsed[0]["webSocketDebuggerUrl"],
+                    "ws://127.0.0.1:9222/devtools/page/tab"
+                );
+                assert_eq!(parsed[1]["id"], "");
+                assert!(parsed[1]["title"].is_null());
+                assert!(parsed[1]["url"].is_null());
             }
-        })
-        .collect::<Vec<_>>();
-    budgeted_json(context, &entries)
+            drop(output);
+        }
+        drop(tabs);
+        assert_eq!(budget.used(), (MAX_FRAME_BYTES, 0));
+    }
 }
 
 struct Query {
@@ -554,7 +735,7 @@ async fn upgrade(
         return error_response(StatusCode::CONFLICT, "Browser unavailable");
     }
     if let Some(session) = &query.session {
-        if session != &context.session.session_id {
+        if session.as_str() != context.session.session_id.as_str() {
             return error_response(StatusCode::CONFLICT, "Session expired");
         }
     }
