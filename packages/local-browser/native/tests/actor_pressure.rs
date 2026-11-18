@@ -6,18 +6,37 @@ use super::*;
 use std::future::Future;
 use std::sync::Mutex;
 use crate::transport::{PayloadBudget, INTERNAL_BYTES, MAX_FRAME_BYTES, ORDINARY_BYTES};
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{oneshot, Notify, Semaphore};
 
 // 固定表覆盖场景线程、blocking worker 与任意线程的 free/realloc；不忽略小 allocation。
 // runtime 与有限 harness 也在观测值中；fixture/伪上游排除，不是 SQLite/native/RSS 保证。
 // scope 只决定新分配是否入表；释放不依赖 scope，线程 join 后必须 live=0。
+// 阶段与小尺寸事件环只写固定数组，不能在 tracking 路径分配；供残留归因。
 pub(crate) mod allocations {
     use std::cell::Cell;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static PHASE: AtomicU32 = AtomicU32::new(0);
     pub static SERIAL: Mutex<()> = Mutex::new(());
+
+    pub const PHASE_SETUP: u32 = 1;
+    pub const PHASE_INGRESS: u32 = 2;
+    pub const PHASE_UNKNOWN: u32 = 3;
+    pub const PHASE_SLOW: u32 = 4;
+    pub const PHASE_BACKFILL: u32 = 5;
+    pub const PHASE_STATUS: u32 = 6;
+    pub const PHASE_CANCEL: u32 = 7;
+    pub const PHASE_RESOLVED: u32 = 8;
+    pub const PHASE_LATE: u32 = 9;
+    pub const PHASE_TEARDOWN: u32 = 10;
+    pub const PHASE_SETTLE: u32 = 11;
+    pub const PHASE_RUNTIME: u32 = 12;
+
+    pub fn phase(value: u32) {
+        PHASE.store(value, Ordering::Relaxed);
+    }
 
     #[derive(Clone, Copy, Debug, Default)]
     pub struct Stats {
@@ -27,9 +46,32 @@ pub(crate) mod allocations {
         pub cross_thread_frees: usize,
         pub overflow: bool,
     }
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Record {
+        pub size: usize,
+        pub thread: usize,
+        pub phase: u32,
+        pub seq: u32,
+    }
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Event {
+        pub add: bool,
+        pub found: bool,
+        pub size: usize,
+        pub pointer: usize,
+        pub thread: usize,
+        pub phase: u32,
+    }
+    const SMALL: usize = 128;
+    const EVENTS: usize = 256;
+    pub const RECORDS: usize = 32;
     struct Tracker {
         stats: Stats,
-        slots: [(usize, usize, usize); 32768],
+        seq: u32,
+        slots: [(usize, usize, usize, u32, u32); 32768],
+        events: [Event; EVENTS],
+        event_head: usize,
+        event_count: usize,
     }
     static TRACKER: Mutex<Tracker> = Mutex::new(Tracker {
         stats: Stats {
@@ -39,7 +81,18 @@ pub(crate) mod allocations {
             cross_thread_frees: 0,
             overflow: false,
         },
-        slots: [(0, 0, 0); 32768],
+        seq: 0,
+        slots: [(0, 0, 0, 0, 0); 32768],
+        events: [Event {
+            add: false,
+            found: false,
+            size: 0,
+            pointer: 0,
+            thread: 0,
+            phase: 0,
+        }; EVENTS],
+        event_head: 0,
+        event_count: 0,
     });
     thread_local! {
         static ENABLED: Cell<bool> = const { Cell::new(false) };
@@ -84,6 +137,21 @@ pub(crate) mod allocations {
             }
             None
         }
+        fn event(&mut self, add: bool, found: bool, size: usize, pointer: usize) {
+            if size > SMALL {
+                return;
+            }
+            self.events[self.event_head] = Event {
+                add,
+                found,
+                size,
+                pointer,
+                thread: thread(),
+                phase: PHASE.load(Ordering::Relaxed),
+            };
+            self.event_head = (self.event_head + 1) % EVENTS;
+            self.event_count = (self.event_count + 1).min(EVENTS);
+        }
         fn add(&mut self, pointer: usize, size: usize) {
             if pointer == 0 {
                 return;
@@ -91,24 +159,29 @@ pub(crate) mod allocations {
             self.stats.live += size;
             self.stats.peak = self.stats.peak.max(self.stats.live);
             self.stats.count += 1;
+            self.seq = self.seq.wrapping_add(1);
+            let phase = PHASE.load(Ordering::Relaxed);
             let start = (pointer >> 4).wrapping_mul(0x9e3779b1) % self.slots.len();
             for offset in 0..self.slots.len() {
                 let index = (start + offset) % self.slots.len();
                 if matches!(self.slots[index].0, 0 | usize::MAX) {
-                    self.slots[index] = (pointer, size, thread());
+                    self.slots[index] = (pointer, size, thread(), phase, self.seq);
                     LIVE.fetch_add(1, Ordering::Relaxed);
+                    self.event(true, true, size, pointer);
                     return;
                 }
             }
             self.stats.overflow = true;
+            self.event(true, false, size, pointer);
         }
         fn remove(&mut self, pointer: usize) -> bool {
             if let Some(index) = self.index(pointer) {
                 let slot = self.slots[index];
                 self.stats.live -= slot.1;
                 self.stats.cross_thread_frees += usize::from(slot.2 != thread());
-                self.slots[index] = (usize::MAX, 0, 0);
+                self.slots[index] = (usize::MAX, 0, 0, 0, 0);
                 LIVE.fetch_sub(1, Ordering::Relaxed);
+                self.event(false, true, slot.1, pointer);
                 return true;
             }
             false
@@ -123,9 +196,13 @@ pub(crate) mod allocations {
         tracker.add(pointer as usize, size);
         pointer
     }
-    pub fn freed(pointer: *mut u8) {
-        if LIVE.load(Ordering::Relaxed) != 0 {
-            TRACKER.lock().unwrap().remove(pointer as usize);
+    pub fn freed(pointer: *mut u8, size: usize) {
+        if LIVE.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let mut tracker = TRACKER.lock().unwrap();
+        if !tracker.remove(pointer as usize) && ENABLED.try_with(Cell::get).unwrap_or(false) {
+            tracker.event(false, false, size, pointer as usize);
         }
     }
     // mutex 覆盖 System.realloc；旧地址重用不能抢先覆盖记录，峰值按旧新并存计。
@@ -152,23 +229,66 @@ pub(crate) mod allocations {
         let mut tracker = TRACKER.lock().unwrap();
         assert_eq!(tracker.stats.live, 0);
         tracker.stats = Stats::default();
-        tracker.slots.fill((0, 0, 0));
+        tracker.seq = 0;
+        tracker.slots.fill((0, 0, 0, 0, 0));
+        tracker.events.fill(Event::default());
+        tracker.event_head = 0;
+        tracker.event_count = 0;
     }
     pub fn stats() -> Stats {
         TRACKER.lock().unwrap().stats
     }
-    pub fn remaining() -> [usize; 16] {
+    pub fn records() -> ([Record; RECORDS], usize) {
         let tracker = TRACKER.lock().unwrap();
-        let mut sizes = [0; 16];
-        for (output, slot) in sizes.iter_mut().zip(
-            tracker
-                .slots
-                .iter()
-                .filter(|slot| slot.0 != 0 && slot.0 != usize::MAX),
-        ) {
-            *output = slot.1;
+        let mut records = [Record::default(); RECORDS];
+        let mut count = 0;
+        for slot in tracker.slots.iter() {
+            if slot.0 == 0 || slot.0 == usize::MAX || count == RECORDS {
+                continue;
+            }
+            records[count] = Record {
+                size: slot.1,
+                thread: slot.2,
+                phase: slot.3,
+                seq: slot.4,
+            };
+            count += 1;
         }
-        sizes
+        (records, count)
+    }
+    pub fn events() -> ([Event; RECORDS], usize) {
+        let tracker = TRACKER.lock().unwrap();
+        let take = tracker.event_count.min(RECORDS);
+        let mut events = [Event::default(); RECORDS];
+        for (output, offset) in events.iter_mut().zip(0..take) {
+            let index = (tracker.event_head + EVENTS - take + offset) % EVENTS;
+            *output = tracker.events[index];
+        }
+        (events, take)
+    }
+    // 只用固定快照；格式化在释放 tracker 锁并暂停 tracking 后，避免递归分配。
+    pub fn describe() -> String {
+        use std::fmt::Write as _;
+        let stats = stats();
+        let (records, record_count) = records();
+        let (events, event_count) = events();
+        let _quiet = Scope::suspend();
+        let mut text = format!("{stats:?}");
+        for record in &records[..record_count] {
+            let _ = write!(
+                text,
+                " rec(size={},thread={},phase={},seq={})",
+                record.size, record.thread, record.phase, record.seq
+            );
+        }
+        for event in &events[..event_count] {
+            let _ = write!(
+                text,
+                " ev(add={},found={},size={},ptr={},thread={},phase={})",
+                event.add, event.found, event.size, event.pointer, event.thread, event.phase
+            );
+        }
+        text
     }
 }
 
@@ -372,6 +492,7 @@ impl PressureSocket {
 
     async fn finish_ingress(&mut self, broker: &BrokerHandle, client: &TestClient) {
         use tokio::io::AsyncWriteExt;
+        allocations::phase(allocations::PHASE_INGRESS);
         let mut tail = vec![b'x'; 65535 - 1024];
         let end = tail.len();
         tail[end - 3..].copy_from_slice(b"\"}}");
@@ -536,6 +657,7 @@ enum Branch {
     Reject,
     BackfillFailure,
     CancelAndLost,
+    CancelAndLostResolved,
 }
 
 async fn output_reply(
@@ -577,6 +699,7 @@ async fn combined_window(branch: Branch, padding: &str, path: std::path::PathBuf
         Duration::from_secs(30),
     );
     let budget = broker.payload_budget();
+    allocations::phase(allocations::PHASE_SETUP);
     let mut viewer = connect(&broker, Endpoint::Browser, Role::Viewer, "viewer").await;
     let mut manager = connect(&broker, Endpoint::Browser, Role::Controller, "owner").await;
     let mut slow = connect(&broker, Endpoint::Browser, Role::Viewer, "slow").await;
@@ -595,6 +718,7 @@ async fn combined_window(branch: Branch, padding: &str, path: std::path::PathBuf
     assert_eq!(next_frame(&mut cleanup).await["id"], 40);
     let mut socket = PressureSocket::new(&budget).await;
     socket.partial().await;
+    allocations::phase(allocations::PHASE_UNKNOWN);
     send(
         &viewer,
         &broker,
@@ -604,9 +728,11 @@ async fn combined_window(branch: Branch, padding: &str, path: std::path::PathBuf
     let unknown = next_request(&mut engine).await;
     assert!(message(&next_frame(&mut viewer).await).contains("outcome may be unknown"));
     assert_eq!(broker.budget_snapshot().await.2, 1);
+    allocations::phase(allocations::PHASE_SLOW);
     output_reply(&mut engine, &broker, &slow, 2, padding).await;
     let writer_bytes = socket.hold_output(&mut slow).await;
     output_reply(&mut engine, &broker, &slow, 3, padding).await;
+    allocations::phase(allocations::PHASE_BACKFILL);
     send(
         &manager,
         &broker,
@@ -642,6 +768,7 @@ async fn combined_window(branch: Branch, padding: &str, path: std::path::PathBuf
     drop(earlier_body);
     drop(earlier_status);
     *profile.outcome_gate.lock().unwrap() = Some(gate.clone());
+    allocations::phase(allocations::PHASE_STATUS);
     let status_task = {
         let profile = profile.clone();
         let budget = budget.clone();
@@ -701,7 +828,11 @@ async fn combined_window(branch: Branch, padding: &str, path: std::path::PathBuf
         engine.reply(request_id(&healthy), json!({}));
         assert_eq!(next_frame(&mut viewer).await["id"], 5);
     }
-    if matches!(branch, Branch::CancelAndLost) {
+    if matches!(
+        branch,
+        Branch::CancelAndLost | Branch::CancelAndLostResolved
+    ) {
+        allocations::phase(allocations::PHASE_CANCEL);
         drop(socket.peer);
         timeout(
             WAIT,
@@ -714,6 +845,33 @@ async fn combined_window(branch: Branch, padding: &str, path: std::path::PathBuf
         broker.writer_gone(slow.id);
         broker.closed(viewer.id);
         assert_eq!(broker.budget_snapshot().await.2, 1);
+        if matches!(branch, Branch::CancelAndLostResolved) {
+            allocations::phase(allocations::PHASE_RESOLVED);
+            engine.reply(request_id(&attach), json!({"sessionId":"first"}));
+            let second = next_method(&mut engine, "Target.attachToTarget").await;
+            engine.reply(request_id(&second), json!({"sessionId":"second"}));
+            assert_eq!(next_frame(&mut manager).await["id"], 4);
+            let (finished, resume) = pause(&broker).await;
+            assert_eq!(finished.result_capacity, 0);
+            assert_eq!(finished.targets_capacity, 0);
+            assert_eq!(finished.span_capacity, 0);
+            assert_eq!(finished.unknown, 1);
+            assert_eq!(finished.slots, 1);
+            resume.send(()).unwrap();
+            allocations::phase(allocations::PHASE_LATE);
+            engine.reply(request_id(&unknown), json!({}));
+            timeout(WAIT, async {
+                while broker.budget_snapshot().await.2 != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let (cleared, resume) = pause(&broker).await;
+            assert_eq!(cleared.unknown, 0);
+            assert_eq!(cleared.slots, 0);
+            resume.send(()).unwrap();
+        }
     } else {
         if matches!(branch, Branch::BackfillFailure) {
             engine.push(json!({"id":request_id(&attach),"error":{"message":"fixture failure"}}));
@@ -760,11 +918,15 @@ async fn combined_window(branch: Branch, padding: &str, path: std::path::PathBuf
         assert_eq!(next_frame(&mut viewer).await["id"], 6);
         drop(socket.peer);
     }
+    allocations::phase(allocations::PHASE_TEARDOWN);
     drop(socket.socket);
     drop(last);
     let before_http_finish = budget.used();
     http_stall
-        .finish(matches!(branch, Branch::CancelAndLost))
+        .finish(matches!(
+            branch,
+            Branch::CancelAndLost | Branch::CancelAndLostResolved
+        ))
         .await;
     assert_eq!(budget.used().0, before_http_finish.0);
     drop(http_last);
@@ -773,6 +935,7 @@ async fn combined_window(branch: Branch, padding: &str, path: std::path::PathBuf
     drop(cleanup);
     drop(manager);
     drop(viewer);
+    allocations::phase(allocations::PHASE_SETTLE);
     settle_actor(&broker, &mut engine).await;
     assert_eq!(budget.used(), (MAX_FRAME_BYTES, 0));
     check_budget(&budget);
@@ -800,29 +963,76 @@ fn actor_reachable_combined_windows() {
         Branch::BackfillFailure,
         Branch::CancelAndLost,
     ] {
-        let padding = "x".repeat(8 * 1024 * 1024);
-        let path = std::path::PathBuf::from("/状态/".repeat(8192));
-        let id = "synthetic".repeat(8192);
-        allocations::reset();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(async { tokio::task::spawn_blocking(|| {}).await.unwrap() });
-            let scope = allocations::Scope::enter();
-            runtime.block_on(combined_window(branch, &padding, path, id));
-            drop(runtime);
-            drop(scope);
-        })
-        .join()
-        .unwrap();
-        let stats = allocations::stats();
-        assert!(!stats.overflow);
-        assert_eq!(stats.live, 0, "remaining={:?}", allocations::remaining());
-        assert!(stats.cross_thread_frees > 0);
-        println!("combined-final {branch:?} {stats:?}");
+        run_combined(branch);
     }
+}
+
+// 独立可达分支：writer 失败与 viewer 关闭后，backfill 完成、late reply 才清 unknown。
+// 独立验证首轮曾见 128 B 残留；本地复跑未复现，保留全部断言与残留归因输出，不提前清 identity。
+#[test]
+fn actor_cancel_keeps_unknown_until_late_reply() {
+    let _serial = allocations::SERIAL.lock().unwrap();
+    assert_eq!(ORDINARY_BYTES, 128 * 1024 * 1024);
+    assert_eq!(INTERNAL_BYTES, 20 * 1024 * 1024);
+    assert_eq!(MAX_FRAME_BYTES, 16 * 1024 * 1024);
+    run_combined(Branch::CancelAndLostResolved);
+}
+
+fn run_combined(branch: Branch) {
+    let padding = "x".repeat(8 * 1024 * 1024);
+    let path = std::path::PathBuf::from("/状态/".repeat(8192));
+    let id = "synthetic".repeat(8192);
+    allocations::reset();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async { tokio::task::spawn_blocking(|| {}).await.unwrap() });
+        let scope = allocations::Scope::enter();
+        runtime.block_on(combined_window(branch, &padding, path, id));
+        allocations::phase(allocations::PHASE_RUNTIME);
+        drop(runtime);
+        drop(scope);
+    })
+    .join()
+    .unwrap();
+    let stats = allocations::stats();
+    assert!(!stats.overflow);
+    assert_eq!(stats.live, 0, "{}", allocations::describe());
+    assert!(stats.cross_thread_frees > 0);
+    println!("combined-final {branch:?} {stats:?}");
+}
+
+// 64 B 来自 PayloadLease 的 hold 向量：owner 是 lease，drop 时释放并归还 permits。
+// 预算回到基线仍见 64 B 残留时，不能归因于仍存活的 lease（permit 会占预算）。
+#[test]
+fn lease_hold_small_owner_is_tracked_and_released() {
+    let _serial = allocations::SERIAL.lock().unwrap();
+    allocations::reset();
+    let held = std::thread::spawn(|| {
+        let budget = crate::transport::PayloadBudget::default();
+        let slots = Arc::new(Semaphore::new(4));
+        let scope = allocations::Scope::enter();
+        allocations::phase(allocations::PHASE_SLOW);
+        let mut lease = budget.try_acquire(64, false).unwrap();
+        lease.hold(slots.clone().try_acquire_owned().unwrap());
+        lease.hold(slots.clone().try_acquire_owned().unwrap());
+        let (records, count) = allocations::records();
+        assert!(
+            records[..count].iter().any(|record| record.size == 64),
+            "{}",
+            allocations::describe()
+        );
+        let held = allocations::stats().live;
+        drop(lease);
+        drop(scope);
+        held
+    })
+    .join()
+    .unwrap();
+    assert_eq!(held, 64);
+    assert_eq!(allocations::stats().live, 0, "{}", allocations::describe());
 }
 
 #[test]
@@ -838,13 +1048,14 @@ fn flush_real_command_queue_callback_and_http_cancel() {
             runtime.block_on(async { tokio::task::spawn_blocking(|| {}).await.unwrap() });
             let scope = allocations::Scope::enter();
             runtime.block_on(flush_window(cancel));
+            allocations::phase(allocations::PHASE_RUNTIME);
             drop(runtime);
             drop(scope);
         })
         .join()
         .unwrap();
         let stats = allocations::stats();
-        assert_eq!(stats.live, 0, "remaining={:?}", allocations::remaining());
+        assert_eq!(stats.live, 0, "{}", allocations::describe());
         assert!(!stats.overflow);
         println!("flush-final cancel={cancel} {stats:?}");
     }

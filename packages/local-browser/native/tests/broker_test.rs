@@ -321,7 +321,7 @@ mod request_allocations {
             ptr
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            super::pressure::allocations::freed(ptr);
+            super::pressure::allocations::freed(ptr, layout.size());
             let _ = TRACK.try_with(|state| state.borrow_mut().remove(ptr));
             System.dealloc(ptr, layout);
         }
