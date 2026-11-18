@@ -44,13 +44,16 @@ fn next_owner_token() -> Result<u64> {
         .map_err(|_| RawError::Limit)
 }
 
-// token 是每个 owner 固定 8 字节 metadata，与 backing lease 同寿命；
-// 无全局注册表，span 复制不分配。后继接入必须按 owner 记录计费。
+// token 是每个 owner 固定 8 字节 metadata；无全局注册表，span 复制不分配。
+// client 由 RequestLease 的 fixed accounting 覆盖；后继 raw owner 仍须接线计费。
 struct RawOwner {
     token: u64,
     text: String,
     _lease: PayloadLease,
 }
+
+// client 的 64 KiB fixed accounting 为每个 owner（含 Arc 头）保留 128 bytes。
+const _: () = assert!(std::mem::size_of::<RawOwner>() + 2 * std::mem::size_of::<usize>() <= 128);
 
 /// clone 只共享 backing、lease 与 token；复制必须经 copy_span_to_ordinary 先取得普通预算。
 #[derive(Clone)]
@@ -183,21 +186,26 @@ impl RawEnvelope {
         preflight(backing.as_str(), policy)?;
         let mut fields = [RawPresence::Missing; 6];
         let names = ["id", "method", "sessionId", "params", "result", "error"];
-        visit_object(&backing, backing.full_span(), scratch, |key, raw, text| {
-            for (index, name) in names.iter().enumerate() {
-                if !text.equals(key, name)? {
-                    continue;
+        if policy == ParsePolicy::ClientOpaque && backing.as_str().trim_start().starts_with('[') {
+            let selected = select_sequence::<4>(&backing, backing.full_span(), scratch)?;
+            fields[..4].copy_from_slice(&selected);
+        } else {
+            visit_object(&backing, backing.full_span(), scratch, |key, raw, text| {
+                for (index, name) in names.iter().enumerate() {
+                    if !text.equals(key, name)? {
+                        continue;
+                    }
+                    if policy == ParsePolicy::ClientOpaque
+                        && index < 4
+                        && fields[index] != RawPresence::Missing
+                    {
+                        return Err(RawError::Duplicate);
+                    }
+                    fields[index] = presence(&backing, raw)?;
                 }
-                if policy == ParsePolicy::ClientOpaque
-                    && index < 4
-                    && fields[index] != RawPresence::Missing
-                {
-                    return Err(RawError::Duplicate);
-                }
-                fields[index] = presence(&backing, raw)?;
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })?;
+        }
         if policy == ParsePolicy::ClientOpaque {
             validate_client_fields(&backing, &fields)?;
         }
@@ -341,6 +349,26 @@ pub fn visit_array<'a>(
     })
     .map_err(|_| error.unwrap_or(RawError::Invalid))?;
     de.end().map_err(|_| RawError::Invalid)
+}
+
+/// serde struct 的序列形式必须恰有 N 个元素；只记录固定 span，不解码值。
+pub(crate) fn select_sequence<const N: usize>(
+    backing: &LeasedRaw,
+    span: RawSpan,
+    scratch: &mut JsonScratchGuard<'_>,
+) -> Result<[RawPresence; N]> {
+    let mut fields = [RawPresence::Missing; N];
+    let mut index = 0;
+    visit_array(backing, span, scratch, |raw| {
+        let field = fields.get_mut(index).ok_or(RawError::Invalid)?;
+        *field = presence(backing, raw)?;
+        index += 1;
+        Ok(())
+    })?;
+    if index != N {
+        return Err(RawError::Invalid);
+    }
+    Ok(fields)
 }
 
 /// 固定字段选择：重复拒绝可供 params metadata 的整体 fallback 使用，不决定 broker 策略。
@@ -551,6 +579,136 @@ pub fn decode_identity(
         text,
         _lease: lease,
     })))
+}
+
+pub(crate) enum MetadataScalar {
+    Other,
+    Text(LeasedIdentity),
+    Bool(bool),
+    Number(serde_json::Number),
+}
+
+struct MetadataSeed<'a> {
+    budget: &'a PayloadBudget,
+    capture: bool,
+}
+
+impl<'de> DeserializeSeed<'de> for MetadataSeed<'_> {
+    type Value = MetadataScalar;
+    fn deserialize<D: Deserializer<'de>>(
+        self,
+        de: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        de.deserialize_any(self)
+    }
+}
+
+// 仅用于旧路径已限制到 4096 raw bytes 的 metadata，不用于 opaque params。
+// 无容器树；普通嵌套共用 serde scratch。sentinel 每层至少缩短 35 raw bytes，
+// 深度 <128；每层 buffer/grow/栈保守计 32 KiB，总量 <4 MiB 且与 raw 扫描串行。
+impl<'de> Visitor<'de> for MetadataSeed<'_> {
+    type Value = MetadataScalar;
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("metadata")
+    }
+    fn visit_bool<E: serde::de::Error>(self, value: bool) -> std::result::Result<Self::Value, E> {
+        Ok(MetadataScalar::Bool(value))
+    }
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> std::result::Result<Self::Value, E> {
+        Ok(MetadataScalar::Number(value.into()))
+    }
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> std::result::Result<Self::Value, E> {
+        Ok(MetadataScalar::Number(value.into()))
+    }
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> std::result::Result<Self::Value, E> {
+        serde_json::Number::from_f64(value)
+            .map(MetadataScalar::Number)
+            .ok_or_else(|| E::custom(RawError::Invalid))
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+        Ok(MetadataScalar::Other)
+    }
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
+        if !self.capture {
+            return Ok(MetadataScalar::Other);
+        }
+        // identity clone 可短暂晚于 RequestLease drop；Arc 头和 owner 随自己的 lease 计费。
+        let charged =
+            value.len() + std::mem::size_of::<IdentityOwner>() + 2 * std::mem::size_of::<usize>();
+        let lease = self
+            .budget
+            .try_acquire(charged, false)
+            .ok_or_else(|| E::custom(RawError::Budget))?;
+        let mut text = String::with_capacity(value.len());
+        text.push_str(value);
+        Ok(MetadataScalar::Text(LeasedIdentity(Arc::new(
+            IdentityOwner {
+                text,
+                _lease: lease,
+            },
+        ))))
+    }
+    fn visit_seq<S: SeqAccess<'de>>(
+        self,
+        mut seq: S,
+    ) -> std::result::Result<Self::Value, S::Error> {
+        while seq
+            .next_element_seed(MetadataSeed {
+                budget: self.budget,
+                capture: false,
+            })?
+            .is_some()
+        {}
+        Ok(MetadataScalar::Other)
+    }
+    fn visit_map<M: MapAccess<'de>>(
+        self,
+        mut map: M,
+    ) -> std::result::Result<Self::Value, M::Error> {
+        let Some(key) = map.next_key::<String>()? else {
+            return Ok(MetadataScalar::Other);
+        };
+        if key == "$serde_json::private::RawValue" {
+            let text: String = map.next_value()?;
+            return metadata_scalar_inner(&text, self.budget, self.capture)
+                .map_err(M::Error::custom);
+        }
+        map.next_value_seed(MetadataSeed {
+            budget: self.budget,
+            capture: false,
+        })?;
+        while map.next_key::<String>()?.is_some() {
+            map.next_value_seed(MetadataSeed {
+                budget: self.budget,
+                capture: false,
+            })?;
+        }
+        Ok(MetadataScalar::Other)
+    }
+}
+
+fn metadata_scalar_inner(
+    text: &str,
+    budget: &PayloadBudget,
+    capture: bool,
+) -> Result<MetadataScalar> {
+    if text.len() > IDENTITY_BYTES {
+        return Err(RawError::Limit);
+    }
+    let mut de = serde_json::Deserializer::from_str(text);
+    let scalar = MetadataSeed { budget, capture }
+        .deserialize(&mut de)
+        .map_err(|_| RawError::Invalid)?;
+    de.end().map_err(|_| RawError::Invalid)?;
+    Ok(scalar)
+}
+
+pub(crate) fn metadata_scalar(
+    raw: &RawValue,
+    budget: &PayloadBudget,
+    _scratch: &mut JsonScratchGuard<'_>,
+) -> Result<MetadataScalar> {
+    metadata_scalar_inner(raw.get(), budget, true)
 }
 
 fn number(raw: &RawValue) -> Option<serde_json::Number> {

@@ -23,8 +23,440 @@ use crate::observe::Observer;
 use crate::services::{MemoryProfile, ProfileService};
 use crate::transport::{Upstream, UpstreamAddress};
 
+// 保留迁移前 Request 的解析策略作为 oracle；仅测试允许构造 metadata Value。
+fn old_request(text: &str) -> Option<Value> {
+    use serde_json::value::RawValue;
+    #[derive(serde::Deserialize)]
+    struct Envelope<'a> {
+        #[serde(borrow)]
+        id: Option<&'a RawValue>,
+        #[serde(borrow)]
+        method: Option<&'a RawValue>,
+        #[serde(rename = "sessionId", borrow)]
+        session: Option<&'a RawValue>,
+        #[serde(borrow)]
+        params: Option<&'a RawValue>,
+    }
+    #[derive(Default, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Fields<'a> {
+        #[serde(borrow)]
+        target_id: Option<&'a RawValue>,
+        #[serde(borrow)]
+        session_id: Option<&'a RawValue>,
+        #[serde(borrow)]
+        auto_attach: Option<&'a RawValue>,
+        #[serde(borrow)]
+        discover: Option<&'a RawValue>,
+    }
+    let raw: Envelope<'_> = serde_json::from_str(text).ok()?;
+    let fields: Fields<'_> = raw
+        .params
+        .map(|raw| serde_json::from_str(raw.get()).unwrap_or_default())
+        .unwrap_or_default();
+    let mut result = serde_json::Map::new();
+    for (name, field) in [
+        ("id", raw.id),
+        ("method", raw.method),
+        ("sessionId", raw.session),
+        ("targetId", fields.target_id),
+        ("paramSession", fields.session_id),
+        ("autoAttach", fields.auto_attach),
+        ("discover", fields.discover),
+    ] {
+        if let Some(raw) = field {
+            if raw.get().len() > 4096 {
+                return None;
+            }
+            result.insert(name.into(), serde_json::from_str(raw.get()).ok()?);
+        }
+    }
+    Some(Value::Object(result))
+}
+
+#[test]
+fn client_raw_fixed_accounting_and_failure_release() {
+    use super::{ManagedWork, ObservedParams, Pending, Request, RequestLease, Unknown};
+    use std::mem::size_of;
+    use crate::transport::{PayloadBudget, MAX_FRAME_BYTES, ORDINARY_BYTES};
+    let fixed = size_of::<Request>()
+        + size_of::<ManagedWork>()
+        + size_of::<Pending>()
+        + size_of::<Unknown>()
+        + size_of::<RequestLease>()
+        + size_of::<ObservedParams>()
+        + 16 * size_of::<crate::cdp_raw::RawSpan>()
+        + 16 * 128;
+    assert!(fixed + 12 * 4096 < 64 * 1024);
+    println!("client metadata fixed={fixed}, identity copies<=49152, lease=65536");
+    let budget = PayloadBudget::default();
+    for text in [
+        r#"{"id":1,"method":"x","params":{"targetId":"\uD800"}}"#,
+        r#"{"id":1,"method":"x","params":{"targetId":"a","targetId":"b"}}"#,
+    ] {
+        let owned = text.to_string();
+        let lease = budget.try_acquire(owned.capacity(), false).unwrap();
+        drop(Request::parse(owned, lease, &budget));
+        assert_eq!(budget.used().0, MAX_FRAME_BYTES);
+    }
+    let identity_text = r#"{"id":1,"method":"x","params":{"targetId":"held"}}"#.to_string();
+    let payload = budget.try_acquire(identity_text.capacity(), false).unwrap();
+    let request = Request::parse(identity_text, payload, &budget).unwrap();
+    let observed = request.observed.clone();
+    drop(request);
+    assert!(budget.used().0 > MAX_FRAME_BYTES);
+    assert_eq!(observed.string("targetId"), Some("held"));
+    drop(observed);
+    assert_eq!(budget.used().0, MAX_FRAME_BYTES);
+    let text = r#"{"id":1,"method":"x"}"#.to_string();
+    let payload = budget.try_acquire(text.capacity(), false).unwrap();
+    let remaining = ORDINARY_BYTES - budget.used().0;
+    let held = budget.try_acquire(remaining, false).unwrap();
+    assert!(Request::parse(text, payload, &budget).is_none());
+    drop(held);
+    assert_eq!(budget.used().0, MAX_FRAME_BYTES);
+}
+
+#[test]
+fn client_request_matches_old_policy_and_keeps_raw_opaque() {
+    let budget = crate::transport::PayloadBudget::default();
+    let deep = format!("{}0{}", "[".repeat(4096), "]".repeat(4096));
+    let long = format!("\"{}\"", "x".repeat(4096));
+    let values = [
+        r#"["t","s",true,false]"#,
+        r#"["t"]"#,
+        "null",
+        "false",
+        "[]",
+        "{}",
+        "1e400",
+        r#""\uD800""#,
+        r#"{"targetId":"t","autoAttach":true}"#,
+        r#"{"targetId":"a","targetId":"b","autoAttach":true}"#,
+        r#"{"targetId":null,"targetId":"b","autoAttach":true}"#,
+        r#"{"targetId":{},"sessionId":7,"autoAttach":"true"}"#,
+        r#"{"targetId":"\uD800"}"#,
+        r#"{"ignored":"\uD800"}"#,
+        r#"{"ignored":1e400}"#,
+        r#"{"autoAttach":1e400}"#,
+        r#"{"targetId":{"$serde_json::private::RawValue":"1"}}"#,
+        r#"{"targetId":{"$serde_json::private::RawValue":1}}"#,
+        r#"{"targetId":{"$serde_json::private::Number":"1"}}"#,
+        r#"{"targ\u0065tId":"t","discover":true}"#,
+        &deep,
+        &long,
+    ];
+    let ids = [
+        "1",
+        "-0",
+        "1.0",
+        "1e0",
+        "9007199254740991",
+        "9007199254740992",
+        "-9007199254740991",
+        "18446744073709551615",
+        "1e400",
+        "1e-400",
+        "null",
+    ];
+    let mut count = 0;
+    for params in values {
+        for id in ids {
+            let text = format!(
+                r#"{{"id":{id},"method":"Runtime.evaluate","params":{params},"extra":{{"ignored":true}}}}"#
+            );
+            compare_old_request(&text, &budget);
+            count += 1;
+        }
+    }
+    for text in [
+        r#"[1,"x",null,{}]"#,
+        r#"[1,"x"]"#,
+        r#"{"id":1,"id":2,"method":"x"}"#,
+        r#"{"id":null,"id":2,"method":"x"}"#,
+        r#"{"method":null,"method":"x"}"#,
+        r#"{"params":null,"params":{}}"#,
+        r#"{"id":1,"method":"x","meth\u006fd":"y"}"#,
+        r#"{"id":1,"method":"\uD800"}"#,
+        r#"{"id":1,"method":"x","params":[1,]}"#,
+    ] {
+        compare_old_request(text, &budget);
+        count += 1;
+    }
+    for size in [4094, 4095, 4096] {
+        let token = serde_json::to_string(&"x".repeat(size)).unwrap();
+        for key in ["method", "sessionId"] {
+            let text = format!(r#"{{"id":1,"{key}":{token}}}"#);
+            compare_old_request(&text, &budget);
+            count += 1;
+        }
+        let text = format!(r#"{{"id":1,"method":"x","params":{{"targetId":{token}}}}}"#);
+        compare_old_request(&text, &budget);
+        count += 1;
+    }
+    for payload in [r#""\"decoded\"""#, "true", "1e400", r#""\uD800""#] {
+        let wrapped = json!({"$serde_json::private::RawValue": payload}).to_string();
+        let text = format!(
+            r#"{{"id":1,"method":"x","params":{{"targetId":{wrapped},"autoAttach":{wrapped}}}}}"#
+        );
+        compare_old_request(&text, &budget);
+        count += 1;
+    }
+    assert_eq!(budget.used().0, crate::transport::MAX_FRAME_BYTES);
+    println!("client production Request old-policy cases={count}");
+}
+
+fn compare_old_request(text: &str, budget: &crate::transport::PayloadBudget) {
+    use super::Request;
+    let old = old_request(text);
+    let owned = text.to_string();
+    let lease = budget.try_acquire(owned.capacity(), false).unwrap();
+    let new = Request::parse(owned, lease, budget);
+    if let Some(request) = &new {
+        if request.observed.fallback {
+            assert!(request.observed.string("targetId").is_none());
+            assert!(request.observed.auto_attach.is_none());
+            assert!(request.observed.discover.is_none());
+        }
+    }
+    assert_eq!(new.is_some(), old.is_some(), "{text}");
+    if let (Some(new), Some(old)) = (new, old) {
+        assert_eq!(
+            new.id,
+            old.get("id").and_then(super::safe_integer),
+            "{text}"
+        );
+        assert_eq!(
+            new.method(),
+            old.get("method").and_then(Value::as_str),
+            "{text}"
+        );
+        assert_eq!(
+            new.session(),
+            old.get("sessionId").and_then(Value::as_str),
+            "{text}"
+        );
+        assert_eq!(
+            new.observed.string("targetId"),
+            old.get("targetId").and_then(Value::as_str),
+            "{text}"
+        );
+        assert_eq!(
+            new.observed.string("sessionId"),
+            old.get("paramSession").and_then(Value::as_str),
+            "{text}"
+        );
+        assert_eq!(
+            new.observed.auto_attach,
+            old.get("autoAttach").and_then(Value::as_bool),
+            "{text}"
+        );
+        assert_eq!(
+            new.observed.discover,
+            old.get("discover").and_then(Value::as_bool),
+            "{text}"
+        );
+        let mut scratch = budget.json_scratch();
+        if let Some(raw) = new.raw_params(&mut scratch) {
+            assert!(text.contains(raw.get()));
+        }
+    }
+}
+
+mod request_allocations {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, Default, Debug)]
+    struct Stats {
+        live: usize,
+        peak: usize,
+        largest: usize,
+        count: usize,
+        overflow: bool,
+    }
+    struct Tracking {
+        active: bool,
+        stats: Stats,
+        slots: [(usize, usize); 1024],
+    }
+    thread_local! {
+        static TRACK: RefCell<Tracking> = const { RefCell::new(Tracking {
+            active: false, stats: Stats { live: 0, peak: 0, largest: 0, count: 0, overflow: false },
+            slots: [(0, 0); 1024],
+        }) };
+    }
+    impl Tracking {
+        fn add(&mut self, ptr: *mut u8, size: usize) {
+            if !self.active || ptr.is_null() {
+                return;
+            }
+            self.stats.live += size;
+            self.stats.peak = self.stats.peak.max(self.stats.live);
+            self.stats.largest = self.stats.largest.max(size);
+            self.stats.count += 1;
+            if let Some(slot) = self.slots.iter_mut().find(|slot| slot.0 == 0) {
+                *slot = (ptr as usize, size);
+            } else {
+                self.stats.overflow = true;
+            }
+        }
+        fn remove(&mut self, ptr: *mut u8) {
+            if let Some(slot) = self.slots.iter_mut().find(|slot| slot.0 == ptr as usize) {
+                self.stats.live -= slot.1;
+                *slot = (0, 0);
+            }
+        }
+    }
+    struct Allocator;
+    // 仅测试按线程记录全部大小；realloc 以旧新并存计峰，槽溢出使测试失败。
+    unsafe impl GlobalAlloc for Allocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = System.alloc(layout);
+            let _ = TRACK.try_with(|state| state.borrow_mut().add(ptr, layout.size()));
+            ptr
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            let _ = TRACK.try_with(|state| state.borrow_mut().remove(ptr));
+            System.dealloc(ptr, layout);
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            let new = System.realloc(ptr, layout, size);
+            if !new.is_null() {
+                let _ = TRACK.try_with(|state| {
+                    let mut state = state.borrow_mut();
+                    if state.active {
+                        state.stats.peak = state.stats.peak.max(state.stats.live + size);
+                    }
+                    state.remove(ptr);
+                    state.add(new, size);
+                });
+            }
+            new
+        }
+    }
+    #[global_allocator]
+    static ALLOCATOR: Allocator = Allocator;
+
+    #[test]
+    fn production_request_has_no_params_tree_or_copy() {
+        use crate::transport::{PayloadBudget, MAX_FRAME_BYTES};
+        use super::super::Request;
+        let budget = PayloadBudget::default();
+        drop(budget.json_scratch());
+        drop(budget.try_acquire(64 * 1024, false).unwrap());
+        let escaped = format!(r#"{{"data":"{}"}}"#, "\\u0061".repeat(500_000));
+        let objects = format!("[{}0]", "{\"x\":[1,2]},".repeat(100_000));
+        let keys = format!(r#"{{"{}":0}}"#, "\\u0061".repeat(500_000));
+        let fields = format!(r#"{{{}"last":0}}"#, "\"x\":{},".repeat(100_000));
+        for (name, params) in [
+            ("escape", escaped),
+            ("objects", objects),
+            ("key", keys),
+            ("fields", fields),
+        ] {
+            let text = format!(r#"{{"id":1,"method":"Target.attachToTarget","params":{params}}}"#);
+            let pointer = text.as_ptr();
+            let lease = budget.try_acquire(text.capacity(), false).unwrap();
+            TRACK.with(|track| {
+                let mut track = track.borrow_mut();
+                track.stats = Stats::default();
+                track.slots.fill((0, 0));
+                track.active = true;
+            });
+            let mut request = Request::parse(text, lease, &budget).unwrap();
+            assert_eq!(
+                request.raw.as_ref().unwrap().backing().as_str().as_ptr(),
+                pointer
+            );
+            let observed = request.observed.clone();
+            request.release_raw();
+            drop(request);
+            drop(observed);
+            let stats = TRACK.with(|track| {
+                let mut track = track.borrow_mut();
+                track.active = false;
+                track.stats
+            });
+            println!("production Request {name}: {stats:?}");
+            assert!(!stats.overflow);
+            assert_eq!(stats.live, 0);
+            assert!(stats.peak < 64 * 1024, "{name}: {stats:?}");
+            assert_eq!(budget.used().0, MAX_FRAME_BYTES);
+        }
+    }
+}
+
 const WAIT: Duration = Duration::from_secs(2);
 const QUIET: Duration = Duration::from_millis(200);
+
+#[tokio::test]
+async fn client_dispatch_preserves_opaque_params_and_drops_extra_fields() {
+    use serde_json::value::RawValue;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (captured, mut frames) = mpsc::channel(4);
+    let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        loop {
+            tokio::select! {
+                _ = &mut stopped => return,
+                frame = socket.next() => {
+                    let Some(Ok(Message::Text(text))) = frame else { return };
+                    captured.send(text.to_string()).await.unwrap();
+                }
+            }
+        }
+    });
+    let observer = Arc::new(Observer::disabled());
+    let upstream = Upstream::connect(&UpstreamAddress::Tcp(address), observer.clone())
+        .await
+        .unwrap();
+    let profile = Arc::new(ProfileService::new(Arc::new(
+        MemoryProfile::new("http://profile.invalid").unwrap(),
+    )));
+    let broker = BrokerHandle::start(upstream, profile, observer);
+    let client = connect(&broker, Endpoint::Browser, Role::Controller, "raw-owner").await;
+    let deep = format!("{}0{}", "[".repeat(4096), "]".repeat(4096));
+    for (index, params) in [
+        r#"{ "unknown":1e400,"s":"\uD800","x":1,"x":2 }"#,
+        &deep,
+        r#"{"targetId":"t","padding":{"a":1,"a":2}}"#,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let method = if index == 2 {
+            "Target.attachToTarget"
+        } else {
+            "Runtime.evaluate"
+        };
+        let text = format!(
+            r#"{{"id":{}e0,"method":"{method}","params":{params},"extra":"not-forwarded"}}"#,
+            9000 + index
+        );
+        send(&client, &broker, &text).await;
+        let outbound = timeout(WAIT, frames.recv()).await.unwrap().unwrap();
+        #[derive(serde::Deserialize)]
+        struct Wire<'a> {
+            id: u64,
+            method: String,
+            #[serde(borrow)]
+            params: &'a RawValue,
+        }
+        let wire: Wire<'_> = serde_json::from_str(&outbound).unwrap();
+        assert_ne!(wire.id, 9000 + index as u64);
+        assert_eq!(wire.method, method);
+        assert_eq!(wire.params.get(), *params);
+        assert!(!outbound.contains("not-forwarded"));
+        assert!(!outbound.contains("sessionId"));
+    }
+    stop.send(()).unwrap();
+    server.await.unwrap();
+    assert!(!broker.wait_terminal().await);
+}
 
 struct FakeEngine {
     address: SocketAddr,

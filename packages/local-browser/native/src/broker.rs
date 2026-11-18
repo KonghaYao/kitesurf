@@ -8,8 +8,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::ops::Deref;
-use serde::Deserialize;
+use crate::cdp_raw::{
+    self, DuplicatePolicy, LeasedIdentity, LeasedRaw, ParsePolicy, RawEnvelope, RawPresence,
+    RawSpan,
+};
 use serde_json::value::RawValue;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use std::time::Duration;
@@ -63,6 +65,7 @@ const MAX_PAGE_QUEUE: usize = 64;
 const MAX_PAGE_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 const CLIENT_QUEUE_FRAMES: usize = 64;
 const CLIENT_QUEUE_BYTES: usize = 32 * 1024 * 1024;
+#[cfg(all(test, feature = "test-faults"))]
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const CLIENT_DEADLINE: Duration = Duration::from_secs(120);
 const INTERNAL_DEADLINE: Duration = Duration::from_secs(30);
@@ -349,7 +352,7 @@ impl BrokerHandle {
     }
 
     pub fn try_frame(&self, client: ClientId, text: String) -> bool {
-        let Some(lease) = self.budget.try_acquire(text.len(), false) else {
+        let Some(lease) = self.budget.try_acquire(text.capacity(), false) else {
             return false;
         };
         self.frames.try_send((client, text, lease)).is_ok()
@@ -357,7 +360,7 @@ impl BrokerHandle {
 
     /// 读端使用有界队列施加背压；broker 结束时返回 false。
     pub async fn frame(&self, client: ClientId, text: String) -> bool {
-        let Some(lease) = self.budget.try_acquire(text.len(), false) else {
+        let Some(lease) = self.budget.try_acquire(text.capacity(), false) else {
             return false;
         };
         self.frames.send((client, text, lease)).await.is_ok()
@@ -583,91 +586,189 @@ impl Drop for RequestLease {
 }
 
 struct Request {
-    envelope: Value,
-    params: Option<Box<RawValue>>,
+    raw: Option<RawEnvelope>,
+    id: Option<i64>,
+    method: Option<LeasedIdentity>,
+    session: Option<LeasedIdentity>,
+    params: Option<RawSpan>,
+    observed: ObservedParams,
     metadata: Option<PayloadLease>,
-    _payload: PayloadLease,
     lease: Option<Arc<RequestLease>>,
 }
 
-impl Deref for Request {
-    type Target = Value;
-    fn deref(&self) -> &Value {
-        &self.envelope
+#[derive(Clone, Default)]
+struct ObservedParams {
+    target: Option<LeasedIdentity>,
+    session: Option<LeasedIdentity>,
+    auto_attach: Option<bool>,
+    discover: Option<bool>,
+    fallback: bool,
+}
+
+impl ObservedParams {
+    fn string(&self, name: &str) -> Option<&str> {
+        if self.fallback {
+            return None;
+        }
+        match name {
+            "targetId" => self.target.as_ref().map(LeasedIdentity::as_str),
+            "sessionId" => self.session.as_ref().map(LeasedIdentity::as_str),
+            _ => None,
+        }
     }
 }
 
-#[derive(Deserialize)]
-struct BorrowedRequest<'a> {
-    #[serde(borrow)]
-    id: Option<&'a RawValue>,
-    #[serde(borrow)]
-    method: Option<&'a RawValue>,
-    #[serde(rename = "sessionId", borrow)]
-    session: Option<&'a RawValue>,
-    #[serde(borrow)]
-    params: Option<&'a RawValue>,
-}
-
 impl Request {
-    fn parse(text: &str, payload: PayloadLease, metadata_lease: PayloadLease) -> Option<Self> {
-        let raw: BorrowedRequest<'_> = serde_json::from_str(text).ok()?;
-        let mut envelope = serde_json::Map::new();
-        for (key, raw) in [
-            ("id", raw.id),
-            ("method", raw.method),
-            ("sessionId", raw.session),
-        ] {
-            if let Some(raw) = raw {
-                // 身份字段不可成为大 payload 的第二份隐藏副本。
-                if raw.get().len() > 4096 {
-                    return None;
-                }
-                envelope.insert(key.into(), serde_json::from_str(raw.get()).ok()?);
-            }
-        }
-        let params = raw
-            .params
-            .map(|raw| RawValue::from_string(raw.get().into()))
-            .transpose()
-            .ok()?;
-        let mut metadata = serde_json::Map::new();
-        if let Some(raw) = raw.params {
-            #[derive(Default, Deserialize)]
-            #[serde(rename_all = "camelCase")]
-            struct Fields<'a> {
-                #[serde(borrow)]
-                target_id: Option<&'a RawValue>,
-                #[serde(borrow)]
-                session_id: Option<&'a RawValue>,
-                #[serde(borrow)]
-                auto_attach: Option<&'a RawValue>,
-                #[serde(borrow)]
-                discover: Option<&'a RawValue>,
-            }
-            let fields: Fields<'_> = serde_json::from_str(raw.get()).unwrap_or_default();
-            for (key, raw) in [
-                ("targetId", fields.target_id),
-                ("sessionId", fields.session_id),
-                ("autoAttach", fields.auto_attach),
-                ("discover", fields.discover),
-            ] {
-                if let Some(raw) = raw {
-                    if raw.get().len() > 4096 {
-                        return None;
-                    }
-                    metadata.insert(key.into(), serde_json::from_str(raw.get()).ok()?);
+    #[cfg(all(test, feature = "test-faults"))]
+    fn parse(text: String, payload: PayloadLease, budget: &PayloadBudget) -> Option<Self> {
+        let metadata = budget.try_acquire(64 * 1024, false)?;
+        Self::parse_with_metadata(text, payload, metadata, budget)
+    }
+
+    fn parse_with_metadata(
+        text: String,
+        payload: PayloadLease,
+        metadata: PayloadLease,
+        budget: &PayloadBudget,
+    ) -> Option<Self> {
+        // 64 KiB 随 request/unknown lease 保留：固定记录、Arc 头、owner token、
+        // 实际 16-byte span 及最多 12 份 <=4096-byte identity 临时/持久副本。
+        // 动态 identity 字符容量还由 metadata_scalar 单独收费；测试核对固定容量余量。
+        let mut scratch = budget.json_scratch();
+        let raw = RawEnvelope::parse(
+            LeasedRaw::new(text, payload).ok()?,
+            ParsePolicy::ClientOpaque,
+            &mut scratch,
+        )
+        .ok()?;
+        let backing = raw.backing();
+        let id = match Self::scalar(backing, raw.field("id"), budget, &mut scratch)? {
+            cdp_raw::MetadataScalar::Number(number) => {
+                if let Some(value) = number.as_i64() {
+                    (value.unsigned_abs() <= 9_007_199_254_740_991).then_some(value)
+                } else {
+                    number
+                        .as_f64()
+                        .filter(|value| {
+                            value.fract() == 0.0 && value.abs() <= 9_007_199_254_740_991f64
+                        })
+                        .map(|value| value as i64)
                 }
             }
-        }
-        envelope.insert("params".into(), Value::Object(metadata));
+            _ => None,
+        };
+        let method = Self::identity(backing, raw.field("method"), budget, &mut scratch)?;
+        let session = Self::identity(backing, raw.field("sessionId"), budget, &mut scratch)?;
+        let params = match raw.field("params") {
+            RawPresence::Present(span) => Some(span),
+            _ => None,
+        };
+        let observed = Self::observe(backing, params, budget, &mut scratch)?;
         Some(Self {
-            envelope: Value::Object(envelope),
+            raw: Some(raw),
+            id,
+            method,
+            session,
             params,
-            metadata: Some(metadata_lease),
-            _payload: payload,
+            observed,
+            metadata: Some(metadata),
             lease: None,
         })
+    }
+
+    fn identity(
+        backing: &LeasedRaw,
+        field: RawPresence,
+        budget: &PayloadBudget,
+        scratch: &mut crate::transport::JsonScratchGuard<'_>,
+    ) -> Option<Option<LeasedIdentity>> {
+        Some(match Self::scalar(backing, field, budget, scratch)? {
+            cdp_raw::MetadataScalar::Text(text) => Some(text),
+            _ => None,
+        })
+    }
+
+    fn scalar(
+        backing: &LeasedRaw,
+        field: RawPresence,
+        budget: &PayloadBudget,
+        scratch: &mut crate::transport::JsonScratchGuard<'_>,
+    ) -> Option<cdp_raw::MetadataScalar> {
+        let Some(span) = field.span() else {
+            return Some(cdp_raw::MetadataScalar::Other);
+        };
+        if backing.text(span).ok()?.len() > 4096 {
+            return None;
+        }
+        let raw = backing.raw(span, scratch).ok()?;
+        cdp_raw::metadata_scalar(raw, budget, scratch).ok()
+    }
+
+    fn observe(
+        backing: &LeasedRaw,
+        params: Option<RawSpan>,
+        budget: &PayloadBudget,
+        scratch: &mut crate::transport::JsonScratchGuard<'_>,
+    ) -> Option<ObservedParams> {
+        let Some(span) = params else {
+            return Some(ObservedParams::default());
+        };
+        let fields = if backing.text(span).ok()?.starts_with('[') {
+            cdp_raw::select_sequence::<4>(backing, span, scratch)
+        } else {
+            cdp_raw::select_fields(
+                backing,
+                span,
+                ["targetId", "sessionId", "autoAttach", "discover"],
+                DuplicatePolicy::Reject,
+                scratch,
+            )
+        };
+        let Ok(fields) = fields else {
+            return Some(ObservedParams {
+                fallback: true,
+                ..Default::default()
+            });
+        };
+        // 扫描回调只保存 span；退出 serde 后才逐字段解码，避免重入共享 scratch。
+        // metadata_scalar 在 owned allocation 前执行旧 4096 raw-byte 限制。
+        let mut boolean = |field| {
+            Some(match Self::scalar(backing, field, budget, scratch)? {
+                cdp_raw::MetadataScalar::Bool(value) => Some(value),
+                _ => None,
+            })
+        };
+        let auto_attach = boolean(fields[2])?;
+        let discover = boolean(fields[3])?;
+        Some(ObservedParams {
+            target: Self::identity(backing, fields[0], budget, scratch)?,
+            session: Self::identity(backing, fields[1], budget, scratch)?,
+            auto_attach,
+            discover,
+            fallback: false,
+        })
+    }
+
+    fn method(&self) -> Option<&str> {
+        self.method.as_ref().map(LeasedIdentity::as_str)
+    }
+    fn session(&self) -> Option<&str> {
+        self.session.as_ref().map(LeasedIdentity::as_str)
+    }
+    fn bytes(&self) -> usize {
+        self.raw
+            .as_ref()
+            .map_or(0, |raw| raw.backing().as_str().len())
+    }
+    fn raw_params<'a>(
+        &'a self,
+        scratch: &mut crate::transport::JsonScratchGuard<'_>,
+    ) -> Option<&'a RawValue> {
+        self.raw.as_ref()?.backing().raw(self.params?, scratch).ok()
+    }
+    fn release_raw(&mut self) {
+        self.params = None;
+        self.raw = None;
     }
 }
 
@@ -759,7 +860,7 @@ struct ManagedWork {
     external_id: i64,
     explicit_session: Option<String>,
     method: String,
-    params: Value,
+    params: ObservedParams,
     retained: Vec<PayloadLease>,
 }
 
@@ -1138,19 +1239,17 @@ impl Broker {
     }
 
     fn client_frame(&mut self, client_id: ClientId, text: String, ingress: PayloadLease) {
-        let Some(payload) = self.upstream.handle.budget.try_acquire(text.len(), false) else {
-            self.disconnect_client(client_id, 1011, "Payload budget exhausted", true);
-            return;
-        };
         let Some(metadata) = self.upstream.handle.budget.try_acquire(64 * 1024, false) else {
             self.disconnect_client(client_id, 1011, "Payload budget exhausted", true);
             return;
         };
-        let Some(value) = Request::parse(&text, payload, metadata) else {
+        let Some(value) =
+            Request::parse_with_metadata(text, ingress, metadata, &self.upstream.handle.budget)
+        else {
             self.send_error(client_id, 0, -32000, "Invalid CDP request", None);
             return;
         };
-        let Some(external_id) = value.get("id").and_then(safe_integer) else {
+        let Some(external_id) = value.id else {
             self.send_error(
                 client_id,
                 0,
@@ -1160,11 +1259,7 @@ impl Broker {
             );
             return;
         };
-        let Some(method) = value
-            .get("method")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-        else {
+        let Some(method) = value.method().map(str::to_string) else {
             self.send_error(
                 client_id,
                 external_id,
@@ -1174,8 +1269,6 @@ impl Broker {
             );
             return;
         };
-        drop(text);
-        drop(ingress);
         let mut value = value;
         if let Err(message) = self.check_request(client_id, &value, external_id, &method) {
             self.send_error(
@@ -1233,7 +1326,7 @@ impl Broker {
             self.admit_request(client_id, request, external_id, method);
             return;
         }
-        let bytes = request._payload.bytes();
+        let bytes = request.bytes();
         if client.page_queue.len() >= MAX_PAGE_QUEUE
             || client.page_queue_bytes.saturating_add(bytes) > MAX_PAGE_QUEUE_BYTES
         {
@@ -1321,24 +1414,18 @@ impl Broker {
     fn resolve_session(
         &mut self,
         client_id: ClientId,
-        request: &Value,
+        request: &Request,
         method: &str,
     ) -> Option<Option<String>> {
-        let explicit = request
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let external_id = request.get("id").and_then(safe_integer).unwrap_or_default();
+        let explicit = request.session().map(str::to_string);
+        let external_id = request.id.unwrap_or_default();
         let session = error_session(request);
         if let Err(message) = self.validate_session(client_id, explicit.as_deref()) {
             self.send_error(client_id, external_id, -32000, message, session);
             return None;
         }
         if method == "Target.detachFromTarget" {
-            let target_session = request
-                .get("params")
-                .and_then(|params| params.get("sessionId"))
-                .and_then(Value::as_str);
+            let target_session = request.observed.string("sessionId");
             if let Some(target_session) = target_session {
                 if self.attachments.owner(target_session) != Some(client_id) {
                     self.send_error(
@@ -1357,11 +1444,7 @@ impl Broker {
             None => self.synthetic_session(client_id, method, external_id, session)?,
         };
         if method == "Target.setDiscoverTargets" {
-            let discover = request
-                .get("params")
-                .and_then(|params| params.get("discover"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+            let discover = request.observed.discover.unwrap_or(false);
             if let Some(client) = self.clients.get_mut(&client_id) {
                 client.discover = discover;
             }
@@ -1396,7 +1479,9 @@ impl Broker {
         method: &str,
         session: Option<String>,
     ) {
-        let params = request.params.as_deref();
+        let budget = self.upstream.handle.budget.clone();
+        let mut scratch = budget.json_scratch();
+        let params = request.raw_params(&mut scratch);
         let client = match self.clients.get(&client_id) {
             Some(client) => client,
             None => return,
@@ -1418,6 +1503,7 @@ impl Broker {
             spec,
             request.lease.clone(),
         );
+        drop(scratch);
         match result {
             Ok(_) => {}
             Err(message) => {
@@ -1446,14 +1532,14 @@ impl Broker {
         let Some(client) = self.clients.get(&client_id) else {
             return;
         };
-        let explicit_session = request
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| match &client.endpoint {
-                Endpoint::Page { .. } => client.primary.clone(),
-                Endpoint::Browser => None,
-            });
+        let explicit_session =
+            request
+                .session()
+                .map(str::to_string)
+                .or_else(|| match &client.endpoint {
+                    Endpoint::Page { .. } => client.primary.clone(),
+                    Endpoint::Browser => None,
+                });
         // 入队时校验顶层与 detach 参数 session；排队期间归属可能变化，派发前再校验。
         if let Some(message) =
             self.managed_session_error(client_id, method, &request, explicit_session.as_deref())
@@ -1474,7 +1560,7 @@ impl Broker {
             external_id,
             explicit_session,
             method: method.to_string(),
-            params: request.get("params").cloned().unwrap_or(Value::Null),
+            params: request.observed.clone(),
             request,
         };
         self.management_queue.push_back(work);
@@ -1518,7 +1604,7 @@ impl Broker {
         if !owns_id && client.ids.lock().unwrap().contains(&external_id) {
             return Err("Duplicate in-flight request id");
         }
-        let session = request.get("sessionId").and_then(Value::as_str);
+        let session = request.session();
         self.validate_session(client_id, session)?;
         if let Some(message) = self.managed_session_error(client_id, method, request, session) {
             return Err(message);
@@ -1760,6 +1846,7 @@ fn valid_owner(owner: &str) -> bool {
     !owner.is_empty() && units <= MAX_OWNER_UTF16
 }
 
+#[cfg(all(test, feature = "test-faults"))]
 fn safe_integer(value: &Value) -> Option<i64> {
     if let Some(number) = value.as_i64() {
         return (number.unsigned_abs() <= MAX_SAFE_INTEGER).then_some(number);
@@ -1771,11 +1858,8 @@ fn safe_integer(value: &Value) -> Option<i64> {
     Some(number as i64)
 }
 
-fn error_session(request: &Value) -> Option<String> {
-    request
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .map(str::to_string)
+fn error_session(request: &Request) -> Option<String> {
+    request.session().map(str::to_string)
 }
 
 fn is_managed_method(method: &str) -> bool {
@@ -2233,23 +2317,9 @@ impl Broker {
                         .clients
                         .get(&managed_client)
                         .map_or(role, |state| Some(state.role));
-                    let target = active
-                        .work
-                        .params
-                        .get("targetId")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    let session = active
-                        .work
-                        .params
-                        .get("sessionId")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    let auto = active
-                        .work
-                        .params
-                        .get("autoAttach")
-                        .and_then(Value::as_bool);
+                    let target = active.work.params.string("targetId").map(str::to_string);
+                    let session = active.work.params.string("sessionId").map(str::to_string);
+                    let auto = active.work.params.auto_attach;
                     // 迟到回复仍可能改变归属，所以保留 intent 与 auto owner 直到它到达。
                     self.send_error(
                         managed_client,
@@ -2535,12 +2605,8 @@ impl Broker {
         state.page_queue_bytes = 0;
         self.own_attachment(client_id, epoch, &session, target, None);
         for request in queued {
-            let external_id = request.get("id").and_then(safe_integer).unwrap_or_default();
-            let method = request
-                .get("method")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_default();
+            let external_id = request.id.unwrap_or_default();
+            let method = request.method().map(str::to_string).unwrap_or_default();
             self.admit_request(client_id, request, external_id, &method);
         }
     }
@@ -2618,7 +2684,7 @@ impl Broker {
         active.work.retained.push(retained);
         let result = result_ref.clone();
         if method == "Target.attachToTarget" {
-            let Some(target) = params.get("targetId").and_then(Value::as_str) else {
+            let Some(target) = params.string("targetId") else {
                 self.finish_managed(active.work, Err((-32000, "Invalid target".into())));
                 return;
             };
@@ -2646,7 +2712,7 @@ impl Broker {
             return;
         }
         if method == "Target.detachFromTarget" {
-            if let Some(session) = params.get("sessionId").and_then(Value::as_str) {
+            if let Some(session) = params.string("sessionId") {
                 self.attachments.forget(session);
             }
             self.finish_managed(active.work, Ok(result));
@@ -2663,10 +2729,7 @@ impl Broker {
             self.finish_managed(active.work, Ok(result));
             return;
         }
-        let auto_attach = params
-            .get("autoAttach")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let auto_attach = params.auto_attach.unwrap_or(false);
         let backfill = auto_attach && active.work.explicit_session.is_none();
         active.response = result;
         if backfill && self.start_backfill(&mut active).is_ok() {
@@ -2859,7 +2922,7 @@ impl Broker {
         if active.work.method != "Target.attachToTarget" {
             return;
         }
-        if let Some(target) = active.work.params.get("targetId").and_then(Value::as_str) {
+        if let Some(target) = active.work.params.string("targetId") {
             self.attachments.clear_intent(target, active.work.client);
         }
     }
@@ -2939,11 +3002,7 @@ impl Broker {
                 return false;
             }
         }
-        let target = work
-            .params
-            .get("targetId")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let target = work.params.string("targetId").map(str::to_string);
         let session = work.explicit_session.clone();
         let prepared = self.prepare_managed(&work, target.as_deref());
         let Ok(()) = prepared else {
@@ -2967,17 +3026,21 @@ impl Broker {
             kind: PendingKind::Managed,
             deadline: self.internal_deadline,
         };
-        match self.send_raw_request(
+        let budget = self.upstream.handle.budget.clone();
+        let mut scratch = budget.json_scratch();
+        let params = work.request.raw_params(&mut scratch);
+        let sent = self.send_raw_request(
             &work.method,
-            work.request.params.as_deref(),
+            params,
             session.as_deref(),
             spec,
             work.request.lease.clone(),
-        ) {
+        );
+        drop(scratch);
+        match sent {
             Ok(id) => {
                 // 已派发后只保留有界 intent；原始大 params 不属于未知结果身份。
-                work.request.params = None;
-                work.request._payload.shrink(0);
+                work.request.release_raw();
                 self.management_active = Some(ActiveManaged {
                     work,
                     stage: ManagedStage::Sent { id },
@@ -3003,7 +3066,7 @@ impl Broker {
         &self,
         client_id: ClientId,
         method: &str,
-        request: &Value,
+        request: &Request,
         explicit_session: Option<&str>,
     ) -> Option<&'static str> {
         let foreign = |session: &str| self.attachments.owner(session) != Some(client_id);
@@ -3011,10 +3074,7 @@ impl Broker {
             return Some("CDP attachment expired or belongs to another connection; attach again");
         }
         if method == "Target.detachFromTarget" {
-            let session = request
-                .get("params")
-                .and_then(|params| params.get("sessionId"))
-                .and_then(Value::as_str);
+            let session = request.observed.string("sessionId");
             if session.is_some_and(foreign) {
                 return Some("This connection does not own that attachment");
             }
@@ -3048,11 +3108,7 @@ impl Broker {
                     .ok_or(())
             }
             "Target.detachFromTarget" => {
-                let session = work
-                    .params
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .ok_or(())?;
+                let session = work.params.string("sessionId").ok_or(())?;
                 if self.attachments.owner(session) != Some(work.client) {
                     return Err(());
                 }
@@ -3060,11 +3116,7 @@ impl Broker {
             }
             "Target.setAutoAttach" => {
                 // Node 在发送前记录 auto owner，失败不回滚；这里保持同一可见性。
-                let auto = work
-                    .params
-                    .get("autoAttach")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                let auto = work.params.auto_attach.unwrap_or(false);
                 if auto {
                     self.attachments.auto_owner = Some(work.client);
                 } else {
@@ -3078,7 +3130,7 @@ impl Broker {
     }
 
     fn clear_intent_for_work(&mut self, work: &ManagedWork) {
-        if let Some(target) = work.params.get("targetId").and_then(Value::as_str) {
+        if let Some(target) = work.params.string("targetId") {
             self.attachments.clear_intent(target, work.client);
         }
     }
