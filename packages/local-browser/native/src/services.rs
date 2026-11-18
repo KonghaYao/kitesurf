@@ -194,6 +194,8 @@ pub trait ProfileBackend: Send + Sync {
 pub struct ProfileService {
     backend: Arc<dyn ProfileBackend>,
     inflight: Arc<AtomicUsize>,
+    #[cfg(all(test, feature = "test-faults"))]
+    pub(crate) outcome_gate: Mutex<Option<Arc<crate::broker::tests::pressure::OutcomeGate>>>,
 }
 
 impl ProfileService {
@@ -201,6 +203,8 @@ impl ProfileService {
         Self {
             backend,
             inflight: Arc::new(AtomicUsize::new(0)),
+            #[cfg(all(test, feature = "test-faults"))]
+            outcome_gate: Mutex::new(None),
         }
     }
 
@@ -256,12 +260,22 @@ impl ProfileService {
     ) -> Result<LeasedProfileStatus, ProfileError> {
         let guard = self.begin();
         let backend = self.backend.clone();
-        tokio::task::spawn_blocking(move || {
+        let worker = tokio::task::spawn_blocking(move || {
             let _guard = guard;
             backend.leased_status(&budget)
-        })
-        .await
-        .map_err(|_| ProfileError::conflict())?
+        });
+        #[cfg(all(test, feature = "test-faults"))]
+        {
+            let gate = self.outcome_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                while !worker.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+                gate.ready.notify_one();
+                gate.resume.notified().await;
+            }
+        }
+        worker.await.map_err(|_| ProfileError::conflict())?
     }
 
     /// 计数归阻塞闭包所有：调用方被取消时，数据库操作结束前计数不会归零。

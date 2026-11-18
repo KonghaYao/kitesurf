@@ -459,6 +459,26 @@ pub(crate) fn budgeted_body<T: serde::Serialize>(
     }))
 }
 
+#[cfg(all(test, feature = "test-faults"))]
+pub(crate) async fn test_session_body(
+    broker: BrokerHandle,
+    profile: Arc<ProfileService>,
+) -> Response<Full<Bytes>> {
+    let raw = crate::transport::LeasedRaw::literal("{}", &broker.payload_budget()).unwrap();
+    let session = SessionInfo::from_raw(&raw, &broker.payload_budget(), "test").unwrap();
+    let context = HostContext {
+        broker,
+        profile,
+        session,
+        generation: "test".into(),
+        recovery: "test".into(),
+        port: 1,
+        active: AtomicUsize::new(0),
+        connections: Mutex::new(JoinSet::new()),
+    };
+    session_body(&context).await
+}
+
 async fn session_body(context: &HostContext) -> Response<Full<Bytes>> {
     let Some(snapshot) = context.broker.session().await else {
         return error_response(StatusCode::CONFLICT, "Browser session is lost");

@@ -72,7 +72,10 @@ rust_binary(
 # 与发行二进制相同的源码，只多启用 test-faults；测试注入不进入发行产物。
 rust_library(
     name = "kitesurf_local_host_faults",
-    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]) + ["tests/broker_test.rs"],
+    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]) + [
+        "tests/actor_pressure.rs",
+        "tests/broker_test.rs",
+    ],
     crate_name = "kitesurf_local_host",
     crate_features = ["test-faults"],
     crate_root = "src/lib.rs",
@@ -124,6 +127,7 @@ rust_test(
 rust_test(
     name = "broker_test",
     size = "small",
+    args = ["--skip=broker::tests::pressure::"],
     crate = ":kitesurf_local_host_faults",
     crate_features = ["test-faults"],
     edition = "2021",
@@ -132,6 +136,21 @@ rust_test(
         package_name = "",        normal = True,
         normal_dev = True,
     ),
+)
+
+rust_test(
+    name = "actor_pressure_test",
+    size = "small",
+    args = [
+        "broker::tests::pressure::",
+        "--test-threads=1",
+        "--nocapture",
+    ],
+    crate = ":kitesurf_local_host_faults",
+    crate_features = ["test-faults"],
+    edition = "2021",
+    rustc_env_files = [":cargo_env"],
+    deps = all_crate_deps(package_name = "", normal = True, normal_dev = True),
 )
 
 rust_test(
@@ -162,6 +181,7 @@ rust_test(
 rust_lint_tests(targets = [
     ":codec_budget_test",
     ":raw_envelope_test",
+    ":actor_pressure_test",
     ":broker_test",
     ":fake_engine",
     ":kitesurf-native",

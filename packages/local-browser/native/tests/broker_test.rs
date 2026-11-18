@@ -263,6 +263,9 @@ fn compare_old_request(text: &str, budget: &crate::transport::PayloadBudget) {
     }
 }
 
+#[path = "actor_pressure.rs"]
+pub(crate) mod pressure;
+
 mod request_allocations {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::RefCell;
@@ -312,16 +315,20 @@ mod request_allocations {
     // 仅测试按线程记录全部大小；realloc 以旧新并存计峰，槽溢出使测试失败。
     unsafe impl GlobalAlloc for Allocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            let ptr = System.alloc(layout);
+            let ptr =
+                super::pressure::allocations::allocated(layout.size(), || System.alloc(layout));
             let _ = TRACK.try_with(|state| state.borrow_mut().add(ptr, layout.size()));
             ptr
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            super::pressure::allocations::freed(ptr);
             let _ = TRACK.try_with(|state| state.borrow_mut().remove(ptr));
             System.dealloc(ptr, layout);
         }
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-            let new = System.realloc(ptr, layout, size);
+            let new = super::pressure::allocations::reallocated(ptr, size, || {
+                System.realloc(ptr, layout, size)
+            });
             if !new.is_null() {
                 let _ = TRACK.try_with(|state| {
                     let mut state = state.borrow_mut();
@@ -953,6 +960,7 @@ struct FakeEngine {
     send: mpsc::UnboundedSender<String>,
     receive: mpsc::UnboundedReceiver<Value>,
     kill: mpsc::UnboundedSender<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl FakeEngine {
@@ -985,20 +993,22 @@ async fn fake_engine() -> FakeEngine {
     let (send, mut outbound) = mpsc::unbounded_channel::<String>();
     let (inbound, receive) = mpsc::unbounded_channel::<Value>();
     let (kill, mut killed) = mpsc::unbounded_channel::<()>();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let Ok((stream, _)) = listener.accept().await else {
             return;
         };
         let Ok(socket) = tokio_tungstenite::accept_async(stream).await else {
             return;
         };
-        serve_fake(socket, &mut outbound, &inbound, &mut killed).await;
+        pressure::allocations::untracked(serve_fake(socket, &mut outbound, &inbound, &mut killed))
+            .await;
     });
     FakeEngine {
         address,
         send,
         receive,
         kill,
+        task: Some(task),
     }
 }
 

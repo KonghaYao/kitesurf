@@ -94,6 +94,15 @@ impl LeasedRaw {
         Arc::get_mut(&mut raw.0).ok_or(RawError::Invalid)?._metadata = Some(metadata);
         Ok(raw)
     }
+    #[cfg(all(test, feature = "test-faults"))]
+    pub(crate) fn test_capacity(&self) -> usize {
+        assert!(self.0._lease.bytes() >= self.0.text.capacity());
+        assert!(self.0._metadata.as_ref().is_some_and(|lease| {
+            lease.bytes() >= std::mem::size_of::<RawOwner>() + 2 * std::mem::size_of::<usize>()
+        }));
+        self.0.text.capacity()
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0.text
     }
@@ -437,6 +446,17 @@ impl<S> BudgetedSocket<S> {
         assert!(lease.is_internal() && lease.bytes() >= CODEC_BYTES);
         self.handshake = Some(lease);
         self
+    }
+
+    #[cfg(all(test, feature = "test-faults"))]
+    pub(crate) fn test_presence(&self) -> (bool, usize, usize, usize) {
+        let read = self.socket.read_buffer_state();
+        (
+            self.receive.is_some() && !self.idle(),
+            read.buffered_bytes,
+            self.writer.iter().map(PayloadLease::bytes).sum(),
+            self.writer.len(),
+        )
     }
 
     fn idle(&self) -> bool {

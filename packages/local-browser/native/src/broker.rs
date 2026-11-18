@@ -356,6 +356,8 @@ enum BrokerCommand {
     BudgetSnapshot(oneshot::Sender<(usize, usize, usize, usize)>),
     #[cfg(all(test, feature = "test-faults"))]
     ReceiveAck(LeasedRaw, oneshot::Sender<(bool, usize)>),
+    #[cfg(all(test, feature = "test-faults"))]
+    PressurePause(tests::pressure::Pause),
     ProfileStatus {
         token: u64,
         result: Result<crate::services::LeasedProfileStatus, String>,
@@ -408,6 +410,8 @@ pub struct BrokerHandle {
     lost: watch::Receiver<Option<String>>,
     closed: watch::Receiver<bool>,
     diagnostics: Option<watch::Receiver<Option<crate::supervisor::EngineDiagnostic>>>,
+    #[cfg(all(test, feature = "test-faults"))]
+    test_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl BrokerHandle {
@@ -462,6 +466,8 @@ impl BrokerHandle {
             lost,
             closed,
             diagnostics: None,
+            #[cfg(all(test, feature = "test-faults"))]
+            test_task: Arc::new(std::sync::Mutex::new(None)),
         };
         let broker = Broker {
             _scratch: scratch,
@@ -503,7 +509,13 @@ impl BrokerHandle {
             closed_tx,
             finished: false,
         };
-        tokio::spawn(broker.run());
+        let task = tokio::spawn(broker.run());
+        #[cfg(all(test, feature = "test-faults"))]
+        {
+            *handle.test_task.lock().unwrap() = Some(task);
+        }
+        #[cfg(not(all(test, feature = "test-faults")))]
+        drop(task);
         handle
     }
 
@@ -1212,6 +1224,12 @@ impl Broker {
               }
               command = self.commands.recv() => {
                 if let Some(command) = command {
+                  #[cfg(all(test, feature = "test-faults"))]
+                  if let BrokerCommand::PressurePause(pause) = command {
+                    let _ = pause.presence.send(self.pressure_presence());
+                    let _ = pause.resume.await;
+                    continue;
+                  }
                   self.command(command);
                 }
               }
@@ -1223,6 +1241,8 @@ impl Broker {
 
     fn command(&mut self, command: BrokerCommand) {
         match command {
+            #[cfg(all(test, feature = "test-faults"))]
+            BrokerCommand::PressurePause(_) => unreachable!("handled by actor run loop"),
             #[cfg(all(test, feature = "test-faults"))]
             BrokerCommand::ReceiveAck(raw, reply) => {
                 self.upstream_event(UpstreamEvent::Raw(raw));
@@ -3899,9 +3919,16 @@ impl Broker {
                 .leased_status(budget)
                 .await
                 .map_err(|_| "Profile status unavailable".to_string());
-            let _ = commands
-                .send(BrokerCommand::ProfileStatus { token, result })
-                .await;
+            let command = BrokerCommand::ProfileStatus { token, result };
+            #[cfg(all(test, feature = "test-faults"))]
+            {
+                let gate = profile.outcome_gate.lock().unwrap().clone();
+                if let Some(gate) = gate {
+                    tests::pressure::send_profile_command(commands, command, gate).await;
+                    return;
+                }
+            }
+            let _ = commands.send(command).await;
         });
     }
 
@@ -4335,4 +4362,4 @@ impl Broker {
 
 #[cfg(all(test, feature = "test-faults"))]
 #[path = "../tests/broker_test.rs"]
-mod tests;
+pub(crate) mod tests;
