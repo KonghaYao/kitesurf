@@ -42,6 +42,9 @@ type ReceivedInit = {
 
 const ISOLATE_KILL_MARKER: IsolateKillMarker = "[ks-kill]";
 
+// Capture before the page's worker script can replace its shared-realm timers.
+const nativeSetTimeout = globalThis.setTimeout.bind(globalThis);
+
 let started = false;
 
 // Props, not env: the page's worker script runs here and can import env.
@@ -54,7 +57,13 @@ export class DedicatedWorker extends WorkerEntrypoint<unknown, DedicatedWorkerPr
     const why = reason || "worker terminated";
     setTailToken(this.ctx.props?.KS_TAIL_TOKEN);
     writeIsolateKillLine(ISOLATE_KILL_MARKER, why);
-    abortIsolate(`kitesurf: ${why}`);
+    // Abort in a later task: aborting inside this invocation cancels the kill's own RPC, which the
+    // runtime reports as an uncaught async exception. The isolate still dies on the timer.
+    try {
+      nativeSetTimeout(() => abortIsolate(`kitesurf: ${why}`), 0);
+    } catch {
+      abortIsolate(`kitesurf: ${why}`);
+    }
   }
 
   openSession(init: ReceivedInit | undefined): RetainedWorkerSession {

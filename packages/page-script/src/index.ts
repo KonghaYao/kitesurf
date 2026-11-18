@@ -4080,7 +4080,13 @@ export class PageScript extends WorkerEntrypoint implements PageScriptSession {
   killIsolate(reason?: string): void {
     const why = reason || "generation retired";
     writeIsolateKillLine(ISOLATE_KILL_MARKER, why);
-    abortIsolate(`kitesurf: ${why}`);
+    // Abort in a later task: aborting inside this invocation cancels the kill's own RPC, which the
+    // runtime reports as an uncaught async exception. The isolate still dies on the timer.
+    try {
+      nativeSetTimeout(() => abortIsolate(`kitesurf: ${why}`), 0);
+    } catch {
+      abortIsolate(`kitesurf: ${why}`);
+    }
   }
 
   makeRenderPort(): RenderPortContract & Rpc.RpcTargetBranded {

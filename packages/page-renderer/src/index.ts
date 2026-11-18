@@ -52,6 +52,9 @@ import type { IsolateKillMarker } from "@kitesurf/jsrpc-types/shared";
 
 const ISOLATE_KILL_MARKER: IsolateKillMarker = "[ks-kill]";
 
+// Capture before any loaded code can replace its shared-realm timers.
+const nativeSetTimeout = globalThis.setTimeout.bind(globalThis);
+
 const coreWasmMemory: { current: WebAssembly.Memory | null } = { current: null };
 let coreWasmInitialBytes = 0;
 const OrigInstance = WebAssembly.Instance;
@@ -750,10 +753,18 @@ export class PageRenderer extends WorkerEntrypoint<RendererEnv> implements PageR
 
   killIsolate(reason?: string): void {
     const token = this.env.KS_TAIL_TOKEN;
+    const why = reason || "renderer retired";
     if (typeof token === "string" && token) {
-      console.log(`${ISOLATE_KILL_MARKER} ${token} ${reason || "renderer retired"}`);
+      console.log(`${ISOLATE_KILL_MARKER} ${token} ${why}`);
     }
-    abortIsolate(new Error("PageRenderer.killIsolate"));
+    // Abort in a later task: aborting inside this invocation cancels the kill's own RPC, which the
+    // runtime reports as an uncaught async exception. This only runs while the isolate stays alive;
+    // a retired loaded worker may be unloaded first, so it is not a guaranteed kill.
+    try {
+      nativeSetTimeout(() => abortIsolate(new Error("PageRenderer.killIsolate")), 0);
+    } catch {
+      abortIsolate(new Error("PageRenderer.killIsolate"));
+    }
   }
 }
 
