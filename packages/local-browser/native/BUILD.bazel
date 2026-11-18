@@ -19,7 +19,12 @@ js_binary(
 rust_test(
     name = "codec_budget_test",
     size = "small",
-    srcs = ["tests/codec_budget_test.rs"],
+    srcs = [
+        "src/transport.rs",
+        "tests/codec_budget_test.rs",
+    ],
+    crate_features = ["test-faults"],
+    crate_root = "tests/codec_budget_test.rs",
     edition = "2021",
     rustc_env_files = [":cargo_env"],
     deps = [":kitesurf_local_host"] + all_crate_deps(package_name = "", normal = True),

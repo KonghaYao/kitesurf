@@ -13,7 +13,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(all(test, feature = "test-faults"))]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,6 +46,7 @@ pub struct PayloadBudget {
     internal: Arc<Semaphore>,
     upstream_receive: Arc<Semaphore>,
     copy: Arc<Mutex<()>>,
+    #[cfg(all(test, feature = "test-faults"))]
     high: Arc<(AtomicUsize, AtomicUsize)>,
     _copy_lease: Arc<OwnedSemaphorePermit>,
 }
@@ -60,6 +63,7 @@ impl Default for PayloadBudget {
             internal: Arc::new(Semaphore::new(INTERNAL_BYTES - MAX_FRAME_BYTES)),
             upstream_receive: Arc::new(Semaphore::new(MAX_FRAME_BYTES)),
             copy: Arc::new(Mutex::new(())),
+            #[cfg(all(test, feature = "test-faults"))]
             high: Arc::new((AtomicUsize::new(MAX_FRAME_BYTES), AtomicUsize::new(0))),
             _copy_lease: Arc::new(copy),
         }
@@ -121,19 +125,29 @@ impl PayloadBudget {
     }
 
     fn record_high(&self) {
-        let (ordinary, internal) = self.used();
-        self.high.0.fetch_max(ordinary, Ordering::Relaxed);
-        self.high.1.fetch_max(internal, Ordering::Relaxed);
+        #[cfg(all(test, feature = "test-faults"))]
+        {
+            let (ordinary, internal) = self.usage();
+            self.high.0.fetch_max(ordinary, Ordering::Relaxed);
+            self.high.1.fetch_max(internal, Ordering::Relaxed);
+        }
     }
 
-    pub fn high_water(&self) -> (usize, usize) {
+    #[cfg(all(test, feature = "test-faults"))]
+    pub(crate) fn high_water(&self) -> (usize, usize) {
         (
             self.high.0.load(Ordering::Relaxed),
             self.high.1.load(Ordering::Relaxed),
         )
     }
 
-    pub fn used(&self) -> (usize, usize) {
+    #[cfg(all(test, feature = "test-faults"))]
+    pub(crate) fn used(&self) -> (usize, usize) {
+        self.usage()
+    }
+
+    #[cfg(all(test, feature = "test-faults"))]
+    fn usage(&self) -> (usize, usize) {
         (
             ORDINARY_BYTES - self.ordinary.available_permits(),
             INTERNAL_BYTES

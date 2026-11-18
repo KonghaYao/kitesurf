@@ -2,13 +2,19 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 // https://opensource.org/licenses/Apache-2.0
 
+// 在测试 crate 内编译同一 transport 源码，预算诊断不必成为库的生产 API。
+#[allow(dead_code)]
+#[path = "../src/transport.rs"]
+mod transport;
+use kitesurf_local_host::{observe, HostResult};
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
-use kitesurf_local_host::transport::{
+use crate::transport::{
     websocket_config, BudgetedSocket, LeasedMessage, PayloadBudget, CODEC_BYTES, INTERNAL_BYTES,
     MAX_FRAME_BYTES, ORDINARY_BYTES,
 };
@@ -74,11 +80,10 @@ fn bounded_serializer_reserves_before_allocating_and_drops_permits() {
         .try_acquire(ORDINARY_BYTES - MAX_FRAME_BYTES, false)
         .unwrap();
     LARGEST.with(|size| size.set(0));
-    assert!(kitesurf_local_host::transport::serialize_payload(&budget, &input, false).is_none());
+    assert!(crate::transport::serialize_payload(&budget, &input, false).is_none());
     assert!(LARGEST.with(Cell::get) < 128 * 1024);
     drop(occupied);
-    let (text, lease) =
-        kitesurf_local_host::transport::serialize_payload(&budget, &input, false).unwrap();
+    let (text, lease) = crate::transport::serialize_payload(&budget, &input, false).unwrap();
     assert_eq!(lease.bytes(), text.len());
     assert_eq!(budget.used().0, MAX_FRAME_BYTES + text.len());
     drop(text);
@@ -86,10 +91,30 @@ fn bounded_serializer_reserves_before_allocating_and_drops_permits() {
     assert_eq!(budget.used().0, MAX_FRAME_BYTES);
     let oversized = "x".repeat(MAX_FRAME_BYTES);
     LARGEST.with(|size| size.set(0));
-    assert!(
-        kitesurf_local_host::transport::serialize_payload(&budget, &oversized, false).is_none()
-    );
+    assert!(crate::transport::serialize_payload(&budget, &oversized, false).is_none());
     assert!(LARGEST.with(Cell::get) < 128 * 1024);
+}
+
+#[test]
+fn production_budget_limits_and_failed_queue_transfers_conserve_leases() {
+    assert_eq!(ORDINARY_BYTES, 128 * 1024 * 1024);
+    assert_eq!(INTERNAL_BYTES, 20 * 1024 * 1024);
+    assert_eq!(MAX_FRAME_BYTES, 16 * 1024 * 1024);
+    let budget = PayloadBudget::default();
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let message = || LeasedMessage {
+        message: Message::text("abc"),
+        lease: budget.try_acquire(3, false).unwrap(),
+    };
+    sender.try_send(message()).unwrap();
+    let rejected = sender.try_send(message()).unwrap_err();
+    assert_eq!(budget.used().0, MAX_FRAME_BYTES + 6);
+    drop(rejected);
+    assert_eq!(budget.used().0, MAX_FRAME_BYTES + 3);
+    drop(receiver);
+    assert_eq!(budget.used().0, MAX_FRAME_BYTES);
+    drop(sender.try_send(message()).unwrap_err());
+    assert_eq!(budget.used().0, MAX_FRAME_BYTES);
 }
 
 #[tokio::test]
