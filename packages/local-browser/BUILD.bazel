@@ -74,6 +74,35 @@ node_test(
     ] + glob(["test/*.mjs"]),
 )
 
+# The T0 contract runs the same suite the legacy host was baselined with; KS_HOST_KIND=legacy
+# selects the extracted 035a014 tree outside Bazel. Bazel exercises the native implementation.
+[
+    node_test(
+        name = name,
+        size = size,
+        timeout = "long",
+        args = ["test/" + suite],
+        data = [
+            ":node_modules/ws",
+            "//:node_modules/pngjs",
+            "//packages/local-browser/native:generated_config",
+            "//packages/local-browser/native:kitesurf-native",
+            "//packages/local-browser/native:native_assets",
+            "//packages/local-browser/native:workerd_bin",
+        ] + glob(["test/*.mjs"]),
+        env = {
+            "KITESURF_CONFIG_DIR": "$(rootpath //packages/local-browser/native:generated_config)",
+            "KITESURF_ENGINE_ASSETS": "$(rootpath //packages/local-browser/native:native_assets)",
+            "KITESURF_NATIVE_HOST": "$(rootpath //packages/local-browser/native:kitesurf-native)",
+            "KITESURF_WORKERD": "$(rootpath //packages/local-browser/native:workerd_bin)",
+        },
+    )
+    for name, suite, size in [
+        ("host_contract_test", "host-contract.test.mjs", "medium"),
+        ("engine_smoke_test", "native-engine.test.mjs", "large"),
+    ]
+]
+
 node_test(
     name = "profile_test",
     args = ["test/profile-store.test.mjs", "test/attachments.test.mjs"],

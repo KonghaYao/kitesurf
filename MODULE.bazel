@@ -216,6 +216,14 @@ crate.from_cargo(
     supported_platform_triples = RUST_HOST_TRIPLES,
 )
 crate.from_cargo(
+    name = "crates_native",
+    cargo_lockfile = "//packages/local-browser/native:Cargo.lock",
+    host_tools = "@rust_tools",
+    manifests = ["//packages/local-browser/native:Cargo.toml"],
+    skip_cargo_lockfile_overwrite = True,
+    supported_platform_triples = RUST_HOST_TRIPLES,
+)
+crate.from_cargo(
     name = "crates_rust_check",
     cargo_lockfile = "//scripts/lint/rust-check:Cargo.lock",
     host_tools = "@rust_tools",
@@ -257,7 +265,7 @@ rust_library(
     crate = "vello_cpu",
     repositories = ["crates"],
 )
-use_repo(crate, "crates", "crates_cli", "crates_font_host", "crates_memprof", "crates_renderer", "crates_rust_check", "crates_scene_host")
+use_repo(crate, "crates", "crates_cli", "crates_font_host", "crates_memprof", "crates_native", "crates_renderer", "crates_rust_check", "crates_scene_host")
 use_repo(
     crate,
     "crates__boa_gc-0.22.0",
@@ -360,6 +368,31 @@ http_archive(
         "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.127/" +
         "wasm-bindgen-0.2.127-aarch64-apple-darwin.tar.gz"
     ),
+)
+# The runtime workerd the native host supervises, pinned to the same release as the npm toolchain.
+# sha256: 4e011ed3ce69476ad0fdd384d0a49eb2456b88c7499f424189fa761669e9accc
+http_archive(
+    name = "workerd_darwin_arm64",
+    build_file_content = 'exports_files(["bin/workerd"])',
+    integrity = "sha512-WU4bFqEN0H7ndGWxoedegv95DmNVBtv0ncXcHG9nYFTUI78sxEb0qoT3U6Ga4hyBkzsJFBX/zvVBIGX3qKldGA==",
+    strip_prefix = "package",
+    url = "https://registry.npmjs.org/@cloudflare/workerd-darwin-arm64/-/workerd-darwin-arm64-1.20260911.1.tgz",
+)
+# sha256: 7921769c99eede49c8bdb6666e47750d0280b95df2dccdce098a8f071a928f40
+http_archive(
+    name = "workerd_linux_x86_64",
+    build_file_content = 'exports_files(["bin/workerd"])',
+    integrity = "sha512-0Y2gy62oxQxWa38qinSPE6zNL5+JmumJtDY9AWW1HB8KHuATxN71o5MGzmVFfB8PwZsiHfUd2Sv7O22krCOrhw==",
+    strip_prefix = "package",
+    url = "https://registry.npmjs.org/@cloudflare/workerd-linux-64/-/workerd-linux-64-1.20260911.1.tgz",
+)
+# sha256: 1494444d4f3c798aa9c5e8cf49aa4ad39d3db1fcf50390ffa2fd5275298c6c15
+http_archive(
+    name = "workerd_linux_aarch64",
+    build_file_content = 'exports_files(["bin/workerd"])',
+    integrity = "sha512-kttNPnx1r2lCqFUoMH62z7CqGV+j4QBbw5fdtaz4pzOrzBv0AWkNATt7onFUe+SwP8zhcepMtbm2F4kKzTf6VA==",
+    strip_prefix = "package",
+    url = "https://registry.npmjs.org/@cloudflare/workerd-linux-arm64/-/workerd-linux-arm64-1.20260911.1.tgz",
 )
 http_archive(
     name = "binaryen_linux_x86_64",

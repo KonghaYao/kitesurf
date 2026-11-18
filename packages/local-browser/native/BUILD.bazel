@@ -1,0 +1,206 @@
+load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_run_binary")
+load("@bazel_lib//lib:copy_file.bzl", "copy_file")
+load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
+load("@crates_native//:defs.bzl", "all_crate_deps")
+load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("//bazel:checks.bzl", "node_test")
+load("//bazel:paths.bzl", "bin_relative", "exec_path")
+load("//bazel:rust_checks.bzl", "rust_comments_test", "rust_lint_tests", "rust_nesting_test")
+
+cargo_toml_env_vars(
+    name = "cargo_env",
+    src = "Cargo.toml",
+)
+
+rust_library(
+    name = "kitesurf_local_host",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
+    crate_name = "kitesurf_local_host",
+    crate_root = "src/lib.rs",
+    edition = "2021",
+    rustc_env_files = [":cargo_env"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "kitesurf-native",
+    srcs = ["src/main.rs"],
+    edition = "2021",
+    rustc_env_files = [":cargo_env"],
+    deps = [":kitesurf_local_host"] + all_crate_deps(normal = True),
+    visibility = ["//visibility:public"],
+)
+
+rust_binary(
+    name = "fake_engine",
+    srcs = ["examples/fake_engine.rs"],
+    edition = "2021",
+    rustc_env_files = [":cargo_env"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_test",
+    crate = ":kitesurf_local_host",
+    edition = "2021",
+    rustc_env_files = [":cargo_env"],
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "supervisor_test",
+    size = "small",
+    srcs = ["tests/supervisor_test.rs"],
+    data = [":fake_engine"],
+    edition = "2021",
+    env = {"FAKE_ENGINE": "$(rootpath :fake_engine)"},
+    rustc_env_files = [":cargo_env"],
+    deps = [":kitesurf_local_host"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_lint_tests(targets = [
+    ":fake_engine",
+    ":kitesurf-native",
+    ":kitesurf_local_host",
+    ":supervisor_test",
+    ":unit_test",
+])
+
+rust_comments_test(
+    name = "comments_test",
+    srcs = glob([
+        "examples/**/*.rs",
+        "src/**/*.rs",
+        "tests/**/*.rs",
+    ]),
+)
+
+rust_nesting_test(
+    name = "nesting_test",
+    srcs = glob([
+        "examples/**/*.rs",
+        "src/**/*.rs",
+        "tests/**/*.rs",
+    ]),
+)
+
+# 每个受支持宿主只带一个运行时 workerd；测试通过 KITESURF_WORKERD 传入其 rootpath。
+# 本地 config_setting：//bazel/rust 的宿主设置无法跨包使用。
+[
+    config_setting(
+        name = host,
+        constraint_values = constraints,
+    )
+    for host, constraints in {
+        "linux_aarch64": ["@platforms//cpu:aarch64", "@platforms//os:linux"],
+        "linux_x86_64": ["@platforms//cpu:x86_64", "@platforms//os:linux"],
+        "macos_aarch64": ["@platforms//cpu:aarch64", "@platforms//os:macos"],
+    }.items()
+]
+
+filegroup(
+    name = "workerd_source",
+    srcs = select({
+        ":linux_aarch64": ["@workerd_linux_aarch64//:bin/workerd"],
+        ":linux_x86_64": ["@workerd_linux_x86_64//:bin/workerd"],
+        ":macos_aarch64": ["@workerd_darwin_arm64//:bin/workerd"],
+        "//conditions:default": [],
+    }),
+)
+
+# rules_js 的数据必须能复制进 bin 树，因此外部二进制先复制到本地。
+copy_file(
+    name = "workerd_bin",
+    src = ":workerd_source",
+    out = "workerd-bin/workerd",
+    is_executable = True,
+    visibility = ["//visibility:public"],
+)
+
+# 仅用于测试的图像字节：引擎通过 FONT_ASSETS 取用它，冒烟测试检查像素。
+filegroup(
+    name = "fixture_assets",
+    srcs = ["fixtures/pixel.png"],
+)
+
+# 合并为单一目录：引擎公共文件，加上 RBI 对、inspector 快照和原生图像 fixture。
+copy_to_directory(
+    name = "native_assets",
+    srcs = [
+        ":fixture_assets",
+        "//packages/engine:assets",
+    ],
+    out = "native-assets",
+    root_paths = [
+        "packages/engine/public",
+        "packages/local-browser/native",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+js_binary(
+    name = "config_generator",
+    data = glob(["config/*.mjs"]),
+    entry_point = "config/generate.mjs",
+)
+
+# Node 只在这里运行：测试消费模块、清单和三个配置。
+js_run_binary(
+    name = "generated_config",
+    srcs = [
+        ":native_assets",
+        "//packages/engine:local_dist",
+    ],
+    out_dirs = ["native-config"],
+    args = [
+        "--assets",
+        exec_path(":native_assets"),
+        "--dist",
+        exec_path("//packages/engine:local_dist"),
+        "--out",
+        bin_relative("packages/local-browser/native/native-config"),
+    ],
+    mnemonic = "NativeConfig",
+    progress_message = "Generating the native workerd config",
+    tool = ":config_generator",
+    visibility = ["//visibility:public"],
+)
+
+node_test(
+    name = "config_test",
+    args = ["config/generate.test.mjs"],
+    data = [
+        "config/generate.mjs",
+        "config/generate.test.mjs",
+    ],
+)
+
+node_test(
+    name = "config_compile_test",
+    size = "large",
+    timeout = "long",
+    args = ["config/config-compile.test.mjs"],
+    data = [
+        ":generated_config",
+        ":workerd_bin",
+        "config/config-compile.test.mjs",
+    ],
+    env = {
+        "KITESURF_CONFIG_DIR": "$(rootpath :generated_config)",
+        "KITESURF_WORKERD": "$(rootpath :workerd_bin)",
+    },
+)
+
+# 冒烟驱动属于 local-browser 包（随其契约套件一起打包）。
+# 该别名保留任务计划指定的 native 包入口名称。
+test_suite(
+    name = "engine_smoke_test",
+    tests = ["//packages/local-browser:engine_smoke_test"],
+)
