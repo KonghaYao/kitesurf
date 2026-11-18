@@ -392,6 +392,12 @@ js_library(
 )
 
 js_library(
+    name = "cargo_lock_isolation_check",
+    srcs = ["cargo-lock-check-bazel.isolation.mjs"],
+    visibility = ["//:__pkg__"],
+)
+
+js_library(
     name = "check_no_explicit_any",
     srcs = ["check-no-explicit-any.mjs"],
     visibility = ["//packages:__subpackages__"],

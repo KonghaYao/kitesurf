@@ -169,6 +169,35 @@ js_test(
     },
 )
 
+# 隔离测试依赖根包可见的 workspace manifests，故定义在根包而不是 //scripts。
+js_test(
+    name = "cargo_lock_isolation_test",
+    size = "small",
+    args = ["cargo-lock-check-bazel.isolation.mjs"],
+    chdir = "scripts",
+    copy_data_to_bin = False,
+    data = [
+        "Cargo.lock",
+        "Cargo.toml",
+        "//packages/core:Cargo.toml",
+        "//packages/renderer-core:Cargo.toml",
+        "//packages/scene-host-wasm:Cargo.toml",
+        "//scripts:cargo_lock_check",
+        "//scripts:cargo_lock_isolation_check",
+        "@cargo_vendor//:vendor",
+        "@cargo_vendor//:vendor.json",
+        "@rules_rust//rust/toolchain:current_cargo_files",
+        "@rules_rust//rust/toolchain:current_rustc_files",
+        "@rules_rust//rust/toolchain:current_rustc_lib_files",
+    ],
+    entry_point = "//scripts:node_test_bazel",
+    env = {
+        "CARGO": "$(rootpath @rules_rust//rust/toolchain:current_cargo_files)",
+        "CARGO_VENDOR_INDEX": "$(rootpath @cargo_vendor//:vendor.json)",
+        "RUSTC": "$(rootpath @rules_rust//rust/toolchain:current_rustc_files)",
+    },
+)
+
 test_suite(
     name = "check",
     tests = [
@@ -203,6 +232,7 @@ test_suite(
         "//packages/worker-script:types",
         "//packages/worker-script:types_strict",
         "//scripts:helpers_test",
+        ":cargo_lock_isolation_test",
         "//scripts:lint_test",
         "//scripts:lint_types",
     ],

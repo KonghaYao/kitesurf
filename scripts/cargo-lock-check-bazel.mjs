@@ -35,20 +35,26 @@ for (const [, path, key] of manifest.matchAll(/path = "(\S*\/vendor-patched\/([^
 }
 
 const home = join(work, ".cargo-home");
+const vendored = join(vendor, "vendor");
 mkdirSync(home);
 writeFileSync(
   join(home, "config.toml"),
-  `[source.crates-io]\nreplace-with = "vendored"\n[source.vendored]\ndirectory = ${JSON.stringify(join(vendor, "vendor"))}\n`,
+  `[source.crates-io]\nreplace-with = "vendored"\n[source.vendored]\ndirectory = ${JSON.stringify(vendored)}\n`,
 );
-const result = spawnSync(
-  fromRoot("CARGO"),
-  ["metadata", "--locked", "--offline", "--format-version", "1"],
-  {
-    cwd: work,
-    stdio: ["ignore", "ignore", "inherit"],
-    env: { PATH: process.env.PATH, HOME: home, CARGO_HOME: home, RUSTC: fromRoot("RUSTC") },
-  },
-);
+// Bazel sandbox 位于用户 HOME 之下，cargo 会读取祖先目录的 .cargo/config.toml，
+// 其 source 替换优先于 CARGO_HOME。命令行 --config 优先级最高，确保始终用 vendored。
+const args = ["metadata", "--locked", "--offline", "--format-version", "1"];
+for (const config of [
+  `source.crates-io.replace-with="vendored"`,
+  `source.vendored.directory=${JSON.stringify(vendored)}`,
+]) {
+  args.push("--config", config);
+}
+const result = spawnSync(fromRoot("CARGO"), args, {
+  cwd: work,
+  stdio: ["ignore", "ignore", "inherit"],
+  env: { PATH: process.env.PATH, HOME: home, CARGO_HOME: home, RUSTC: fromRoot("RUSTC") },
+});
 if (result.status !== 0) {
   console.error(
     `[cargo-lock] ${result.signal ?? `exit ${result.status}`}: Cargo.lock does not match public workspace manifests`,
