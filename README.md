@@ -71,6 +71,10 @@ not have to be Chrome.
 entry includes `devtoolsFrontendUrl`, so Chrome's inspect page can open DevTools
 directly. The port follows `--port`.
 
+Target titles are captured at navigation. A script-only `document.title` change
+updates the page and accessibility tree but may not update the title reported by
+`/json/list`, `/session`, or `list_pages`.
+
 Kitesurf implements the CDP domains it needs. Unsupported commands and
 Chrome-only DevTools panels are not emulated.
 
@@ -105,9 +109,10 @@ Point `chrome-devtools-mcp` at it instead of letting the server launch Chrome:
 }
 ```
 
-Verified calls include `list_pages`, `navigate_page`, `take_snapshot`,
-`evaluate_script`, and `take_screenshot`. The remaining skill tools depend on
-the CDP domains Kitesurf implements; treat them as best effort.
+Verified calls include `list_pages`, `navigate_page`, `take_snapshot`, `fill`,
+`click`, `evaluate_script`, `take_screenshot`, `list_console_messages`, and
+`list_network_requests`. The remaining skill tools depend on the CDP domains
+Kitesurf implements; treat them as best effort.
 
 The CLI speaks the same protocol:
 
