@@ -4032,6 +4032,21 @@ async fn backfill_attach_late_success_after_client_close_never_reaches_a_new_cli
 async fn disconnected_clients_reap_after_ordinary_replies() {
     let mut engine = fake_engine().await;
     let broker = broker(&engine).await;
+    // 握手 lease 只在 reader 首次 poll 后归还；真实往返后再取可比基线。
+    let discovery = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.targets().await })
+    };
+    let targets = next_request(&mut engine).await;
+    assert_eq!(targets["method"], "Target.getTargets");
+    engine.reply(request_id(&targets), json!({ "targetInfos": [] }));
+    let discovered = timeout(WAIT, discovery)
+        .await
+        .expect("target discovery")
+        .expect("target discovery task")
+        .expect("target discovery reply");
+    drop(discovered);
+    broker.budget_snapshot().await;
     let baseline = broker.payload_budget().used();
     let mut held = Vec::new();
     for index in 0..32 {
@@ -4078,8 +4093,7 @@ async fn disconnected_clients_reap_after_ordinary_replies() {
     drop(extra);
     broker.budget_snapshot().await;
     let used = broker.payload_budget().used();
-    assert_eq!(used.0, baseline.0, "{used:?} vs {baseline:?}");
-    assert!(used.1 <= baseline.1, "{used:?} vs {baseline:?}");
+    assert_eq!(used, baseline, "{used:?} vs {baseline:?}");
     engine.kill();
     assert!(!broker.wait_terminal().await);
 }
