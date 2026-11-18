@@ -2,13 +2,16 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 // https://opensource.org/licenses/Apache-2.0
 
-// workerd 通过 Unix socket 访问的两个私有服务。profile 存储是 T2 的内存测试替身，不是
-// SQLite 存储：它保留引擎桥接已覆盖的原始保存 JSON 以及 owner/revision 规则。资源只从
-// 显式构建清单提供，并对照清单做哈希校验。
+// workerd 通过 Unix socket 访问的两个私有服务。profile 默认是显式 --profile 打开的
+// SQLite 存储，--test-memory-profile 才启用内存替身；两者共用同一套 owner/revision 与
+// 原始 JSON 文本规则。资源只从显式构建清单提供，并对照清单做哈希校验。
 
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -18,7 +21,6 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
-use serde_json::value::RawValue;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::net::UnixListener;
@@ -26,22 +28,302 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::observe::Observer;
+use crate::profile::{self, ProfileError, ProfileErrorKind};
+use crate::profile_state::{self, Json as StateJson, JsonString};
 use crate::HostResult;
 
-const MAX_PROFILE_BODY: usize = 70 * 1024 * 1024;
-const OBSERVED_STATE_LIMIT: usize = 64 * 1024;
-const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct ServicePaths {
     pub profile: PathBuf,
     pub assets: PathBuf,
 }
 
+#[derive(Debug)]
+pub struct LoadResult {
+    pub revision: i64,
+    pub state_text: String,
+}
+
+/// 私有 profile 的两种实现：显式测试替身和正式 SQLite；HTTP 语义不区分二者。
+pub trait ProfileBackend: Send + Sync {
+    fn load(&self, owner: &[u16]) -> Result<LoadResult, ProfileError>;
+    fn save(
+        &self,
+        owner: &[u16],
+        revision: &StateJson,
+        state: Option<&StateJson>,
+    ) -> Result<(), ProfileError>;
+    fn status(&self) -> Result<Value, ProfileError>;
+    fn kind(&self) -> &'static str;
+    fn display(&self) -> String;
+}
+
+pub struct ProfileService {
+    backend: Arc<dyn ProfileBackend>,
+    inflight: Arc<AtomicUsize>,
+}
+
+impl ProfileService {
+    pub fn new(backend: Arc<dyn ProfileBackend>) -> Self {
+        Self {
+            backend,
+            inflight: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        self.backend.kind()
+    }
+
+    pub fn display(&self) -> String {
+        self.backend.display()
+    }
+
+    pub async fn load(&self, owner: JsonString) -> Result<LoadResult, ProfileError> {
+        let guard = self.begin();
+        let backend = self.backend.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            backend.load(&owner)
+        })
+        .await;
+        result.map_err(|_| ProfileError::conflict())?
+    }
+
+    pub async fn save(
+        &self,
+        owner: JsonString,
+        revision: StateJson,
+        state: Option<StateJson>,
+    ) -> Result<(), ProfileError> {
+        let guard = self.begin();
+        let backend = self.backend.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            backend.save(&owner, &revision, state.as_ref())
+        })
+        .await;
+        result.map_err(|_| ProfileError::conflict())?
+    }
+
+    pub async fn status(&self) -> Result<Value, ProfileError> {
+        let guard = self.begin();
+        let backend = self.backend.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            backend.status()
+        })
+        .await;
+        result.map_err(|_| ProfileError::conflict())?
+    }
+
+    /// 计数归阻塞闭包所有：调用方被取消时，数据库操作结束前计数不会归零。
+    fn begin(&self) -> InflightGuard {
+        self.inflight.fetch_add(1, Ordering::SeqCst);
+        InflightGuard {
+            counter: self.inflight.clone(),
+        }
+    }
+
+    async fn drain(&self) {
+        while self.inflight.load(Ordering::SeqCst) != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+struct InflightGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+pub struct MemoryProfile {
+    inner: Mutex<MemoryInner>,
+}
+
+struct MemoryInner {
+    owner: Option<Vec<u16>>,
+    revision: i64,
+    state_text: String,
+    loads: u64,
+    saves: u64,
+}
+
+impl MemoryProfile {
+    /// 仅由显式 --test-memory-profile 启用，seed 数据是合成 fixture。
+    pub fn new(origin: &str) -> HostResult<Self> {
+        Ok(Self {
+            inner: Mutex::new(MemoryInner {
+                owner: None,
+                revision: 0,
+                state_text: initial_state(origin)?,
+                loads: 0,
+                saves: 0,
+            }),
+        })
+    }
+}
+
+impl ProfileBackend for MemoryProfile {
+    fn load(&self, owner: &[u16]) -> Result<LoadResult, ProfileError> {
+        if owner.is_empty() {
+            return Err(ProfileError::conflict());
+        }
+        let mut inner = self.inner.lock().map_err(|_| ProfileError::conflict())?;
+        match &inner.owner {
+            Some(current) if current.as_slice() != owner => {
+                return Err(ProfileError::conflict());
+            }
+            Some(_) => {}
+            None => inner.owner = Some(owner.to_vec()),
+        }
+        inner.loads += 1;
+        Ok(LoadResult {
+            revision: inner.revision,
+            state_text: inner.state_text.clone(),
+        })
+    }
+
+    fn save(
+        &self,
+        owner: &[u16],
+        revision: &StateJson,
+        state: Option<&StateJson>,
+    ) -> Result<(), ProfileError> {
+        let mut inner = self.inner.lock().map_err(|_| ProfileError::conflict())?;
+        if inner.owner.as_deref() != Some(owner) {
+            return Err(ProfileError::conflict());
+        }
+        let revision = profile_state::safe_integer(revision).ok_or_else(ProfileError::conflict)?;
+        let state = state.ok_or_else(ProfileError::invalid_state)?;
+        let text =
+            profile_state::canonicalize_state(state).map_err(|_| ProfileError::invalid_state())?;
+        if revision == inner.revision {
+            return (inner.state_text == text)
+                .then_some(())
+                .ok_or_else(ProfileError::conflict);
+        }
+        if revision != inner.revision.saturating_add(1) {
+            return Err(ProfileError::conflict());
+        }
+        inner.revision = revision;
+        inner.state_text = text;
+        inner.saves += 1;
+        Ok(())
+    }
+
+    fn status(&self) -> Result<Value, ProfileError> {
+        let inner = self.inner.lock().map_err(|_| ProfileError::conflict())?;
+        Ok(json!({
+          "revision": inner.revision,
+          "loads": inner.loads,
+          "saves": inner.saves,
+          "bytes": inner.state_text.len(),
+        }))
+    }
+
+    fn kind(&self) -> &'static str {
+        "memory"
+    }
+
+    fn display(&self) -> String {
+        "memory".to_string()
+    }
+}
+
+pub struct SqliteProfile {
+    store: profile::ProfileStore,
+}
+
+impl SqliteProfile {
+    pub fn open(path: &Path, create: bool) -> HostResult<Self> {
+        Ok(Self {
+            store: profile::ProfileStore::open(path, create)?,
+        })
+    }
+}
+
+impl ProfileBackend for SqliteProfile {
+    fn load(&self, owner: &[u16]) -> Result<LoadResult, ProfileError> {
+        let read = self.store.acquire(owner)?;
+        Ok(LoadResult {
+            revision: read.revision,
+            state_text: read.state_text,
+        })
+    }
+
+    fn save(
+        &self,
+        owner: &[u16],
+        revision: &StateJson,
+        state: Option<&StateJson>,
+    ) -> Result<(), ProfileError> {
+        self.store.save(owner, revision, state)
+    }
+
+    fn status(&self) -> Result<Value, ProfileError> {
+        self.store.status().map(|status| status.to_json())
+    }
+
+    fn kind(&self) -> &'static str {
+        "sqlite"
+    }
+
+    fn display(&self) -> String {
+        self.store.status().map_or_else(
+            |_| "sqlite".to_string(),
+            |status| status.path.display().to_string(),
+        )
+    }
+}
+
+struct ConnectionTasks {
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl ConnectionTasks {
+    fn new() -> Self {
+        Self {
+            tasks: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn track(&self, handle: JoinHandle<()>) {
+        let Ok(mut tasks) = self.tasks.lock() else {
+            handle.abort();
+            return;
+        };
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(handle);
+    }
+
+    async fn close(&self) {
+        let handles = self
+            .tasks
+            .lock()
+            .map(|mut tasks| std::mem::take(&mut *tasks))
+            .unwrap_or_default();
+        for handle in &handles {
+            handle.abort();
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
+}
+
 pub struct PrivateServices {
     shutdown: watch::Sender<bool>,
-    profile: Arc<ProfileStore>,
+    profile: Arc<ProfileService>,
     paths: ServicePaths,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    connections: Arc<ConnectionTasks>,
 }
 
 impl PrivateServices {
@@ -50,22 +332,31 @@ impl PrivateServices {
         run_dir: &Path,
         assets_root: &Path,
         manifest_path: &Path,
-        profile_origin: &str,
+        profile: Arc<ProfileService>,
         observer: Arc<Observer>,
     ) -> HostResult<Self> {
         let profile_path = run_dir.join("profile.sock");
         let assets_path = run_dir.join("assets.sock");
         remove_socket(&profile_path);
         remove_socket(&assets_path);
-        let profile_listener = UnixListener::bind(&profile_path)?;
-        let assets_listener = UnixListener::bind(&assets_path)?;
+        let profile_listener = bind_private_socket(&profile_path)?;
+        let assets_listener = bind_private_socket(&assets_path)?;
 
-        let profile = Arc::new(ProfileStore::new(profile_origin, observer.clone())?);
+        let connections = Arc::new(ConnectionTasks::new());
+        let handler = Arc::new(ProfileHandler {
+            profile: profile.clone(),
+            observer: observer.clone(),
+        });
         let assets = Arc::new(AssetStore::load(assets_root, manifest_path, observer)?);
         let (shutdown, shutdown_rx) = watch::channel(false);
         let tasks = vec![
-            spawn_listener(profile_listener, shutdown_rx.clone(), profile.clone()),
-            spawn_listener(assets_listener, shutdown_rx, assets),
+            spawn_listener(
+                profile_listener,
+                shutdown_rx.clone(),
+                handler,
+                connections.clone(),
+            ),
+            spawn_listener(assets_listener, shutdown_rx, assets, connections.clone()),
         ];
         Ok(Self {
             shutdown,
@@ -75,6 +366,7 @@ impl PrivateServices {
                 assets: assets_path,
             },
             tasks: Mutex::new(tasks),
+            connections,
         })
     }
 
@@ -82,12 +374,28 @@ impl PrivateServices {
         &self.paths
     }
 
-    pub fn profile(&self) -> Arc<ProfileStore> {
+    pub fn profile(&self) -> Arc<ProfileService> {
         self.profile.clone()
     }
 
     pub fn stop(&self) {
         let _ = self.shutdown.send(true);
+    }
+
+    /// 先停止监听，再关闭已接受的连接，最后等到已开始的数据库操作结束。被取消的连接可能
+    /// 收不到响应，但提交结果由 revision 重试确定，且关闭前一定释放 profile 锁。
+    pub async fn shutdown(&self) {
+        self.stop();
+        let listeners = self
+            .tasks
+            .lock()
+            .map(|mut tasks| std::mem::take(&mut *tasks))
+            .unwrap_or_default();
+        for listener in listeners {
+            let _ = listener.await;
+        }
+        self.connections.close().await;
+        let _ = tokio::time::timeout(DRAIN_TIMEOUT, self.profile.drain()).await;
     }
 }
 
@@ -108,10 +416,22 @@ fn remove_socket(path: &Path) {
     }
 }
 
+/// socket 只允许当前用户读写；父目录仍由 main 的 0700 run dir 保护。
+fn bind_private_socket(path: &Path) -> HostResult<UnixListener> {
+    let listener = UnixListener::bind(path)?;
+    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        drop(listener);
+        let _ = std::fs::remove_file(path);
+        return Err(format!("cannot secure private socket: {error}").into());
+    }
+    Ok(listener)
+}
+
 fn spawn_listener(
     listener: UnixListener,
     shutdown: watch::Receiver<bool>,
     handler: Arc<dyn ConnectionHandler>,
+    connections: Arc<ConnectionTasks>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut shutdown = shutdown;
@@ -125,7 +445,7 @@ fn spawn_listener(
               accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
                   let handler = handler.clone();
-                  tokio::spawn(async move {
+                  let task = tokio::spawn(async move {
                     let service = service_fn(move |request| {
                       let handler = handler.clone();
                       async move { Ok::<_, std::convert::Infallible>(handler.handle(request).await) }
@@ -134,6 +454,7 @@ fn spawn_listener(
                       .serve_connection(TokioIo::new(stream), service)
                       .await;
                   });
+                  connections.track(task);
                 }
                 Err(_) => break,
               }
@@ -165,192 +486,62 @@ fn json_response(status: StatusCode, body: impl Into<Bytes>) -> Response<Full<By
         .expect("json response")
 }
 
-async fn body_text(body: Incoming, limit: usize) -> std::result::Result<String, StatusCode> {
+async fn collect_body(body: Incoming) -> std::result::Result<Vec<u8>, ()> {
     use http_body_util::BodyExt;
-    let limited = http_body_util::Limited::new(body, limit);
-    match limited.collect().await {
-        Ok(collected) => {
-            let bytes = collected.to_bytes();
-            String::from_utf8(bytes.to_vec()).map_err(|_| StatusCode::BAD_REQUEST)
-        }
-        Err(_) => Err(StatusCode::PAYLOAD_TOO_LARGE),
+    match body.collect().await {
+        Ok(collected) => Ok(collected.to_bytes().to_vec()),
+        Err(_) => Err(()),
     }
 }
 
-struct ProfileInner {
-    owner: Option<String>,
-    revision: u64,
-    state: Value,
-    state_text: String,
-    loads: u64,
-    saves: u64,
-}
-
-pub struct ProfileStore {
-    inner: Mutex<ProfileInner>,
+struct ProfileHandler {
+    profile: Arc<ProfileService>,
     observer: Arc<Observer>,
 }
 
-impl ProfileStore {
-    fn new(origin: &str, observer: Arc<Observer>) -> HostResult<Self> {
-        let (state, state_text) = initial_state(origin)?;
-        Ok(Self {
-            inner: Mutex::new(ProfileInner {
-                owner: None,
-                revision: 0,
-                state,
-                state_text,
-                loads: 0,
-                saves: 0,
-            }),
-            observer,
-        })
-    }
-
-    pub fn status(&self) -> Value {
-        let Ok(inner) = self.inner.lock() else {
-            return json!({ "revision": 0, "loads": 0, "saves": 0, "bytes": 0 });
-        };
-        json!({
-          "revision": inner.revision,
-          "loads": inner.loads,
-          "saves": inner.saves,
-          "bytes": inner.state_text.len(),
-        })
-    }
-
-    fn load(&self, body: &str) -> Response<Full<Bytes>> {
-        #[derive(Deserialize)]
-        struct LoadRequest {
-            owner: String,
-        }
-        let Ok(request) = serde_json::from_str::<LoadRequest>(body) else {
-            return json_response(StatusCode::BAD_REQUEST, r#"{"error":"invalid body"}"#);
-        };
-        if request.owner.is_empty() || request.owner.len() > 128 {
-            return json_response(StatusCode::BAD_REQUEST, r#"{"error":"invalid owner"}"#);
-        }
-        let Ok(mut inner) = self.inner.lock() else {
-            return json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                r#"{"error":"profile lock"}"#,
-            );
-        };
-        if let Some(owner) = &inner.owner {
-            if owner != &request.owner {
-                return json_response(
-                    StatusCode::CONFLICT,
-                    r#"{"error":"profile owned elsewhere"}"#,
-                );
+impl ProfileHandler {
+    async fn load(&self, owner: JsonString) -> (Response<Full<Bytes>>, Result<i64, ProfileError>) {
+        match self.profile.load(owner).await {
+            Ok(read) => {
+                let mut body = format!("{{\"revision\":{},\"state\":", read.revision).into_bytes();
+                body.extend_from_slice(read.state_text.as_bytes());
+                body.push(b'}');
+                (json_response(StatusCode::OK, body), Ok(read.revision))
             }
-        } else {
-            inner.owner = Some(request.owner.clone());
+            Err(error) => (profile_error_response(error), Err(error)),
         }
-        inner.loads += 1;
-        let revision = inner.revision;
-        let state_text = inner.state_text.clone();
-        let state = inner.state.clone();
-        let loads = inner.loads;
-        drop(inner);
+    }
+
+    async fn save(
+        &self,
+        owner: JsonString,
+        revision: StateJson,
+        state: Option<StateJson>,
+    ) -> (Response<Full<Bytes>>, Result<i64, ProfileError>) {
+        let requested = profile_state::safe_integer(&revision);
+        match self.profile.save(owner, revision, state).await {
+            Ok(()) => (
+                json_response(StatusCode::OK, r#"{"saved":true}"#),
+                Ok(requested.unwrap_or(0)),
+            ),
+            Err(error) => (profile_error_response(error), Err(error)),
+        }
+    }
+
+    fn observe(&self, operation: &str, revision: Option<i64>, status: u16) {
         self.observer.with(
-            "profile-load",
+            "profile",
             json!({
-              "kind": "profile-load",
-              "owner": request.owner,
+              "kind": "profile",
+              "operation": operation,
               "revision": revision,
-              "loads": loads,
-              "state": state,
+              "status": status,
             }),
         );
-        json_response(
-            StatusCode::OK,
-            format!("{{\"state\":{state_text},\"revision\":{revision}}}"),
-        )
-    }
-
-    fn save(&self, body: &str) -> Response<Full<Bytes>> {
-        #[derive(Deserialize)]
-        struct SaveRequest<'a> {
-            owner: String,
-            revision: u64,
-            #[serde(borrow)]
-            state: &'a RawValue,
-        }
-        let Ok(request) = serde_json::from_str::<SaveRequest>(body) else {
-            return json_response(StatusCode::BAD_REQUEST, r#"{"error":"invalid body"}"#);
-        };
-        if request.owner.is_empty() || request.owner.len() > 128 {
-            return json_response(StatusCode::BAD_REQUEST, r#"{"error":"invalid owner"}"#);
-        }
-        if request.revision > MAX_SAFE_INTEGER {
-            return json_response(StatusCode::BAD_REQUEST, r#"{"error":"unsafe revision"}"#);
-        }
-        let raw = request.state.get();
-        let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
-            return json_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                r#"{"error":"INVALID_STATE"}"#,
-            );
-        };
-        if !parsed.is_object() {
-            return json_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                r#"{"error":"INVALID_STATE"}"#,
-            );
-        }
-        let Ok(mut inner) = self.inner.lock() else {
-            return json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                r#"{"error":"profile lock"}"#,
-            );
-        };
-        if inner.owner.as_deref() != Some(request.owner.as_str()) {
-            return json_response(
-                StatusCode::CONFLICT,
-                r#"{"error":"profile owner mismatch"}"#,
-            );
-        }
-        if request.revision == inner.revision {
-            if raw == inner.state_text {
-                return json_response(
-                    StatusCode::OK,
-                    format!("{{\"revision\":{},\"idempotent\":true}}", request.revision),
-                );
-            }
-            return json_response(
-                StatusCode::CONFLICT,
-                r#"{"error":"revision already committed"}"#,
-            );
-        }
-        if request.revision != inner.revision + 1 {
-            return json_response(StatusCode::CONFLICT, r#"{"error":"revision out of order"}"#);
-        }
-        inner.revision = request.revision;
-        inner.state = parsed;
-        inner.state_text = raw.to_string();
-        inner.saves += 1;
-        let revision = inner.revision;
-        let saves = inner.saves;
-        let bytes = inner.state_text.len();
-        drop(inner);
-        let observed = if raw.len() <= OBSERVED_STATE_LIMIT {
-            json!({ "stateRaw": raw })
-        } else {
-            json!({ "stateBytes": bytes, "truncated": true })
-        };
-        let mut event = observed;
-        if let Value::Object(map) = &mut event {
-            map.insert("kind".to_string(), json!("profile-save"));
-            map.insert("owner".to_string(), json!(request.owner));
-            map.insert("revision".to_string(), json!(revision));
-            map.insert("saves".to_string(), json!(saves));
-        }
-        self.observer.record(event);
-        json_response(StatusCode::OK, format!("{{\"revision\":{revision}}}"))
     }
 }
 
-impl ConnectionHandler for ProfileStore {
+impl ConnectionHandler for ProfileHandler {
     fn handle(
         &self,
         request: Request<Incoming>,
@@ -364,20 +555,64 @@ impl ConnectionHandler for ProfileStore {
             if path != "/load" && path != "/save" {
                 return empty_response(StatusCode::NOT_FOUND);
             }
-            let body = match body_text(request.into_body(), MAX_PROFILE_BODY).await {
-                Ok(body) => body,
-                Err(status) => return empty_response(status),
+            let Ok(bytes) = collect_body(request.into_body()).await else {
+                self.observe(&path[1..], None, 409);
+                return profile_error_response(ProfileError::conflict());
+            };
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                self.observe(&path[1..], None, 409);
+                return profile_error_response(ProfileError::conflict());
+            };
+            let Ok(body) = profile_state::parse(text) else {
+                self.observe(&path[1..], None, 409);
+                return profile_error_response(ProfileError::conflict());
+            };
+            let Some(owner) = request_owner(&body) else {
+                self.observe(&path[1..], None, 409);
+                return profile_error_response(ProfileError::conflict());
             };
             if path == "/load" {
-                self.load(&body)
-            } else {
-                self.save(&body)
+                let (response, result) = self.load(owner).await;
+                match result {
+                    Ok(revision) => {
+                        self.observe("load", Some(revision), response.status().as_u16())
+                    }
+                    Err(_) => self.observe("load", None, response.status().as_u16()),
+                }
+                return response;
             }
+            let revision = body.get("revision").cloned().unwrap_or(StateJson::Null);
+            let requested = profile_state::safe_integer(&revision);
+            let state = body.get("state").cloned();
+            let (response, result) = self.save(owner, revision, state).await;
+            match result {
+                Ok(revision) => self.observe("save", Some(revision), response.status().as_u16()),
+                Err(_) => self.observe("save", requested, response.status().as_u16()),
+            }
+            response
         })
     }
 }
 
-fn initial_state(origin: &str) -> HostResult<(Value, String)> {
+fn request_owner(body: &StateJson) -> Option<JsonString> {
+    match body.get("owner") {
+        Some(StateJson::String(owner)) if !owner.is_empty() => Some(owner.clone()),
+        _ => None,
+    }
+}
+
+fn profile_error_response(error: ProfileError) -> Response<Full<Bytes>> {
+    let (status, code) = match error.kind() {
+        ProfileErrorKind::InvalidState => (StatusCode::UNPROCESSABLE_ENTITY, "INVALID_STATE"),
+        ProfileErrorKind::Conflict => (StatusCode::CONFLICT, "COMMIT_UNKNOWN"),
+    };
+    json_response(
+        status,
+        json!({ "code": code, "message": error.to_string() }).to_string(),
+    )
+}
+
+fn initial_state(origin: &str) -> HostResult<String> {
     let authority = origin
         .split_once("://")
         .map(|(_, rest)| rest)
@@ -423,7 +658,8 @@ fn initial_state(origin: &str) -> HostResult<(Value, String)> {
       "localStorage": [[origin, [["seed", "initial"]]]],
     });
     let text = serde_json::to_string(&state)?;
-    Ok((state, text))
+    let parsed = profile_state::parse(&text).map_err(|_| "invalid seed state".to_string())?;
+    profile_state::canonicalize_state(&parsed).map_err(|_| "invalid seed state".into())
 }
 
 #[derive(Deserialize)]
@@ -721,54 +957,70 @@ mod tests {
     }
 
     #[test]
-    fn profile_owner_revision_and_raw_state() {
-        let store = ProfileStore::new("http://fixture.test:8080", Arc::new(Observer::disabled()))
-            .expect("profile store");
-        let state = store.inner.lock().expect("profile").state_text.clone();
-        assert!(state.contains("fixture.test"));
-        assert_eq!(store.load(r#"{"owner":"alpha"}"#).status(), StatusCode::OK);
+    fn memory_profile_owner_revision_and_canonical_state() {
+        let store = MemoryProfile::new("http://fixture.test:8080").expect("profile store");
+        let alpha: Vec<u16> = "alpha".encode_utf16().collect();
+        let beta: Vec<u16> = "beta".encode_utf16().collect();
+        let read = store.load(&alpha).expect("load");
+        assert!(read.state_text.contains("fixture.test"));
+        assert!(matches!(
+            store.load(&beta).unwrap_err().kind(),
+            ProfileErrorKind::Conflict
+        ));
+        let revision_one = profile_state::parse("1").expect("revision");
+        let state =
+            profile_state::parse(r#"{"localStorage":[],"cookies":[],"Z":1,"a":2}"#).expect("state");
+        store
+            .save(&alpha, &revision_one, Some(&state))
+            .expect("first save");
         assert_eq!(
-            store.load(r#"{"owner":"beta"}"#).status(),
-            StatusCode::CONFLICT
+            store.load(&alpha).expect("reload").state_text,
+            r#"{"localStorage":[],"cookies":[],"Z":1,"a":2}"#
         );
-        assert_eq!(store.load("{}").status(), StatusCode::BAD_REQUEST);
-        let save = r#"{"owner":"alpha","revision":1,"state":{"Z":1,"a":2}}"#;
-        assert_eq!(store.save(save).status(), StatusCode::OK);
-        let raw = store.inner.lock().expect("profile").state_text.clone();
-        assert_eq!(raw, r#"{"Z":1,"a":2}"#);
-        assert_eq!(store.save(save).status(), StatusCode::OK);
-        assert_eq!(
+        store
+            .save(&alpha, &revision_one, Some(&state))
+            .expect("lost-reply retry");
+        let different = profile_state::parse(r#"{"cookies":[],"localStorage":[]}"#).expect("state");
+        assert!(matches!(
             store
-                .save(r#"{"owner":"alpha","revision":1,"state":{"a":2}}"#)
-                .status(),
-            StatusCode::CONFLICT
-        );
-        assert_eq!(
+                .save(&alpha, &revision_one, Some(&different))
+                .unwrap_err()
+                .kind(),
+            ProfileErrorKind::Conflict
+        ));
+        let revision_three = profile_state::parse("3").expect("revision");
+        assert!(matches!(
             store
-                .save(r#"{"owner":"alpha","revision":3,"state":{}}"#)
-                .status(),
-            StatusCode::CONFLICT
-        );
-        assert_eq!(
+                .save(&alpha, &revision_three, Some(&state))
+                .unwrap_err()
+                .kind(),
+            ProfileErrorKind::Conflict
+        ));
+        assert!(matches!(
             store
-                .save(r#"{"owner":"beta","revision":2,"state":{}}"#)
-                .status(),
-            StatusCode::CONFLICT
-        );
-        assert_eq!(
+                .save(&beta, &revision_one, Some(&state))
+                .unwrap_err()
+                .kind(),
+            ProfileErrorKind::Conflict
+        ));
+        let array = profile_state::parse("[]").expect("state");
+        assert!(matches!(
             store
-                .save(r#"{"owner":"alpha","revision":2,"state":[]}"#)
-                .status(),
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
-        assert_eq!(
+                .save(&alpha, &profile_state::parse("2").unwrap(), Some(&array))
+                .unwrap_err()
+                .kind(),
+            ProfileErrorKind::InvalidState
+        ));
+        let unsafe_revision = profile_state::parse("9007199254740992").expect("revision");
+        assert!(matches!(
             store
-                .save(r#"{"owner":"alpha","revision":9007199254740992,"state":{}}"#)
-                .status(),
-            StatusCode::BAD_REQUEST
-        );
-        let status = store.status();
-        assert_eq!(status["loads"], 1);
+                .save(&alpha, &unsafe_revision, Some(&state))
+                .unwrap_err()
+                .kind(),
+            ProfileErrorKind::Conflict
+        ));
+        let status = store.status().expect("status");
+        assert_eq!(status["loads"], 2);
         assert_eq!(status["saves"], 1);
         assert_eq!(status["revision"], 1);
     }

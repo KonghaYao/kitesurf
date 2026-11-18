@@ -173,8 +173,8 @@ test("flush completes through the engine profile bridge", async () => {
 });
 
 test("native profile is an in-memory T2 test double", nativeOnly, async () => {
-  // T2 只实现测试替身：T3 之前没有 path/format/id，也没有磁盘文件。这里仅断内存诊断
-  // 计数，不能把该探针当成正式 profile 兼容，也不伪造磁盘元数据。
+  // 共用契约宿主仍显式启用内存替身，保持 T0/T2 断言不变；正式 SQLite 由本包的
+  // profile_compat_test 与 profile_engine_smoke_test 单独证明，不伪造磁盘元数据。
   assert.equal(host.profile, "memory");
   assert.equal(host.ready.profile, "memory");
   const session = await host.request("/session");

@@ -40,6 +40,28 @@ rust_binary(
     deps = all_crate_deps(normal = True),
 )
 
+# 仅测试使用的 profile 驱动；发行二进制不含该入口。
+rust_binary(
+    name = "profile_harness",
+    srcs = ["examples/profile_harness.rs"],
+    edition = "2021",
+    rustc_env_files = [":cargo_env"],
+    deps = [":kitesurf_local_host"] + all_crate_deps(normal = True),
+    visibility = ["//packages/local-browser:__pkg__"],
+)
+
+rust_test(
+    name = "profile_test",
+    size = "small",
+    srcs = ["tests/profile_test.rs"],
+    edition = "2021",
+    rustc_env_files = [":cargo_env"],
+    deps = [":kitesurf_local_host"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 rust_test(
     name = "unit_test",
     crate = ":kitesurf_local_host",
@@ -69,6 +91,8 @@ rust_lint_tests(targets = [
     ":fake_engine",
     ":kitesurf-native",
     ":kitesurf_local_host",
+    ":profile_harness",
+    ":profile_test",
     ":supervisor_test",
     ":unit_test",
 ])
@@ -203,4 +227,16 @@ node_test(
 test_suite(
     name = "engine_smoke_test",
     tests = ["//packages/local-browser:engine_smoke_test"],
+)
+
+# Node oracle 的兼容测试和 T3 engine 冒烟位于 local-browser 包；这两个别名保留计划
+# 指定的 native 入口名称。
+test_suite(
+    name = "profile_compat_test",
+    tests = ["//packages/local-browser:profile_compat_test"],
+)
+
+test_suite(
+    name = "profile_engine_smoke_test",
+    tests = ["//packages/local-browser:profile_engine_smoke_test"],
 )

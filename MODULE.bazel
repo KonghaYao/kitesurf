@@ -244,6 +244,11 @@ crate.annotation(
     ],
 )
 crate.annotation(
+    build_script_env = {"LIBSQLITE3_SYS_USE_PKG_CONFIG": "0"},
+    crate = "libsqlite3-sys",
+    repositories = ["crates_native"],
+)
+crate.annotation(
     build_script_env = {"PYTHON3": "/usr/bin/python3"},
     crate = "stylo",
     repositories = ["crates"],

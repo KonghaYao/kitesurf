@@ -18,8 +18,11 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::timeout;
 
 use kitesurf_local_host::observe::Observer;
+use kitesurf_local_host::profile::ProfileStore;
 use kitesurf_local_host::relay::{HostServer, SessionInfo};
-use kitesurf_local_host::services::PrivateServices;
+use kitesurf_local_host::services::{
+    MemoryProfile, PrivateServices, ProfileBackend, ProfileService, SqliteProfile,
+};
 use kitesurf_local_host::supervisor::{self, EngineSocket, EngineSpec};
 use kitesurf_local_host::transport::Upstream;
 use kitesurf_local_host::{describe_error, HostResult};
@@ -30,9 +33,12 @@ const HELP: &str = "\
 Kitesurf native local host 0.5.0
 
 kitesurf-native serve --workerd FILE --config FILE --assets-root DIR
-                     --assets-manifest FILE [--port 8787]
-                     [--profile-origin URL] [--startup-timeout-ms N]
-                     [--test-observe FILE]
+                     --assets-manifest FILE --profile FILE [--create-profile]
+                     [--port 8787] [--startup-timeout-ms N] [--test-observe FILE]
+kitesurf-native serve --test-memory-profile [--profile-origin URL] ...
+kitesurf-native profile create FILE
+kitesurf-native profile status FILE
+kitesurf-native profile backup FILE --output FILE
 kitesurf-native --help | --version
 
 The generated config carries the public/private network choice. This process owns the
@@ -45,6 +51,9 @@ struct Args {
     assets_root: PathBuf,
     assets_manifest: PathBuf,
     port: u16,
+    profile: Option<PathBuf>,
+    create_profile: bool,
+    memory_profile: bool,
     profile_origin: String,
     startup_timeout_ms: u64,
     observe: Option<PathBuf>,
@@ -75,6 +84,9 @@ impl Args {
             assets_root: PathBuf::new(),
             assets_manifest: PathBuf::new(),
             port: 8787,
+            profile: None,
+            create_profile: false,
+            memory_profile: false,
             profile_origin: "http://profile.invalid".to_string(),
             startup_timeout_ms: 30_000,
             observe: None,
@@ -107,6 +119,9 @@ impl Args {
                     assets_manifest = Some(PathBuf::from(take("--assets-manifest")?))
                 }
                 "--profile-origin" => args.profile_origin = take("--profile-origin")?,
+                "--profile" => args.profile = Some(PathBuf::from(take("--profile")?)),
+                "--create-profile" => args.create_profile = true,
+                "--test-memory-profile" => args.memory_profile = true,
                 "--port" => {
                     args.port = take("--port")?.parse::<u16>()?;
                 }
@@ -146,6 +161,18 @@ impl Args {
             && !args.profile_origin.starts_with("https://")
         {
             return Err("--profile-origin must be an http(s) origin".into());
+        }
+        match (&args.profile, args.memory_profile) {
+            (Some(_), true) => {
+                return Err("--profile and --test-memory-profile are mutually exclusive".into())
+            }
+            (None, false) => {
+                return Err("serve requires --profile FILE or --test-memory-profile".into())
+            }
+            (None, true) if args.create_profile => {
+                return Err("--create-profile requires --profile".into())
+            }
+            _ => {}
         }
         Ok(args)
     }
@@ -188,6 +215,56 @@ fn generation() -> HostResult<String> {
     Ok(hex)
 }
 
+/// 仅保留 T3 需要的 profile 入口；完整 CLI 迁移属于后续任务。
+fn run_profile_command(args: &[OsString]) -> HostResult<()> {
+    let command = args
+        .first()
+        .map(|argument| argument.to_string_lossy().to_string())
+        .ok_or("usage: profile create|status|backup FILE")?;
+    let path = args
+        .get(1)
+        .map(PathBuf::from)
+        .ok_or("profile command requires a FILE")?;
+    match command.as_str() {
+        "create" => {
+            let store = ProfileStore::open(&path, true)?;
+            print_json(store.status()?.to_json())?;
+        }
+        "status" => {
+            let store = ProfileStore::open(&path, false)?;
+            print_json(store.status()?.to_json())?;
+        }
+        "backup" => {
+            let mut output = None;
+            let mut rest = args[2..].iter();
+            while let Some(argument) = rest.next() {
+                if argument.to_string_lossy() == "--output" {
+                    output = Some(PathBuf::from(
+                        rest.next()
+                            .ok_or("--output requires a value")?
+                            .to_string_lossy()
+                            .to_string(),
+                    ));
+                } else {
+                    return Err("usage: profile backup FILE --output FILE".into());
+                }
+            }
+            let output = output.ok_or("--output is required")?;
+            let store = ProfileStore::open(&path, false)?;
+            let destination = store.backup(&output)?;
+            print_json(json!({ "path": destination.display().to_string() }))?;
+        }
+        other => return Err(format!("unknown profile command: {other}").into()),
+    }
+    Ok(())
+}
+
+fn print_json(value: serde_json::Value) -> HostResult<()> {
+    println!("{value}");
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let code = match run().await {
@@ -202,7 +279,15 @@ async fn main() {
 }
 
 async fn run() -> HostResult<bool> {
-    let args = Args::parse(std::env::args_os().skip(1).collect())?;
+    let argv: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if argv
+        .first()
+        .is_some_and(|argument| argument.to_string_lossy() == "profile")
+    {
+        run_profile_command(&argv[1..])?;
+        return Ok(true);
+    }
+    let args = Args::parse(argv)?;
     let observer = match &args.observe {
         Some(path) => Arc::new(Observer::create(path)?),
         None => Arc::new(Observer::disabled()),
@@ -217,11 +302,16 @@ async fn run() -> HostResult<bool> {
           "mode": mode,
         }),
     );
+    let backend: Arc<dyn ProfileBackend> = match &args.profile {
+        Some(path) => Arc::new(SqliteProfile::open(path, args.create_profile)?),
+        None => Arc::new(MemoryProfile::new(&args.profile_origin)?),
+    };
+    let profile_service = Arc::new(ProfileService::new(backend));
     let services = PrivateServices::bind(
         run_dir.path(),
         &args.assets_root,
         &args.assets_manifest,
-        &args.profile_origin,
+        profile_service.clone(),
         observer.clone(),
     )?;
     let socket = EngineSocket::Unix(run_dir.path().join("engine.sock"));
@@ -260,12 +350,22 @@ async fn run() -> HostResult<bool> {
             return Err("engine returned no session id".into());
         }
         let generation = generation()?;
+        let status = profile_service
+            .status()
+            .await
+            .map_err(|error| error.to_string())?;
+        let recovery = if status["revision"].as_i64().unwrap_or(0) > 0 {
+            "profile-restored"
+        } else {
+            "new-profile"
+        };
         let (host, close_requests) = HostServer::bind(
             args.port,
             upstream.clone(),
             session,
             generation.clone(),
-            services.profile(),
+            recovery.to_string(),
+            profile_service.clone(),
             observer.clone(),
         )?;
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
@@ -287,7 +387,7 @@ async fn run() -> HostResult<bool> {
     let ready = json!({
       "ready": true,
       "port": port,
-      "profile": "memory",
+      "profile": profile_service.display(),
       "generation": generation,
     });
     println!("{ready}");
@@ -340,8 +440,9 @@ async fn run() -> HostResult<bool> {
     .await;
     upstream.close();
     let exit = engine.shutdown().await;
-    services.stop();
+    services.shutdown().await;
     drop(services);
+    drop(profile_service);
     let dir_path = run_dir.path().to_path_buf();
     drop(run_dir);
     observer.with(

@@ -8,7 +8,15 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer, request as httpRequest } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -313,10 +321,10 @@ test("a classic dedicated worker answers and terminates", { timeout: 120_000 }, 
   assert.deepEqual(reply, { echo: "ping", isScope: true });
 });
 
-// 内存 profile 是 T2 测试替身：T3 前没有 path/format/id 或磁盘文件。这里只验证引擎与
-// profile binding 的 load/save 文本和计数，不代表正式持久化兼容。
+// 默认契约宿主显式使用内存 profile 测试替身，只验证引擎与 binding 的加载与计数；
+// 正式 SQLite 的内容和磁盘证据由 profile_engine_smoke_test 单独覆盖。
 test(
-  "the profile bridge loads the seed state and saves real cookie and storage text",
+  "the profile bridge loads the seed state and records redacted save operations",
   { timeout: 120_000 },
   async (t) => {
     const site = await fixture(t);
@@ -324,15 +332,14 @@ test(
     const cdp = await connect(host.port);
     t.after(() => cdp.disconnect());
     const page = await open(cdp, `${site.url}/a`);
-    const loaded = await waitFor(() => events(host, "profile-load")[0], "the profile load");
+    const loaded = await waitFor(
+      () => events(host, "profile").find((event) => event.operation === "load"),
+      "the profile load",
+    );
     assert.equal(loaded.revision, 0);
-    assert.ok(loaded.owner.length > 0);
-    assert.ok(
-      loaded.state.cookies.some((cookie) => cookie.name === "seed" && cookie.value === "initial"),
-    );
-    assert.ok(
-      loaded.state.cookies.some((cookie) => cookie.name === "sid" && cookie.httpOnly === true),
-    );
+    assert.equal(loaded.operation, "load");
+    assert.equal(loaded.status, 200);
+    assert.deepEqual(Object.keys(loaded).sort(), ["kind", "operation", "revision", "status"]);
     assert.equal(
       await waitFor(
         () => evaluate(cdp, page.sessionId, "localStorage.getItem('seed')"),
@@ -353,19 +360,15 @@ test(
     assert.equal(flushed.status, 200);
     assert.ok(flushed.body.saves >= 1);
     const save = await waitFor(
-      () => events(host, "profile-save").find((event) => event.stateRaw?.includes('"saved"')),
-      "the raw profile save",
+      () =>
+        events(host, "profile").find(
+          (event) => event.operation === "save" && event.status === 200,
+        ),
+      "the profile save",
     );
-    assert.equal(typeof save.stateRaw, "string");
-    const state = JSON.parse(save.stateRaw);
-    assert.ok(state.cookies.some((cookie) => cookie.name === "saved" && cookie.value === "1"));
-    assert.ok(
-      state.localStorage.some(
-        ([origin, entries]) =>
-          origin === site.url && entries.some(([key, value]) => key === "k" && value === "v"),
-      ),
-      JSON.stringify(state.localStorage),
-    );
+    assert.equal(save.operation, "save");
+    assert.equal(typeof save.revision, "number");
+    assert.deepEqual(Object.keys(save).sort(), ["kind", "operation", "revision", "status"]);
     const session = await host.request("/session");
     assert.ok(session.body.profile.loads >= 1);
     assert.ok(session.body.profile.saves >= 1);
@@ -650,19 +653,24 @@ test(
         .status,
       409,
     );
-    assert.equal(
-      (await unixRequest(profile, { method: "POST", path: "/load", body: {} })).status,
-      400,
-    );
+    for (const body of [{}, { owner: {} }, { owner: "" }])
+      assert.equal(
+        (await unixRequest(profile, { method: "POST", path: "/load", body })).status,
+        409,
+      );
     assert.equal((await host.request("/fixtures/pixel.png")).status, 404);
     assert.equal((await host.request("/load", { method: "POST" })).status, 404);
     const pages = await host.request("/json/list");
     assert.ok(pages.body.every((entry) => entry.type === "page"));
     assert.ok(!JSON.stringify(pages.body).includes("profile.sock"));
-    const owner = events(host, "profile-load")[0].owner;
     const logs = host.stdoutText() + host.stderrText();
+    const observerText = readFileSync(host.observerPath, "utf8");
     assert.ok(!logs.includes("http-only-seed"), "profile state stays out of logs");
-    assert.ok(!logs.includes(owner), "the profile owner stays out of logs");
+    assert.ok(!observerText.includes("http-only-seed"), "profile state stays out of the observer");
+    assert.ok(!observerText.includes('"state"'), "the observer has no state field");
+    assert.ok(!observerText.includes('"owner"'), "the observer has no owner field");
+    for (const event of events(host, "profile"))
+      assert.deepEqual(Object.keys(event).sort(), ["kind", "operation", "revision", "status"]);
   },
 );
 

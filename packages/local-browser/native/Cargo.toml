@@ -21,9 +21,11 @@ bytes = "1.12.1"
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "sink"] }
 getrandom = "0.2.17"
 http-body-util = "0.1.5"
-hyper = { version = "1.11.1", features = ["http1", "server"] }
+hyper = { version = "1.11.1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 libc = "0.2.189"
+rusqlite = { version = "=0.37.0", features = ["bundled"] }
+ryu-js = "=1.0.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["raw_value"] }
 sha2 = "0.10.9"
@@ -40,3 +42,4 @@ tokio = { version = "1.53.1", features = [
   "time",
 ] }
 tokio-tungstenite = { version = "0.27.0", default-features = false, features = ["handshake"] }
+url = "2.5.8"

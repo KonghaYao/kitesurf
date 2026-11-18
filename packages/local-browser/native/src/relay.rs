@@ -29,7 +29,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::observe::Observer;
-use crate::services::ProfileStore;
+use crate::services::ProfileService;
 use crate::transport::{Frame, Upstream};
 use crate::HostResult;
 
@@ -47,7 +47,8 @@ struct HostContext {
     upstream: Arc<Upstream>,
     session: SessionInfo,
     generation: String,
-    profile: Arc<ProfileStore>,
+    recovery: String,
+    profile: Arc<ProfileService>,
     observer: Arc<Observer>,
     client_active: Arc<AtomicBool>,
     close_requests: mpsc::UnboundedSender<()>,
@@ -67,7 +68,8 @@ impl HostServer {
         upstream: Arc<Upstream>,
         session: SessionInfo,
         generation: String,
-        profile: Arc<ProfileStore>,
+        recovery: String,
+        profile: Arc<ProfileService>,
         observer: Arc<Observer>,
     ) -> HostResult<(Self, mpsc::UnboundedReceiver<()>)> {
         let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
@@ -79,6 +81,7 @@ impl HostServer {
             upstream,
             session,
             generation,
+            recovery,
             profile,
             observer: observer.clone(),
             client_active: Arc::new(AtomicBool::new(false)),
@@ -254,7 +257,13 @@ async fn handle_request(
             ),
         },
         (Method::POST, "/flush") => match flush(&context).await {
-            Ok(()) => json_response(StatusCode::OK, context.profile.status().to_string()),
+            Ok(()) => match profile_status(&context.profile).await {
+                Ok(status) => json_response(StatusCode::OK, status.to_string()),
+                Err(error) => json_response(
+                    StatusCode::CONFLICT,
+                    json!({ "error": error.to_string() }).to_string(),
+                ),
+            },
             Err(error) => json_response(
                 StatusCode::CONFLICT,
                 json!({ "error": error.to_string() }).to_string(),
@@ -271,7 +280,7 @@ async fn handle_request(
               "session": "/session",
               "cdp": format!("ws://127.0.0.1:{}/devtools/browser", context.port),
               "inspect": "chrome://inspect - configure this address",
-              "profile": "memory",
+              "profile": context.profile.display(),
             })
             .to_string(),
         ),
@@ -443,15 +452,23 @@ async fn targets(context: &HostContext) -> HostResult<Vec<Value>> {
         .collect())
 }
 
+async fn profile_status(profile: &Arc<ProfileService>) -> HostResult<Value> {
+    profile
+        .status()
+        .await
+        .map_err(|error| error.to_string().into())
+}
+
 async fn session_body(context: &HostContext) -> HostResult<String> {
     let tabs = targets(context).await?;
+    let profile = profile_status(&context.profile).await?;
     Ok(json!({
       "version": context.session.build_version,
       "sessionId": context.session.session_id,
       "generation": context.generation,
       "alive": context.upstream.is_alive(),
-      "recovery": "new-profile",
-      "profile": context.profile.status(),
+      "recovery": context.recovery,
+      "profile": profile,
       "controller": Value::Null,
       "controlEpoch": 1,
       "environment": context.session.environment,

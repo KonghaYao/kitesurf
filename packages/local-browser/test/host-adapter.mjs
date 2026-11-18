@@ -136,6 +136,8 @@ export async function startNativeHost({
   observe,
   startupTimeoutMs = 30_000,
   profileOrigin,
+  profile,
+  createProfile = false,
   env,
 }) {
   const directory = mkdtempSync(join(tmpdir(), "ks-native-host-"));
@@ -163,6 +165,13 @@ export async function startNativeHost({
     observerPath,
   ];
   if (profileOrigin) args.push("--profile-origin", profileOrigin);
+  // 默认宿主使用显式的内存测试替身；正式 SQLite 只由测试显式传入 profile。
+  if (profile) {
+    args.push("--profile", profile);
+    if (createProfile) args.push("--create-profile");
+  } else {
+    args.push("--test-memory-profile");
+  }
   const child = spawn(binary, args, {
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, ...env, TMPDIR: runRoot },

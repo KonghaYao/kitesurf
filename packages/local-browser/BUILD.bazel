@@ -109,6 +109,55 @@ node_test(
     data = [":runtime"] + glob(["test/*.mjs"]),
 )
 
+# Node ProfileStore 是兼容性 oracle；harness 是 native 包中仅用于测试的驱动。
+node_test(
+    name = "profile_compat_test",
+    args = ["test/profile-compat.test.mjs"],
+    data = [
+        ":runtime",
+        "//packages/local-browser/native:profile_harness",
+    ] + glob(["test/*.mjs"]),
+    env = {
+        "KITESURF_PROFILE_HARNESS": "$(rootpath //packages/local-browser/native:profile_harness)",
+    },
+)
+
+# 跨语言 SIGKILL 与 lost-reply 常驻测试；只操作测试自己创建的 profile。
+node_test(
+    name = "profile_crash_test",
+    size = "small",
+    args = ["test/profile-crash.test.mjs"],
+    data = [
+        ":runtime",
+        "//packages/local-browser/native:profile_harness",
+    ] + glob(["test/*.mjs"]),
+    env = {
+        "KITESURF_PROFILE_HARNESS": "$(rootpath //packages/local-browser/native:profile_harness)",
+    },
+)
+
+# T3 的真实 engine 冒烟：显式 SQLite profile，检查磁盘、重启恢复和 CLI 备份。
+node_test(
+    name = "profile_engine_smoke_test",
+    size = "large",
+    timeout = "long",
+    args = ["test/profile-engine.test.mjs"],
+    data = [
+        ":node_modules/ws",
+        ":runtime",
+        "//packages/local-browser/native:generated_config",
+        "//packages/local-browser/native:kitesurf-native",
+        "//packages/local-browser/native:native_assets",
+        "//packages/local-browser/native:workerd_bin",
+    ] + glob(["test/*.mjs"]),
+    env = {
+        "KITESURF_CONFIG_DIR": "$(rootpath //packages/local-browser/native:generated_config)",
+        "KITESURF_ENGINE_ASSETS": "$(rootpath //packages/local-browser/native:native_assets)",
+        "KITESURF_NATIVE_HOST": "$(rootpath //packages/local-browser/native:kitesurf-native)",
+        "KITESURF_WORKERD": "$(rootpath //packages/local-browser/native:workerd_bin)",
+    },
+)
+
 copy_file(
     name = "font_host_bin",
     src = "//packages/local-browser/font-host:kitesurf-font-host",

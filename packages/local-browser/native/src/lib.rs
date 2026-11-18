@@ -6,6 +6,8 @@
 // 中继。正式的 SQLite profile 与多客户端代理属于后续任务。
 
 pub mod observe;
+pub mod profile;
+pub mod profile_state;
 pub mod relay;
 pub mod services;
 pub mod supervisor;
