@@ -176,6 +176,7 @@ interface GetOrCreatePageScriptOptions {
     KITESURF_PAGE_WALL_MS_CAP?: string;
     HOST_TRACER?: Tracer;
     HOST_CLOCK?: HostClock;
+    KITESURF_SYSTEM_FONTS?: string;
   };
   ctx: ExecutionContext;
   key: PageScriptKey;
@@ -248,6 +249,7 @@ export function getOrCreatePageScript({
   const cdpDebug = startupInput.cdpDebug === true;
   const pixelFree = startupInput.pixelFree === true;
   const fontDefer = startupInput.fontDefer === true;
+  const systemFonts = env.KITESURF_SYSTEM_FONTS === "1";
   const configuredQuietTurns = Number.parseInt(env.KITESURF_RESOURCE_DRAIN_QUIET_TURNS ?? "", 10);
   const resourceDrainQuietTurns = Number.isFinite(configuredQuietTurns)
     ? Math.max(1, configuredQuietTurns)
@@ -289,6 +291,7 @@ export const cdpDebug = ${JSON.stringify(cdpDebug)};
 export const lagWatchdog = ${JSON.stringify(lagWatchdog)};
 export const pixelFree = ${JSON.stringify(pixelFree)};
 export const fontDefer = ${JSON.stringify(fontDefer)};
+export const systemFonts = ${JSON.stringify(systemFonts)};
 export const resourceDrainQuietTurns = ${JSON.stringify(resourceDrainQuietTurns)};
 export const csp = ${JSON.stringify(csp)};
 export const metaCsp = ${JSON.stringify(metaCsp)};
@@ -473,6 +476,7 @@ export function spawnFramePageScript(
     LOADER: WorkerLoader;
     KITESURF_SIMULATE_PROD_EVAL?: string;
     KITESURF_LAG_WATCHDOG?: string;
+    KITESURF_SYSTEM_FONTS?: string;
   },
   ctx: ExecutionContext,
   args: {

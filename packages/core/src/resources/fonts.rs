@@ -7,6 +7,7 @@
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use linebender_resource_handle::Blob;
@@ -44,6 +45,16 @@ thread_local! {
 
     static FONT_ASSET_HASHES: RefCell<HashMap<u64, &'static str>> =
         RefCell::new(HashMap::new());
+
+    static SYSTEM_FACE_HASHES: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
+    static SYSTEM_FAMILY_IDS: RefCell<HashMap<String, Vec<FamilyId>>> =
+        RefCell::new(HashMap::new());
+    static SYSTEM_GENERIC_SEEN: RefCell<HashMap<u8, HashSet<FamilyId>>> =
+        RefCell::new(HashMap::new());
+    static SYSTEM_SCRIPT_SEEN: RefCell<HashMap<String, HashSet<FamilyId>>> =
+        RefCell::new(HashMap::new());
+    static SYSTEM_EMOJI_SEEN: RefCell<HashSet<FamilyId>> = RefCell::new(HashSet::new());
+    static SYSTEM_BASE_SEEN: RefCell<HashSet<FamilyId>> = RefCell::new(HashSet::new());
 }
 
 const SFNT_HEADER_BYTES: usize = 12;
@@ -813,6 +824,208 @@ pub fn register_script_font(bytes: Vec<u8>, script_tag: String) -> bool {
     true
 }
 
+fn system_family_ids(name: &str) -> Vec<FamilyId> {
+    SYSTEM_FAMILY_IDS.with(|c| c.borrow().get(name).cloned().unwrap_or_default())
+}
+
+fn append_unique(target: &mut Vec<FamilyId>, ids: &[FamilyId]) {
+    for id in ids {
+        if !target.contains(id) {
+            target.push(*id);
+        }
+    }
+}
+
+/// Register one normalized system face under its real family name. No asset identity is
+/// recorded, and the cloud bundled-font path is untouched.
+#[wasm_bindgen]
+pub fn register_system_face(bytes: Vec<u8>, family_name: String, mono: bool) -> bool {
+    let family_name = family_name.trim().to_string();
+    if bytes.is_empty()
+        || family_name.is_empty()
+        || family_name.len() > 256
+        || family_name.chars().any(char::is_control)
+        || !is_plain_sfnt(&bytes)
+    {
+        return false;
+    }
+    if skrifa::FontRef::from_index(&bytes, 0).is_err() {
+        return false;
+    }
+    if mono {
+        if let Some(ratio) = measure_mono_advance_per_em(&bytes) {
+            MONO_ADVANCE_PER_EM.with(|c| c.set(ratio));
+        }
+    }
+    let hash = font_data_key(fx_hash_u64(&bytes), 0);
+    if !SYSTEM_FACE_HASHES.with(|c| c.borrow_mut().insert(hash)) {
+        return false;
+    }
+    let registered = SHARED_FONT_CONTEXT.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let font_ctx = borrow.get_or_insert_with(make_empty_font_context);
+        let blob = Blob::from(bytes);
+        let result = font_ctx.collection.register_fonts(
+            blob,
+            Some(FontInfoOverride {
+                family_name: Some(&family_name),
+                ..Default::default()
+            }),
+        );
+        let ids: Vec<FamilyId> = result.into_iter().map(|(id, _)| id).collect();
+        if ids.is_empty() {
+            return false;
+        }
+        SYSTEM_FAMILY_IDS.with(|c| {
+            let mut families = c.borrow_mut();
+            let entry = families.entry(family_name.clone()).or_default();
+            append_unique(entry, &ids);
+        });
+        true
+    });
+    if !registered {
+        SYSTEM_FACE_HASHES.with(|c| {
+            c.borrow_mut().remove(&hash);
+        });
+    }
+    registered
+}
+
+/// Append a registered system family to a generic family.
+#[wasm_bindgen]
+pub fn map_system_generic(generic: String, family_name: String) -> bool {
+    let Some(generic) = GenericFamily::parse(&generic) else {
+        return false;
+    };
+    let ids = system_family_ids(family_name.trim());
+    if ids.is_empty() {
+        return false;
+    }
+    SHARED_FONT_CONTEXT.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let font_ctx = match borrow.as_mut() {
+            Some(font_ctx) => font_ctx,
+            None => return false,
+        };
+        let mut fresh = Vec::new();
+        SYSTEM_GENERIC_SEEN.with(|c| {
+            let mut seen = c.borrow_mut();
+            let entry = seen.entry(generic as u8).or_default();
+            fresh.extend(ids.iter().copied().filter(|id| entry.insert(*id)));
+        });
+        if fresh.is_empty() {
+            return true;
+        }
+        font_ctx
+            .collection
+            .append_generic_families(generic, fresh.iter().copied());
+        if matches!(
+            generic,
+            GenericFamily::SansSerif | GenericFamily::Serif | GenericFamily::Monospace
+        ) {
+            BASE_COMMON_IDS.with(|c| {
+                let mut base = c.borrow_mut();
+                SYSTEM_BASE_SEEN.with(|seen| {
+                    let mut seen = seen.borrow_mut();
+                    for id in &fresh {
+                        if seen.insert(*id) {
+                            base.push(*id);
+                        }
+                    }
+                });
+            });
+        }
+        if matches!(generic, GenericFamily::Emoji) {
+            EMOJI_IDS.with(|c| append_unique(&mut c.borrow_mut(), &fresh));
+        }
+        rebuild_common_fallbacks(font_ctx);
+        true
+    })
+}
+
+/// Append a registered system family to a script fallback chain. CJK faces also join the
+/// common fallback chain so shared punctuation does not fall to tofu.
+#[wasm_bindgen]
+pub fn append_system_fallback(script_tag: String, family_name: String) -> bool {
+    if script_tag.len() != 4 || !script_tag.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    let Ok(tag_bytes) = <[u8; 4]>::try_from(script_tag.as_bytes()) else {
+        return false;
+    };
+    let script = Script::from_bytes(tag_bytes);
+    let ids = system_family_ids(family_name.trim());
+    if ids.is_empty() {
+        return false;
+    }
+    SHARED_FONT_CONTEXT.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let Some(font_ctx) = borrow.as_mut() else {
+            return false;
+        };
+        let mut fresh = Vec::new();
+        SYSTEM_SCRIPT_SEEN.with(|c| {
+            let mut seen = c.borrow_mut();
+            let entry = seen.entry(script_tag.clone()).or_default();
+            fresh.extend(ids.iter().copied().filter(|id| entry.insert(*id)));
+        });
+        if fresh.is_empty() {
+            return true;
+        }
+        font_ctx
+            .collection
+            .append_fallbacks(script, fresh.iter().copied());
+        if matches!(&script_tag[..], "Hani" | "Hira" | "Kana" | "Hang") {
+            CJK_IDS.with(|c| append_unique(&mut c.borrow_mut(), &fresh));
+        }
+        rebuild_common_fallbacks(font_ctx);
+        true
+    })
+}
+
+/// Append a registered system emoji family to the emoji generic and common fallback chain.
+#[wasm_bindgen]
+pub fn append_system_emoji(family_name: String) -> bool {
+    let ids = system_family_ids(family_name.trim());
+    if ids.is_empty() {
+        return false;
+    }
+    SHARED_FONT_CONTEXT.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let Some(font_ctx) = borrow.as_mut() else {
+            return false;
+        };
+        let mut fresh = Vec::new();
+        SYSTEM_EMOJI_SEEN.with(|c| {
+            let mut seen = c.borrow_mut();
+            fresh.extend(ids.iter().copied().filter(|id| seen.insert(*id)));
+        });
+        if fresh.is_empty() {
+            return true;
+        }
+        EMOJI_IDS.with(|c| append_unique(&mut c.borrow_mut(), &fresh));
+        font_ctx
+            .collection
+            .append_generic_families(GenericFamily::Emoji, fresh.iter().copied());
+        rebuild_common_fallbacks(font_ctx);
+        EMOJI_FONT_REGISTERED.with(|c| c.set(true));
+        true
+    })
+}
+
+/// Rebuild the common fallback chain after the caller registers all system faces.
+#[wasm_bindgen]
+pub fn finish_system_fonts() -> bool {
+    SHARED_FONT_CONTEXT.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let Some(font_ctx) = borrow.as_mut() else {
+            return false;
+        };
+        rebuild_common_fallbacks(font_ctx);
+        true
+    })
+}
+
 pub fn get_or_init_font_context() -> FontContext {
     SHARED_FONT_CONTEXT.with(|cell| {
         let mut borrow = cell.borrow_mut();
@@ -1167,6 +1380,63 @@ mod tests {
 
     // A cluster may need a family face other than the best/default match.
     // Verify that the query offers every registered subset face.
+    #[test]
+    fn system_face_registration_maps_generic_and_script() {
+        use parley::fontique::FallbackKey;
+
+        let family = "Kitesurf System Test";
+        assert!(register_system_face(
+            NOTO_SANS_TEST_BYTES.to_vec(),
+            family.to_string(),
+            false
+        ));
+        assert!(!register_system_face(
+            NOTO_SANS_TEST_BYTES.to_vec(),
+            family.to_string(),
+            false
+        ));
+        assert!(map_system_generic(
+            "sans-serif".to_string(),
+            family.to_string()
+        ));
+        assert!(append_system_fallback(
+            "Latn".to_string(),
+            family.to_string()
+        ));
+        assert!(finish_system_fonts());
+
+        let mut ctx = get_or_init_font_context();
+        let generic: Vec<FamilyId> = ctx
+            .collection
+            .generic_families(GenericFamily::SansSerif)
+            .collect();
+        let generic_names: Vec<String> = generic
+            .iter()
+            .filter_map(|id| ctx.collection.family_name(*id).map(str::to_string))
+            .collect();
+        assert!(generic_names.iter().any(|name| name == family));
+
+        let fallback: Vec<FamilyId> = ctx
+            .collection
+            .fallback_families(FallbackKey::new(Script::from_bytes(*b"Latn"), None))
+            .collect();
+        let fallback_names: Vec<String> = fallback
+            .iter()
+            .filter_map(|id| ctx.collection.family_name(*id).map(str::to_string))
+            .collect();
+        assert!(fallback_names.iter().any(|name| name == family));
+
+        assert!(!map_system_generic(
+            "sans-serif".to_string(),
+            "absent".to_string()
+        ));
+        assert!(!register_system_face(
+            vec![1, 2, 3],
+            family.to_string(),
+            false
+        ));
+    }
+
     #[test]
     fn query_offers_all_same_attribute_family_faces() {
         use parley::fontique::{QueryFamily, QueryStatus};

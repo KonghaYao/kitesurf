@@ -195,6 +195,7 @@ import {
   noteNavigateText,
   scriptPendingPromises,
   fontDeferActive,
+  systemFontDiagnostics,
   startFontPrefetch,
   forceMonoFace,
   fontLoaderMode,
@@ -7028,6 +7029,7 @@ function queryDomPageState(): QueryDomResult<"getPageState"> {
     scrollY: state.scrollY,
     href,
     title,
+    fontDiagnostics: systemFontDiagnostics(),
   } satisfies QueryDomResult<"getPageState">;
 }
 

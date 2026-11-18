@@ -23,6 +23,7 @@ const OUTPUTS = [
   { dir: "packages/renderer-core/pkg" },
   { dir: "packages/engine/public/rbi" },
   { dir: "packages/dom-shim/dist" },
+  { dir: "packages/local-browser/font-host-bin", executable: true },
   { dir: "packages/page-script/dist" },
   { dir: "packages/page-renderer/dist" },
   { dir: "packages/worker-script/dist" },
@@ -38,7 +39,7 @@ function copyTree(source, target) {
   if (!statSync(source).isDirectory()) {
     rmSync(target, { force: true });
     copyFileSync(source, target);
-    chmodSync(target, 0o644);
+    chmodSync(target, statSync(source).mode & 0o111 ? 0o755 : 0o644);
     return 1;
   }
   mkdirSync(target, { recursive: true });

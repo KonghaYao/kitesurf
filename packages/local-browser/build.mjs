@@ -32,7 +32,10 @@ const nodeLicensePath = resolve(nodeBinary, "../../LICENSE");
 const options = {};
 for (let i = 2; i < process.argv.length; i += 2) {
   const flag = process.argv[i];
-  if (!["--out", "--dist", "--assets", "--portable"].includes(flag) || !process.argv[i + 1])
+  if (
+    !["--out", "--dist", "--assets", "--portable", "--font-host"].includes(flag) ||
+    !process.argv[i + 1]
+  )
     throw new Error(`Unknown or incomplete argument: ${flag}`);
   options[flag.slice(2)] = resolve(process.argv[i + 1]);
 }
@@ -48,21 +51,35 @@ function copyReleaseFile(source, destination) {
     throw new Error(`Release output aliases its source: ${destination}`);
   mkdirSync(dirname(destination), { recursive: true });
   rmSync(destination, { force: true });
-  writeFileSync(destination, readFileSync(source), { mode: 0o644 });
+  const mode = statSync(source).mode & 0o111 ? 0o755 : 0o644;
+  writeFileSync(destination, readFileSync(source), { mode });
 }
-function copyReleaseTree(source, destination) {
+function copyReleaseTree(source, destination, skip = null, prefix = "") {
   mkdirSync(destination, { recursive: true });
   for (const entry of readdirSync(source)) {
+    const relative = prefix ? `${prefix}/${entry}` : entry;
+    if (skip?.(relative)) continue;
     const from = join(source, entry);
     const to = join(destination, entry);
-    if (statSync(from).isDirectory()) copyReleaseTree(from, to);
+    if (statSync(from).isDirectory()) copyReleaseTree(from, to, skip, relative);
     else copyReleaseFile(from, to);
   }
 }
+const fontHostCandidates = [
+  process.env.KITESURF_FONT_HOST,
+  options["font-host"],
+  join(here, "font-host-bin", "kitesurf-font-host"),
+  join(here, "font-host", "kitesurf-font-host"),
+].filter(Boolean);
+const fontHost = fontHostCandidates.find((candidate) => existsSync(candidate));
+if (!fontHost) throw new Error("System font helper is missing from the package inputs");
+const resolvedFontHost = resolve(fontHost);
+const skipBundledFonts = (relative) => relative === "fonts" || relative.startsWith("fonts/");
 if (options.portable) {
   mkdirSync(options.portable, { recursive: true });
   copyReleaseTree(dist, join(options.portable, "engine"));
-  copyReleaseTree(assets, join(options.portable, "public"));
+  copyReleaseTree(assets, join(options.portable, "public"), skipBundledFonts);
+  copyReleaseFile(resolvedFontHost, join(options.portable, "font-host"));
   process.exit(0);
 }
 if (!existsSync(nodeLicensePath))
@@ -87,14 +104,16 @@ function addFile(source, destination) {
   files.push({ path: destination, mode, content: content.toString("base64") });
 }
 
-function addTree(source, destination) {
+function addTree(source, destination, skip = null, prefix = "") {
   for (const item of readdirSync(source, { withFileTypes: true }).sort((a, b) =>
     a.name.localeCompare(b.name),
   )) {
     if (item.name === "node_modules" || item.name.endsWith(".map")) continue;
+    const relative = prefix ? `${prefix}/${item.name}` : item.name;
+    if (skip?.(relative)) continue;
     const from = join(source, item.name);
     const to = `${destination}/${item.name}`;
-    if (statSync(from).isDirectory()) addTree(from, to);
+    if (statSync(from).isDirectory()) addTree(from, to, skip, relative);
     else addFile(from, to);
   }
 }
@@ -154,7 +173,8 @@ try {
   addTree(join(here, "src"), "src");
   addFile(join(here, "package.json"), "package.json");
   addTree(dist, "engine");
-  addTree(assets, "public");
+  addTree(assets, "public", skipBundledFonts);
+  addFile(resolvedFontHost, "font-host");
   const metadata = JSON.parse(readFileSync(join(here, "package.json"), "utf8"));
   for (const name of Object.keys(metadata.dependencies)) {
     links.push({ path: `node_modules/${name}`, target: addPackage(name, here) });

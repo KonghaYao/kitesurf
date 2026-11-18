@@ -43,7 +43,10 @@ copy_to_bin(
 filegroup(
     name = "fonts",
     srcs = glob(["public/fonts/**"]),
-    visibility = ["//packages/core:__pkg__"],
+    visibility = [
+        "//packages/core:__pkg__",
+        "//packages/local-browser/font-host:__pkg__",
+    ],
 )
 
 filegroup(
@@ -198,6 +201,7 @@ host_run(
         ":rbi_wasm",
         "//packages/core/pkg:pkg",
         "//packages/dom-shim:pkg",
+        "//packages/local-browser:font_host_bin",
         "//packages/page-renderer:pkg",
         "//packages/page-script:pkg",
         "//packages/renderer-core:wasm_pkg",

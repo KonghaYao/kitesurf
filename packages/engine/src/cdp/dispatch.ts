@@ -63,6 +63,8 @@ export interface DispatchCtx {
     KITESURF_PAGE_CPU_MS_CAP?: string;
     KITESURF_PAGE_WALL_MS_CAP?: string;
     KITESURF_ALLOW_PRIVATE_NETWORK?: string;
+    KITESURF_SYSTEM_FONTS?: string;
+    LOCAL_FONTS?: Fetcher;
     HOST_TRACER?: Tracer;
     HOST_CLOCK?: HostClock;
   };

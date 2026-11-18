@@ -265,7 +265,14 @@ export interface QueryDomMethods {
   };
   getPageState: {
     args: EmptyArgs;
-    result: { seq?: number; scrollX?: number; scrollY?: number; href?: string; title?: string };
+    result: {
+      seq?: number;
+      scrollX?: number;
+      scrollY?: number;
+      href?: string;
+      title?: string;
+      fontDiagnostics?: string[];
+    };
   };
   setControlValueAsUser: {
     args: { nodeId: number; value: unknown };

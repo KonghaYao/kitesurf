@@ -1,4 +1,5 @@
 load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_library")
+load("@bazel_lib//lib:copy_file.bzl", "copy_file")
 load("@npm//:defs.bzl", "npm_link_all_packages")
 load("//bazel:checks.bzl", "node_test", "workspace_configs")
 
@@ -16,7 +17,12 @@ node_test(
     timeout = "eternal",
     tags = ["manual"],
     args = ["test/soak.test.mjs"],
-    data = [":runtime", "//packages/engine:local_dist", "//packages/engine:assets"] + glob(["test/*.mjs"]),
+    data = [
+        ":runtime",
+        "//packages/engine:local_dist",
+        "//packages/engine:assets",
+        "//packages/local-browser/font-host:kitesurf-font-host",
+    ] + glob(["test/*.mjs"]),
 )
 
 node_test(
@@ -32,14 +38,40 @@ node_test(
     size = "large",
     timeout = "long",
     args = ["test/browser.test.mjs", "test/reconnect.test.mjs"],
-    data = [":runtime", "//:node_modules/pngjs", "//:node_modules/puppeteer-core", "//packages/engine:local_dist", "//packages/engine:assets"] + glob(["test/*.mjs"]),
+    data = [
+        ":runtime",
+        "//:node_modules/pngjs",
+        "//:node_modules/puppeteer-core",
+        "//packages/engine:local_dist",
+        "//packages/engine:assets",
+        "//packages/local-browser/font-host:kitesurf-font-host",
+    ] + glob(["test/*.mjs"]),
+)
+
+node_test(
+    name = "system_fonts_test",
+    size = "large",
+    timeout = "long",
+    args = ["test/system-fonts.test.mjs"],
+    data = [
+        ":runtime",
+        "//:node_modules/pngjs",
+        "//packages/engine:local_dist",
+        "//packages/engine:assets",
+        "//packages/local-browser/font-host:kitesurf-font-host",
+    ] + glob(["test/*.mjs"]),
 )
 
 node_test(
     name = "engine_loss_test",
     size = "medium",
     args = ["test/engine-loss.test.mjs"],
-    data = [":runtime", "//packages/engine:local_dist", "//packages/engine:assets"] + glob(["test/*.mjs"]),
+    data = [
+        ":runtime",
+        "//packages/engine:local_dist",
+        "//packages/engine:assets",
+        "//packages/local-browser/font-host:kitesurf-font-host",
+    ] + glob(["test/*.mjs"]),
 )
 
 node_test(
@@ -48,11 +80,24 @@ node_test(
     data = [":runtime"] + glob(["test/*.mjs"]),
 )
 
+copy_file(
+    name = "font_host_bin",
+    src = "//packages/local-browser/font-host:kitesurf-font-host",
+    out = "font-host-bin/kitesurf-font-host",
+    visibility = ["//packages/engine:__pkg__"],
+)
+
 js_binary(
     name = "package_from_dist",
     node_options = ["--expose-gc"],
     entry_point = "build.mjs",
-    data = [":runtime", ":node_modules/postject", "README.md", "//:release_licenses"] + glob(["src/*.cjs"]),
+    data = [
+        ":runtime",
+        ":node_modules/postject",
+        "README.md",
+        "//:release_licenses",
+        "//packages/local-browser/font-host:kitesurf-font-host",
+    ] + glob(["src/*.cjs"]),
     patch_node_fs = False,
 )
 
@@ -67,6 +112,7 @@ js_binary(
         "//:release_licenses",
         "//packages/engine:local_dist",
         "//packages/engine:assets",
+        "//packages/local-browser/font-host:kitesurf-font-host",
     ] + glob(["src/*.cjs"]),
     patch_node_fs = False,
 )

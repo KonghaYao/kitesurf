@@ -208,6 +208,14 @@ crate.from_cargo(
     supported_platform_triples = RUST_HOST_TRIPLES,
 )
 crate.from_cargo(
+    name = "crates_font_host",
+    cargo_lockfile = "//packages/local-browser/font-host:Cargo.lock",
+    host_tools = "@rust_tools",
+    manifests = ["//packages/local-browser/font-host:Cargo.toml"],
+    skip_cargo_lockfile_overwrite = True,
+    supported_platform_triples = RUST_HOST_TRIPLES,
+)
+crate.from_cargo(
     name = "crates_rust_check",
     cargo_lockfile = "//scripts/lint/rust-check:Cargo.lock",
     host_tools = "@rust_tools",
@@ -249,7 +257,7 @@ rust_library(
     crate = "vello_cpu",
     repositories = ["crates"],
 )
-use_repo(crate, "crates", "crates_cli", "crates_memprof", "crates_renderer", "crates_rust_check", "crates_scene_host")
+use_repo(crate, "crates", "crates_cli", "crates_font_host", "crates_memprof", "crates_renderer", "crates_rust_check", "crates_scene_host")
 use_repo(
     crate,
     "crates__boa_gc-0.22.0",

@@ -1,0 +1,52 @@
+load("@crates_font_host//:defs.bzl", "all_crate_deps")
+load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("//bazel:rust_checks.bzl", "rust_comments_test", "rust_nesting_test")
+
+cargo_toml_env_vars(
+    name = "cargo_env",
+    src = "Cargo.toml",
+)
+
+rust_library(
+    name = "kitesurf_font_host",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "kitesurf_font_host",
+    crate_root = "src/lib.rs",
+    edition = "2021",
+    rustc_env_files = [":cargo_env"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "kitesurf-font-host",
+    visibility = ["//packages/local-browser:__pkg__", "//packages/engine:__pkg__"],
+    srcs = ["src/main.rs"],
+    crate_name = "kitesurf_font_host_bin",
+    edition = "2021",
+    rustc_env_files = [":cargo_env"],
+    deps = [":kitesurf_font_host"] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "unit_test",
+    size = "medium",
+    compile_data = ["//packages/engine:fonts"],
+    crate = ":kitesurf_font_host",
+    edition = "2021",
+    rustc_env_files = [":cargo_env"],
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_comments_test(
+    name = "comments_test",
+    srcs = glob(["src/**/*.rs"]),
+)
+
+rust_nesting_test(
+    name = "nesting_test",
+    srcs = glob(["src/**/*.rs"]),
+)

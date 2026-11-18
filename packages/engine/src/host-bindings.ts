@@ -13,5 +13,9 @@ declare global {
     HOST_TRACER?: import("./tracing.ts").Tracer;
     // Epoch clock for engine-side timing; Date.now is used when unset.
     HOST_CLOCK?: import("./eval/host-clock.ts").HostClock;
+    // Local host only: bounded system-font selection over a private service binding.
+    LOCAL_FONTS?: Fetcher;
+    // Local host only: PageScript selects system faces instead of bundled Noto files.
+    KITESURF_SYSTEM_FONTS?: string;
   }
 }

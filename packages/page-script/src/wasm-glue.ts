@@ -122,6 +122,16 @@ export declare function register_cjk_font(bytes: Uint8Array): boolean;
 
 export declare function register_script_font(bytes: Uint8Array, script_tag: string): boolean;
 
+export declare function register_system_face(
+  bytes: Uint8Array,
+  family: string,
+  mono: boolean,
+): boolean;
+export declare function map_system_generic(generic: string, family: string): boolean;
+export declare function append_system_fallback(script_tag: string, family: string): boolean;
+export declare function append_system_emoji(family: string): boolean;
+export declare function finish_system_fonts(): boolean;
+
 export declare function setPixelFreeSession(enabled: boolean): void;
 
 export declare function setFontShapingLazy(enabled: boolean): void;

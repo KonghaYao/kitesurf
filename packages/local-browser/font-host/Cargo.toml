@@ -1,0 +1,23 @@
+[package]
+name = "kitesurf-font-host"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[lib]
+name = "kitesurf_font_host"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kitesurf-font-host"
+path = "src/main.rs"
+
+[dependencies]
+fontique = { version = "=0.12.0", features = ["fontconfig-dlopen"] }
+libc = "0.2"
+read-fonts = "=0.41.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

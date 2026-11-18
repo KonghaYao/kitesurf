@@ -10,6 +10,7 @@ import { once } from "node:events";
 import WebSocket, { WebSocketServer } from "ws";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
 import { Attachments } from "./attachments.mjs";
+import { resolveFontHost, startFontHost } from "./font-host.mjs";
 
 const VIEW_METHODS = new Set([
   "Browser.getVersion",
@@ -76,9 +77,12 @@ export async function startBrowser({
   assets,
   port = 8787,
   allowPrivateNetwork = false,
+  fontHost,
 }) {
   const restored = profile.status().revision > 0;
   process.env.MINIFLARE_WORKERD_V8_FLAGS ??= "--expose-gc";
+  const fontHostPath = fontHost || resolveFontHost(resolve(import.meta.dirname, ".."));
+  const systemFonts = await startFontHost({ binary: fontHostPath });
   const base = JSON.parse(readFileSync(resolve(dist, "engine-mf.json"), "utf8"));
   const mf = new Miniflare(
     convertV4MiniflareOptions({
@@ -98,8 +102,12 @@ export async function startBrowser({
             KITESURF_VERSION: "0.5.0",
             KITESURF_RESOURCE_DRAIN_QUIET_TURNS: "5",
             KITESURF_ALLOW_PRIVATE_NETWORK: allowPrivateNetwork ? "1" : "",
+            KITESURF_SYSTEM_FONTS: "1",
           },
-          serviceBindings: { LOCAL_PROFILE: (request) => profile.fetch(request) },
+          serviceBindings: {
+            LOCAL_PROFILE: (request) => profile.fetch(request),
+            LOCAL_FONTS: (request) => systemFonts.fetch(request),
+          },
         },
       ],
     }),
@@ -232,9 +240,13 @@ export async function startBrowser({
           await mf.dispose();
         } finally {
           try {
-            profile.close();
+            await systemFonts.close();
           } finally {
-            finished(reason);
+            try {
+              profile.close();
+            } finally {
+              finished(reason);
+            }
           }
         }
       })();
@@ -446,6 +458,7 @@ export async function startBrowser({
     upstream?.close();
     http?.close();
     await mf.dispose();
+    await systemFonts.close().catch(() => {});
     throw error;
   }
 }

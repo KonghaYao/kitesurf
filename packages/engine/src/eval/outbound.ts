@@ -41,7 +41,13 @@ import { looksLikeSvg, sniffImageDims } from "./image-dims.ts";
 import { MAX_ENTRY_BYTES, putAuthorFont, putOpaqueImage } from "./resource-store.ts";
 import { MAX_SHAPED_FONT_BYTES, shapeFontBytes } from "./font-shaping.ts";
 import { engineIsolateId, isForeignIsolate } from "./isolate-id.ts";
-import { readCapped, readCappedBudgeted, withDeadline } from "../read-capped.ts";
+import {
+  declaredOverCap,
+  readCapped,
+  readCappedBudgeted,
+  readCappedBytes,
+  withDeadline,
+} from "../read-capped.ts";
 import {
   KITESURF_CORS_VERDICT_HEADER,
   KITESURF_NOSNIFF_HEADER,
@@ -105,6 +111,22 @@ export interface OutboundProps {
 }
 
 const ASSET_SENTINEL_HOST = "kitesurf-fonts";
+
+const MAX_SYSTEM_FONT_BYTES = 24 * 1024 * 1024;
+
+const SYSTEM_FAMILIES = new Set([
+  "sans",
+  "sans-serif",
+  "ui-sans",
+  "serif",
+  "ui-serif",
+  "mono",
+  "monospace",
+  "ui-mono",
+  "system-ui",
+  "emoji",
+  "script",
+]);
 
 const ASSET_CACHE_MAX_ENTRY_BYTES = 1_048_576;
 const ASSET_CACHE_MAX_TOTAL_BYTES = 4_194_304;
@@ -186,6 +208,8 @@ function noteForeignIsolate(connectionId: string): void {
 
 export type SandboxOutboundEnv = WbaEnv & {
   FONT_ASSETS: { fetch(req: Request): Promise<Response> };
+  /** Private local-host binding for bounded system-font selection. */
+  LOCAL_FONTS?: { fetch(req: Request): Promise<Response> };
   HOST_TRACER?: Tracer;
   /** "1" lets page-chosen requests reach loopback and private addresses. */
   KITESURF_ALLOW_PRIVATE_NETWORK?: string;
@@ -394,6 +418,85 @@ export class SandboxOutbound extends WorkerEntrypoint<SandboxOutboundEnv, Outbou
     );
   }
 
+  private static async fetchSystemFont(
+    env: SandboxOutboundEnv,
+    parsedUrl: URL,
+    props: OutboundProps | undefined,
+  ): Promise<Response> {
+    const binding = env.LOCAL_FONTS;
+    if (!binding) return new Response("system fonts unavailable", { status: 404 });
+    const connectionId = props?.connectionId ?? "";
+    const params = parsedUrl.searchParams;
+    let path: string;
+    let body: string;
+    if (parsedUrl.pathname === "/system/match") {
+      const family = params.get("family") ?? "";
+      const script = params.get("script") ?? undefined;
+      const locale = params.get("locale") ?? undefined;
+      const style = params.get("style") ?? "normal";
+      const text = params.get("text") ?? undefined;
+      const weight = Number(params.get("weight") ?? "400");
+      if (!SYSTEM_FAMILIES.has(family)) return new Response("invalid family", { status: 400 });
+      if (script !== undefined && !/^[A-Za-z]{4}$/.test(script))
+        return new Response("invalid script", { status: 400 });
+      if (locale !== undefined && !/^[A-Za-z0-9_-]{1,32}$/.test(locale))
+        return new Response("invalid locale", { status: 400 });
+      if (!["normal", "italic", "oblique"].includes(style))
+        return new Response("invalid style", { status: 400 });
+      if (!Number.isFinite(weight) || weight < 1 || weight > 1000)
+        return new Response("invalid weight", { status: 400 });
+      if (text !== undefined && (text.length > 4096 || [...text].length > 256))
+        return new Response("text sample too large", { status: 400 });
+      path = "match";
+      body = JSON.stringify({ family, script, locale, style, weight, text });
+    } else {
+      const id = params.get("id") ?? "";
+      if (!/^[0-9a-f]{32}$/.test(id)) return new Response("invalid font id", { status: 400 });
+      path = "face";
+      body = JSON.stringify({ id });
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15_000);
+    let response: Response;
+    try {
+      response = await binding.fetch(
+        new Request(`http://local-fonts/${path}`, {
+          method: "POST",
+          body,
+          signal: controller.signal,
+        }),
+      );
+    } catch {
+      return new Response("system font request failed", { status: 504 });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      return new Response("system font request failed", { status: 502 });
+    }
+    const cap = path === "face" ? MAX_SYSTEM_FONT_BYTES : 64 * 1024;
+    if (declaredOverCap(response.headers, cap)) {
+      await response.body?.cancel().catch(() => {});
+      return new Response("system font response too large", { status: 502 });
+    }
+    const stream = response.body ? withDeadline(response.body, 20_000) : null;
+    const read = await readCappedBytes(
+      new Response(stream, { headers: response.headers }),
+      cap,
+      connectionId,
+    );
+    if (!read.ok) return new Response("system font response failed", { status: 502 });
+    return new Response(read.bytes, {
+      status: 200,
+      headers: {
+        "content-type": path === "face" ? "font/otf" : "application/json",
+        "cache-control": "no-store",
+      },
+    });
+  }
+
   private static async fetchAsset(env: SandboxOutboundEnv, parsedUrl: URL): Promise<Response> {
     const key = parsedUrl.pathname + parsedUrl.search;
     const hit = assetCache.get(key);
@@ -426,6 +529,8 @@ export class SandboxOutbound extends WorkerEntrypoint<SandboxOutboundEnv, Outbou
       parsedUrl = new URL(request.url);
     } catch {}
     if (parsedUrl && parsedUrl.hostname === ASSET_SENTINEL_HOST) {
+      if (parsedUrl.pathname === "/system/match" || parsedUrl.pathname === "/system/face")
+        return SandboxOutbound.fetchSystemFont(env, parsedUrl, props);
       return SandboxOutbound.fetchAsset(env, parsedUrl);
     }
 

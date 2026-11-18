@@ -196,6 +196,8 @@ declare module "devtools-protocol" {
         scrollY?: number;
         href?: string;
         title?: string;
+        /** Local system-font coverage and registration diagnostics. */
+        fontDiagnostics?: string[];
         error?: string;
       }
 

@@ -44,6 +44,8 @@ packages/renderer-core/pkg/
 packages/engine/public/rbi/
 # The DevTools frontend that `--config=devtools` stages (packages/engine:bundle_devtools).
 packages/engine/public/inspector/
+# Dev staging for the local system-font helper (`bazel run //packages/engine:dev_build`).
+packages/local-browser/font-host-bin/
 
 # Web Platform Tests checkout (shallow clone via `npm run wpt:setup`).
 .wpt/
@@ -60,6 +62,10 @@ packages/engine/public/inspector/
 **/PLAN*.md
 **/FINDINGS*.md
 **/TODO*.md
+
+# Workflow orchestration logs (journals, generated role scripts). Tool output, not product source;
+# the rest of .claude/ stays tracked so shared user/project configuration is visible.
+.claude/workflow-runs/
 
 # local secrets (never committed)
 .secrets/
