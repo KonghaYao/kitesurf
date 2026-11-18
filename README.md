@@ -2,25 +2,67 @@
 
 # Kitesurf
 
-This fork adds a **v0.5 local browser**: one executable with embedded workerd, SQLite account
-profiles and live sessions that survive CDP disconnects. It runs without a Cloudflare account.
-See [local browser usage and builds](packages/local-browser/README.md). The documentation below
-describes the upstream engine and its optional Cloudflare deployment.
-
 Kitesurf is an experimental browser engine that runs on Cloudflare Workers. It
 parses HTML, applies CSS, runs page JavaScript, and renders screenshots without
-Chrome or a browser container.
+Chrome or a browser container. It speaks the
+[Chrome DevTools Protocol (CDP)](https://chromedevtools.github.io/devtools-protocol/),
+so CDP clients such as Puppeteer and Playwright can drive it.
 
-Kitesurf speaks the [Chrome DevTools Protocol (CDP)](https://chromedevtools.github.io/devtools-protocol/),
-so you can use it with CDP clients such as Puppeteer.
+This fork adds a standalone **local browser**: one executable with embedded
+workerd, Node, the engine and fonts, a SQLite account profile, and pages that
+stay alive when a CDP client disconnects. It needs no Cloudflare account and no
+cloud deployment.
+
+## Download and run the local browser
+
+The shortest install uses [mise](https://mise.jdx.dev/), which selects the right
+archive for the current platform:
+
+```bash
+mise use -g github:KonghaYao/kitesurf@0.5.0
+kitesurf serve
+```
+
+Use `mise use -g github:KonghaYao/kitesurf@latest` to pick up later releases.
+Without mise, download the platform archive directly. Linux builds require glibc
+2.35 or later. The example uses macOS; on Linux, replace `darwin-arm64` with
+`linux-x64` or `linux-arm64`:
+
+```bash
+curl -LO https://github.com/KonghaYao/kitesurf/releases/download/v0.5.0/kitesurf-0.5.0-darwin-arm64.tar.gz
+shasum -a 256 -c kitesurf-0.5.0-darwin-arm64.tar.gz.sha256
+tar -xzf kitesurf-0.5.0-darwin-arm64.tar.gz
+./kitesurf serve
+```
+
+On Linux, verify the archive with `sha256sum -c` instead of `shasum -a 256 -c`.
+
+The browser listens on `ws://127.0.0.1:8787/devtools/browser`. Use `./kitesurf
+status`, `flush`, `backup`, `stop`, and `profile create` to manage the running
+browser and its profile. See
+[local browser usage and builds](packages/local-browser/README.md) for profiles,
+reconnect behavior, control ownership, and build details.
+
+To build the standalone browser from source instead, run:
+
+```bash
+bazel run //packages/local-browser:package
+./dist/local-browser/kitesurf serve
+```
+
+The output includes the executable, licenses, a dependency inventory, and its
+SHA-256 checksum.
 
 > [!IMPORTANT]
-> Kitesurf requires Cloudflare Dynamic Workers to create isolated workers for
-> pages. Dynamic Workers are part of the [Workers Paid plan](https://developers.cloudflare.com/dynamic-workers/pricing/).
-> Local development uses `wrangler dev`. A Cloudflare Workers Paid plan is
-> required to run Kitesurf on Cloudflare.
+> Deploying the engine to Cloudflare requires Dynamic Workers, which are part
+> of the [Workers Paid plan](https://developers.cloudflare.com/dynamic-workers/pricing/).
+> The local browser above does not use Cloudflare. The rest of this document
+> covers the upstream engine, local development with `wrangler dev`, and the
+> optional Cloudflare deployment.
 
 ## Requirements
+
+The released local browser needs none of these. Building from source requires:
 
 - [Bazelisk](https://github.com/bazelbuild/bazelisk), installed as `bazel`.
   Bazel builds everything. It downloads the pinned Bazel, Rust toolchains,
@@ -37,12 +79,12 @@ Install pnpm separately if it is not already available:
 npm install --global pnpm@9.15.4
 ```
 
-## Build and run locally
+## Build and run the engine locally
 
-Clone the repository and install its dependencies:
+Clone this fork and install its dependencies:
 
 ```bash
-git clone https://github.com/cloudflare/kitesurf.git
+git clone https://github.com/KonghaYao/kitesurf.git
 cd kitesurf
 pnpm install --frozen-lockfile
 ```
@@ -262,6 +304,17 @@ the source tree, where `wrangler dev` reads them. Other targets run directly,
 for example `bazel test //tests/e2e:gate` for the full e2e suite. Another Bazel
 workspace can depend on this repository as a module.
 
+## Releases
+
+Pushing a tag that matches `v0.5.*` runs the local browser release workflow. It
+checks the source, builds the standalone executable for Linux x64, Linux arm64
+and macOS arm64, verifies each binary, and creates a draft GitHub release with
+`.tar.gz` archives and `.sha256` checksums. Publish the draft before sharing the
+download links. A manual workflow run builds the artifacts without creating a
+release.
+
+The Rust terminal client keeps its own `cli-v*` tag trigger.
+
 ## Technology stack
 
 Kitesurf combines several open-source Rust projects:
@@ -376,6 +429,7 @@ documentation before planning a Cloudflare deployment.
 | Package                                        | Description                                    |
 | ---------------------------------------------- | ---------------------------------------------- |
 | [`engine`](packages/engine/)                   | Cloudflare Worker and CDP server               |
+| [`local-browser`](packages/local-browser/)     | Standalone local browser and profile host      |
 | [`page-script`](packages/page-script/)         | Page DOM and JavaScript runtime                |
 | [`page-renderer`](packages/page-renderer/)     | Renderer for recorded page scenes              |
 | [`dom-shim`](packages/dom-shim/)               | DOM APIs inside the page worker                |
