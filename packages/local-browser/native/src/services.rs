@@ -34,6 +34,134 @@ use crate::HostResult;
 
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum StatusFields {
+    Memory {
+        bytes: usize,
+        loads: u64,
+        revision: i64,
+        saves: u64,
+    },
+    Sqlite {
+        format: i64,
+        id: String,
+        path: String,
+        revision: i64,
+    },
+}
+
+struct StatusOwner {
+    fields: StatusFields,
+    _lease: crate::transport::PayloadLease,
+}
+
+/// 字段数量固定；所有动态文本与 Arc 记录先收费，同一 owner 共享数据和 lease。
+#[derive(Clone)]
+pub struct LeasedProfileStatus(Arc<StatusOwner>);
+
+impl serde::Serialize for LeasedProfileStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.fields.serialize(serializer)
+    }
+}
+
+impl LeasedProfileStatus {
+    const OWNER_BYTES: usize =
+        std::mem::size_of::<StatusOwner>() + 2 * std::mem::size_of::<usize>();
+
+    pub(crate) fn memory(
+        budget: &crate::transport::PayloadBudget,
+        bytes: usize,
+        loads: u64,
+        revision: i64,
+        saves: u64,
+    ) -> Result<Self, ProfileError> {
+        let lease = budget
+            .try_acquire(Self::OWNER_BYTES, false)
+            .ok_or_else(ProfileError::conflict)?;
+        Ok(Self(Arc::new(StatusOwner {
+            fields: StatusFields::Memory {
+                bytes,
+                loads,
+                revision,
+                saves,
+            },
+            _lease: lease,
+        })))
+    }
+
+    pub(crate) fn sqlite(
+        budget: &crate::transport::PayloadBudget,
+        path: &Path,
+        revision: i64,
+        format: i64,
+        id: &str,
+    ) -> Result<Self, ProfileError> {
+        use std::fmt::Write;
+        let mut counter = StatusPathWriter {
+            text: None,
+            length: 0,
+            limit: usize::MAX,
+        };
+        write!(counter, "{}", path.display()).map_err(|_| ProfileError::conflict())?;
+        let bytes = counter
+            .length
+            .checked_add(id.len())
+            .and_then(|n| n.checked_add(Self::OWNER_BYTES))
+            .ok_or_else(ProfileError::conflict)?;
+        let lease = budget
+            .try_acquire(bytes, false)
+            .ok_or_else(ProfileError::conflict)?;
+        let mut writer = StatusPathWriter {
+            text: Some(String::with_capacity(counter.length)),
+            length: 0,
+            limit: counter.length,
+        };
+        write!(writer, "{}", path.display()).map_err(|_| ProfileError::conflict())?;
+        let path = writer.text.ok_or_else(ProfileError::conflict)?;
+        let id = id.to_owned();
+        if path
+            .capacity()
+            .checked_add(id.capacity())
+            .and_then(|n| n.checked_add(Self::OWNER_BYTES))
+            != Some(lease.bytes())
+        {
+            return Err(ProfileError::conflict());
+        }
+        Ok(Self(Arc::new(StatusOwner {
+            fields: StatusFields::Sqlite {
+                format,
+                id,
+                path,
+                revision,
+            },
+            _lease: lease,
+        })))
+    }
+}
+
+struct StatusPathWriter {
+    text: Option<String>,
+    length: usize,
+    limit: usize,
+}
+
+impl std::fmt::Write for StatusPathWriter {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        let length = self
+            .length
+            .checked_add(text.len())
+            .filter(|n| *n <= self.limit)
+            .ok_or(std::fmt::Error)?;
+        if let Some(destination) = &mut self.text {
+            destination.push_str(text);
+        }
+        self.length = length;
+        Ok(())
+    }
+}
+
 pub struct ServicePaths {
     pub profile: PathBuf,
     pub assets: PathBuf,
@@ -55,6 +183,10 @@ pub trait ProfileBackend: Send + Sync {
         state: Option<&StateJson>,
     ) -> Result<(), ProfileError>;
     fn status(&self) -> Result<Value, ProfileError>;
+    fn leased_status(
+        &self,
+        budget: &crate::transport::PayloadBudget,
+    ) -> Result<LeasedProfileStatus, ProfileError>;
     fn kind(&self) -> &'static str;
     fn display(&self) -> String;
 }
@@ -116,6 +248,20 @@ impl ProfileService {
         })
         .await;
         result.map_err(|_| ProfileError::conflict())?
+    }
+
+    pub async fn leased_status(
+        &self,
+        budget: crate::transport::PayloadBudget,
+    ) -> Result<LeasedProfileStatus, ProfileError> {
+        let guard = self.begin();
+        let backend = self.backend.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            backend.leased_status(&budget)
+        })
+        .await
+        .map_err(|_| ProfileError::conflict())?
     }
 
     /// 计数归阻塞闭包所有：调用方被取消时，数据库操作结束前计数不会归零。
@@ -228,6 +374,22 @@ impl ProfileBackend for MemoryProfile {
         }))
     }
 
+    fn leased_status(
+        &self,
+        budget: &crate::transport::PayloadBudget,
+    ) -> Result<LeasedProfileStatus, ProfileError> {
+        let inner = self.inner.lock().map_err(|_| ProfileError::conflict())?;
+        let result = LeasedProfileStatus::memory(
+            budget,
+            inner.state_text.len(),
+            inner.loads,
+            inner.revision,
+            inner.saves,
+        );
+        drop(inner);
+        result
+    }
+
     fn kind(&self) -> &'static str {
         "memory"
     }
@@ -269,6 +431,15 @@ impl ProfileBackend for SqliteProfile {
 
     fn status(&self) -> Result<Value, ProfileError> {
         self.store.status().map(|status| status.to_json())
+    }
+
+    fn leased_status(
+        &self,
+        budget: &crate::transport::PayloadBudget,
+    ) -> Result<LeasedProfileStatus, ProfileError> {
+        self.store.with_status(|path, revision, format, id| {
+            LeasedProfileStatus::sqlite(budget, path, revision, format, id)
+        })
     }
 
     fn kind(&self) -> &'static str {
@@ -361,6 +532,13 @@ impl ProfileBackend for FaultProfile {
 
     fn status(&self) -> Result<Value, ProfileError> {
         self.inner.status()
+    }
+
+    fn leased_status(
+        &self,
+        budget: &crate::transport::PayloadBudget,
+    ) -> Result<LeasedProfileStatus, ProfileError> {
+        self.inner.leased_status(budget)
     }
 
     fn kind(&self) -> &'static str {
@@ -1012,6 +1190,46 @@ fn parse_range(header: &str, length: usize) -> RangeOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_status_preserves_fixed_fields_numbers_and_path_display() {
+        use std::os::unix::ffi::OsStringExt;
+        let budget = crate::transport::PayloadBudget::default();
+        let memory = MemoryProfile::new("http://fixture.invalid").unwrap();
+        {
+            let mut inner = memory.inner.lock().unwrap();
+            inner.loads = u64::MAX;
+            inner.saves = u64::MAX - 1;
+            inner.revision = 9_007_199_254_740_991;
+        }
+        assert_eq!(
+            serde_json::to_value(memory.leased_status(&budget).unwrap()).unwrap(),
+            memory.status().unwrap()
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("状态\"\\\n\u{1f600}.db");
+        let sqlite = SqliteProfile::open(&path, true).unwrap();
+        let status = sqlite.leased_status(&budget).unwrap();
+        assert_eq!(
+            serde_json::to_value(&status).unwrap(),
+            sqlite.status().unwrap()
+        );
+        for path in [
+            PathBuf::from("/长\"\\\n\u{1f600}/".repeat(20_000)),
+            PathBuf::from(std::ffi::OsString::from_vec(b"/invalid-\xff-\xfe".to_vec())),
+        ] {
+            let id = "id\"\\\n\u{1f600}".repeat(10_000);
+            let status =
+                LeasedProfileStatus::sqlite(&budget, &path, i64::MAX, i64::MIN, &id).unwrap();
+            let old = profile::ProfileStatus {
+                path,
+                revision: i64::MAX,
+                format: i64::MIN,
+                id,
+            };
+            assert_eq!(serde_json::to_value(&status).unwrap(), old.to_json());
+        }
+    }
 
     #[test]
     fn ranges_are_single_and_exact() {

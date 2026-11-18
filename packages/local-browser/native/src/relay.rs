@@ -334,7 +334,10 @@ async fn handle_request(
         ),
         (Method::GET, "/json") | (Method::GET, "/json/list") => targets_body(&context).await,
         (Method::POST, "/flush") => match context.broker.flush().await {
-            Ok(status) => json_response(StatusCode::OK, status.to_string()),
+            Ok(status) => match budgeted_body(&context.broker.payload_budget(), &status) {
+                Some(body) => json_response(StatusCode::OK, body),
+                None => error_response(StatusCode::CONFLICT, "Profile status unavailable"),
+            },
             Err(message) => error_response(StatusCode::CONFLICT, &message),
         },
         (Method::POST, "/control") => control(&context, request).await,
@@ -420,27 +423,40 @@ async fn json_body(request: Request<Incoming>) -> Result<Value, String> {
 }
 
 fn budgeted_json<T: serde::Serialize>(context: &HostContext, value: &T) -> Response<Full<Bytes>> {
+    let Some(body) = budgeted_body(&context.broker.payload_budget(), value) else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "Payload budget exhausted");
+    };
+    json_response(StatusCode::OK, body)
+}
+
+pub(crate) fn budgeted_body<T: serde::Serialize>(
+    budget: &crate::transport::PayloadBudget,
+    value: &T,
+) -> Option<Bytes> {
     struct Body {
         text: String,
         _lease: PayloadLease,
+        _metadata: PayloadLease,
     }
     impl AsRef<[u8]> for Body {
         fn as_ref(&self) -> &[u8] {
             self.text.as_bytes()
         }
     }
-    let Some((text, lease)) =
-        crate::transport::serialize_payload(&context.broker.payload_budget(), value, false)
-    else {
-        return error_response(StatusCode::SERVICE_UNAVAILABLE, "Payload budget exhausted");
-    };
-    json_response(
-        StatusCode::OK,
-        Bytes::from_owner(Body {
-            text,
-            _lease: lease,
-        }),
-    )
+    // bytes 的 owner 只有固定记录、引用计数和对齐；与输出 backing 一起留到最后一个 clone。
+    let metadata = budget.try_acquire(
+        std::mem::size_of::<Body>() + 2 * std::mem::size_of::<usize>(),
+        false,
+    )?;
+    let (text, lease) = crate::transport::serialize_payload(budget, value, false)?;
+    if text.capacity() > lease.bytes() {
+        return None;
+    }
+    Some(Bytes::from_owner(Body {
+        text,
+        _lease: lease,
+        _metadata: metadata,
+    }))
 }
 
 async fn session_body(context: &HostContext) -> Response<Full<Bytes>> {
@@ -451,7 +467,11 @@ async fn session_body(context: &HostContext) -> Response<Full<Bytes>> {
         Ok(tabs) => tabs,
         Err(message) => return error_response(StatusCode::CONFLICT, &message),
     };
-    let profile = match context.profile.status().await {
+    let profile = match context
+        .profile
+        .leased_status(context.broker.payload_budget())
+        .await
+    {
         Ok(status) => status,
         Err(_) => return error_response(StatusCode::CONFLICT, "Profile status unavailable"),
     };
@@ -463,7 +483,7 @@ async fn session_body(context: &HostContext) -> Response<Full<Bytes>> {
         generation: &'a str,
         alive: bool,
         recovery: &'a str,
-        profile: &'a Value,
+        profile: &'a crate::services::LeasedProfileStatus,
         controller: &'a Option<String>,
         control_epoch: u64,
         tabs: &'a T,
@@ -617,6 +637,67 @@ mod raw_output_tests {
     use super::*;
     use crate::cdp_raw::LeasedRaw;
     use crate::transport::{PayloadBudget, MAX_FRAME_BYTES};
+
+    #[tokio::test]
+    async fn typed_profile_body_cancel_writer_failure_and_budget_release() {
+        use crate::services::{MemoryProfile, ProfileBackend, SqliteProfile};
+        use crate::transport::ORDINARY_BYTES;
+        use tokio::io::AsyncWriteExt;
+        let budget = PayloadBudget::default();
+        let directory = tempfile::tempdir().unwrap();
+        let memory = MemoryProfile::new("http://fixture.invalid").unwrap();
+        let sqlite = SqliteProfile::open(&directory.path().join("状态.db"), true).unwrap();
+        for backend in [
+            &memory as &dyn ProfileBackend,
+            &sqlite as &dyn ProfileBackend,
+        ] {
+            let status = backend.leased_status(&budget).unwrap();
+            let baseline = budget.used();
+            let held = budget
+                .try_acquire(ORDINARY_BYTES - baseline.0, false)
+                .unwrap();
+            assert!(budgeted_body(&budget, &status).is_none());
+            drop(held);
+            assert_eq!(budget.used(), baseline);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tx.send(status.clone()).ok().unwrap();
+            drop(rx);
+            assert_eq!(budget.used(), baseline);
+            let bytes = budgeted_body(&budget, &status).unwrap();
+            let body = Full::new(bytes);
+            drop(status);
+            assert!(budget.used().0 > MAX_FRAME_BYTES);
+            let writer_held = body.collect().await.unwrap().to_bytes();
+            let (mut writer, reader) = tokio::io::duplex(1);
+            drop(reader);
+            assert!(writer.write_all(&writer_held).await.is_err());
+            assert!(budget.used().0 >= MAX_FRAME_BYTES + writer_held.len());
+            drop(writer_held);
+            assert_eq!(budget.used(), (MAX_FRAME_BYTES, 0));
+            let status = backend.leased_status(&budget).unwrap();
+            let body = Full::new(budgeted_body(&budget, &status).unwrap());
+            drop(status);
+            drop(body);
+            assert_eq!(budget.used(), (MAX_FRAME_BYTES, 0));
+        }
+    }
+
+    #[test]
+    fn typed_body_serialization_failure_releases_provisional_output() {
+        use std::cell::Cell;
+        struct FailsOnWrite(Cell<bool>);
+        impl serde::Serialize for FailsOnWrite {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                if self.0.replace(true) {
+                    return Err(serde::ser::Error::custom("synthetic serialization failure"));
+                }
+                serializer.serialize_str("fixture")
+            }
+        }
+        let budget = PayloadBudget::default();
+        assert!(budgeted_body(&budget, &FailsOnWrite(Cell::new(false))).is_none());
+        assert_eq!(budget.used(), (MAX_FRAME_BYTES, 0));
+    }
 
     #[test]
     fn session_fields_drop_unknown_raw_and_lease_long_decoded_text() {

@@ -172,6 +172,21 @@ impl ProfileStore {
     }
 
     pub fn status(&self) -> Result<ProfileStatus, ProfileError> {
+        self.with_status(|path, revision, format, id| {
+            Ok(ProfileStatus {
+                path: path.to_path_buf(),
+                revision,
+                format,
+                id: id.to_owned(),
+            })
+        })
+    }
+
+    /// 借用字段仅在同步回调内有效；调用方在复制前取得自身的容量预算。
+    pub(crate) fn with_status<T>(
+        &self,
+        view: impl FnOnce(&Path, i64, i64, &str) -> Result<T, ProfileError>,
+    ) -> Result<T, ProfileError> {
         let inner = self.lock()?;
         let revision: i64 = inner
             .connection
@@ -183,12 +198,21 @@ impl ProfileStore {
             .contains(&revision)
             .then_some(())
             .ok_or_else(ProfileError::conflict)?;
-        Ok(ProfileStatus {
-            path: self.path.clone(),
+        let digest = Sha256::digest(self.path.as_os_str().as_encoded_bytes());
+        let mut id = [0u8; 16];
+        for (index, byte) in digest.iter().take(8).enumerate() {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            id[index * 2] = HEX[(byte >> 4) as usize];
+            id[index * 2 + 1] = HEX[(byte & 15) as usize];
+        }
+        let result = view(
+            &self.path,
             revision,
-            format: FORMAT,
-            id: profile_id(&self.path),
-        })
+            FORMAT,
+            std::str::from_utf8(&id).map_err(|_| ProfileError::conflict())?,
+        );
+        drop(inner);
+        result
     }
 
     /// 在同一持锁连接上 VACUUM INTO；目标先独占创建，失败只清理本次创建的文件。
@@ -480,16 +504,6 @@ fn absolute(path: &Path) -> HostResult<PathBuf> {
         std::env::current_dir()?.join(path)
     };
     Ok(path)
-}
-
-fn profile_id(path: &Path) -> String {
-    let digest = Sha256::digest(path.as_os_str().as_encoded_bytes());
-    let mut id = String::with_capacity(16);
-    for byte in digest.iter().take(8) {
-        use std::fmt::Write;
-        let _ = write!(id, "{byte:02x}");
-    }
-    id
 }
 
 fn db_error(_: rusqlite::Error) -> ProfileError {

@@ -337,7 +337,7 @@ enum BrokerCommand {
         reply: oneshot::Sender<Result<(String, u64), ControlError>>,
     },
     Flush {
-        reply: oneshot::Sender<Result<Value, String>>,
+        reply: oneshot::Sender<Result<crate::services::LeasedProfileStatus, String>>,
     },
     Close {
         kind: CloseKind,
@@ -358,7 +358,7 @@ enum BrokerCommand {
     ReceiveAck(LeasedRaw, oneshot::Sender<(bool, usize)>),
     ProfileStatus {
         token: u64,
-        result: Result<Value, String>,
+        result: Result<crate::services::LeasedProfileStatus, String>,
     },
 }
 
@@ -638,7 +638,7 @@ impl BrokerHandle {
             .unwrap_or_else(|_| Err(ControlError::Other("browser session is lost".into())))
     }
 
-    pub async fn flush(&self) -> Result<Value, String> {
+    pub async fn flush(&self) -> Result<crate::services::LeasedProfileStatus, String> {
         self.command(|reply| BrokerCommand::Flush { reply })
             .await
             .and_then(|result| result)
@@ -1103,7 +1103,7 @@ struct ActiveControl {
 }
 
 struct FlushState {
-    reply: Option<oneshot::Sender<Result<Value, String>>>,
+    reply: Option<oneshot::Sender<Result<crate::services::LeasedProfileStatus, String>>>,
     stage: FlushStage,
 }
 
@@ -3812,7 +3812,10 @@ impl Broker {
             .any(|unknown| unknown.role != Some(Role::Viewer))
     }
 
-    fn start_flush(&mut self, reply: oneshot::Sender<Result<Value, String>>) {
+    fn start_flush(
+        &mut self,
+        reply: oneshot::Sender<Result<crate::services::LeasedProfileStatus, String>>,
+    ) {
         if self.lifecycle == Lifecycle::Flushing {
             let _ = reply.send(Err("Browser is already flushing".to_string()));
             return;
@@ -3889,10 +3892,11 @@ impl Broker {
             flush.stage = FlushStage::Status(token);
         }
         let profile = self.profile.clone();
+        let budget = self.upstream.handle.budget.clone();
         let commands = self.commands_tx.clone();
         tokio::spawn(async move {
             let result = profile
-                .status()
+                .leased_status(budget)
                 .await
                 .map_err(|_| "Profile status unavailable".to_string());
             let _ = commands
@@ -3901,7 +3905,11 @@ impl Broker {
         });
     }
 
-    fn profile_status(&mut self, token: u64, result: Result<Value, String>) {
+    fn profile_status(
+        &mut self,
+        token: u64,
+        result: Result<crate::services::LeasedProfileStatus, String>,
+    ) {
         let Some(flush) = self.flush.as_ref() else {
             return;
         };

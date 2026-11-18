@@ -339,6 +339,73 @@ mod request_allocations {
     static ALLOCATOR: Allocator = Allocator;
 
     #[test]
+    fn typed_profile_status_all_sizes_and_body_writer_ownership() {
+        use crate::services::LeasedProfileStatus;
+        use crate::transport::{PayloadBudget, MAX_FRAME_BYTES, ORDINARY_BYTES, INTERNAL_BYTES};
+        use http_body_util::BodyExt;
+        let budget = PayloadBudget::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let path = std::path::PathBuf::from("/状态/\"\\\n\u{1f600}".repeat(20_000));
+        let id = "id\"\\\n\u{1f600}".repeat(10_000);
+        drop(crate::relay::budgeted_body(&budget, &false).unwrap());
+        runtime.block_on(async {});
+        for sqlite in [false, true] {
+            TRACK.with(|track| {
+                let mut track = track.borrow_mut();
+                track.stats = Stats::default();
+                track.slots.fill((0, 0));
+                track.active = true;
+            });
+            let status = if sqlite {
+                LeasedProfileStatus::sqlite(&budget, &path, 9_007_199_254_740_991, 1, &id)
+            } else {
+                LeasedProfileStatus::memory(&budget, usize::MAX, u64::MAX, i64::MIN, u64::MAX)
+            }
+            .unwrap();
+            let held_snapshot = budget.used();
+            let clone = status.clone();
+            drop(status);
+            assert_eq!(budget.used(), held_snapshot);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tx.send(clone).ok().unwrap();
+            assert_eq!(budget.used(), held_snapshot);
+            let status = runtime.block_on(rx).unwrap();
+            let bytes = crate::relay::budgeted_body(&budget, &status).unwrap();
+            let held_body = budget.used();
+            assert!(held_body.0 > held_snapshot.0 + bytes.len());
+            drop(status);
+            assert!(budget.used().0 > MAX_FRAME_BYTES + bytes.len());
+            let body = http_body_util::Full::new(bytes.clone());
+            drop(bytes);
+            let writer_held = runtime.block_on(body.collect()).unwrap().to_bytes();
+            assert!(budget.used().0 > MAX_FRAME_BYTES + writer_held.len());
+            drop(writer_held);
+            let stats = TRACK.with(|track| {
+                let mut track = track.borrow_mut();
+                track.active = false;
+                track.stats
+            });
+            println!("typed profile sqlite={sqlite}: {stats:?}; snapshot={held_snapshot:?}; body={held_body:?}; high={:?}", budget.high_water());
+            assert!(!stats.overflow);
+            assert_eq!(stats.live, 0);
+            assert!(
+                stats.count < 32,
+                "fixed fields must not allocate per text node: {stats:?}"
+            );
+            assert!(
+                stats.peak <= held_body.0 - MAX_FRAME_BYTES + 4096,
+                "{stats:?}"
+            );
+            assert_eq!(held_body.1, 0);
+            assert_eq!(budget.used(), (MAX_FRAME_BYTES, 0));
+            assert!(budget.high_water().0 <= ORDINARY_BYTES);
+            assert!(budget.high_water().1 <= INTERNAL_BYTES);
+        }
+    }
+
+    #[test]
     fn production_received_allocations_cover_raw_reply_and_event_outputs() {
         use crate::cdp_raw::{self, LeasedRaw, ParsePolicy, RawEnvelope};
         use crate::transport::{PayloadBudget, MAX_FRAME_BYTES};
@@ -2458,12 +2525,265 @@ async fn flush_drains_writes_and_reports_profile_status() {
         .expect("flush completes")
         .expect("flush task")
         .expect("flush ok");
-    assert_eq!(status["revision"], 0);
+    assert_eq!(serde_json::to_value(&status).unwrap()["revision"], 0);
     send(&alice, &broker, r#"{"id":2,"method":"Target.getTargets"}"#).await;
     let request = next_request(&mut engine).await;
     engine.reply(request_id(&request), json!({ "targetInfos": [] }));
     let reply = next_frame(&mut alice).await;
     assert_eq!(reply["id"], 2);
+}
+
+struct GatedStatus {
+    inner: Arc<dyn crate::services::ProfileBackend>,
+    entered: tokio::sync::Notify,
+    resume: std::sync::Mutex<bool>,
+    gate: std::sync::Condvar,
+}
+
+impl crate::services::ProfileBackend for GatedStatus {
+    fn load(
+        &self,
+        owner: &[u16],
+    ) -> Result<crate::services::LoadResult, crate::profile::ProfileError> {
+        self.inner.load(owner)
+    }
+    fn save(
+        &self,
+        owner: &[u16],
+        revision: &crate::profile_state::Json,
+        state: Option<&crate::profile_state::Json>,
+    ) -> Result<(), crate::profile::ProfileError> {
+        self.inner.save(owner, revision, state)
+    }
+    fn status(&self) -> Result<Value, crate::profile::ProfileError> {
+        panic!("broker must use typed status, never Value")
+    }
+    fn leased_status(
+        &self,
+        budget: &crate::transport::PayloadBudget,
+    ) -> Result<crate::services::LeasedProfileStatus, crate::profile::ProfileError> {
+        let status = self.inner.leased_status(budget)?;
+        self.entered.notify_one();
+        let guard = self.resume.lock().unwrap();
+        let (guard, waited) = self
+            .gate
+            .wait_timeout_while(guard, WAIT, |resume| !*resume)
+            .unwrap();
+        assert!(!waited.timed_out(), "status test gate timed out");
+        drop(guard);
+        Ok(status)
+    }
+    fn kind(&self) -> &'static str {
+        self.inner.kind()
+    }
+    fn display(&self) -> String {
+        self.inner.display()
+    }
+}
+
+#[tokio::test]
+async fn typed_status_callbacks_cancel_lost_and_exhaustion_release_both_profiles() {
+    use crate::transport::{MAX_FRAME_BYTES, ORDINARY_BYTES};
+    for sqlite in [false, true] {
+        for lost in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let inner: Arc<dyn crate::services::ProfileBackend> = if sqlite {
+                Arc::new(
+                    crate::services::SqliteProfile::open(&directory.path().join("状态.db"), true)
+                        .unwrap(),
+                )
+            } else {
+                Arc::new(MemoryProfile::new("http://fixture.invalid").unwrap())
+            };
+            let expected = inner.status().unwrap();
+            let gated = Arc::new(GatedStatus {
+                inner,
+                entered: tokio::sync::Notify::new(),
+                resume: std::sync::Mutex::new(false),
+                gate: std::sync::Condvar::new(),
+            });
+            let mut engine = fake_engine().await;
+            let observer = Arc::new(Observer::disabled());
+            let upstream =
+                Upstream::connect(&UpstreamAddress::Tcp(engine.address), observer.clone())
+                    .await
+                    .unwrap();
+            let broker = BrokerHandle::start(
+                upstream,
+                Arc::new(ProfileService::new(gated.clone())),
+                observer,
+            );
+            let budget = broker.payload_budget();
+            assert!(broker.session().await.unwrap().alive);
+            let baseline = budget.used();
+            let flushing = {
+                let broker = broker.clone();
+                tokio::spawn(async move { broker.flush().await })
+            };
+            let flush = next_method(&mut engine, "Kitesurf.flushProfile").await;
+            engine.reply(request_id(&flush), json!({}));
+            timeout(WAIT, gated.entered.notified()).await.unwrap();
+            assert!(budget.used().0 > baseline.0);
+            assert!(
+                budget.used().1 <= baseline.1,
+                "status cannot borrow internal reserve"
+            );
+            assert!(
+                broker.session().await.unwrap().alive,
+                "blocking status must not block actor"
+            );
+            flushing.abort();
+            assert!(matches!(flushing.await, Err(error) if error.is_cancelled()));
+            if lost {
+                broker.engine_lost();
+                assert!(!timeout(WAIT, broker.wait_terminal()).await.unwrap());
+            }
+            *gated.resume.lock().unwrap() = true;
+            gated.gate.notify_all();
+            timeout(WAIT, async {
+                loop {
+                    let used = budget.used();
+                    if used.0 == baseline.0 && (!lost || used.1 == 0) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if !lost {
+                let held = budget
+                    .try_acquire(ORDINARY_BYTES - budget.used().0, false)
+                    .unwrap();
+                let flushing = {
+                    let broker = broker.clone();
+                    tokio::spawn(async move { broker.flush().await })
+                };
+                let flush = next_method(&mut engine, "Kitesurf.flushProfile").await;
+                engine.reply(request_id(&flush), json!({}));
+                let error = timeout(WAIT, flushing)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .err()
+                    .unwrap();
+                assert_eq!(error, "Profile status unavailable");
+                assert!(broker.session().await.unwrap().alive);
+                assert_eq!(budget.used().0, ORDINARY_BYTES);
+                drop(held);
+                let flushing = {
+                    let broker = broker.clone();
+                    tokio::spawn(async move { broker.flush().await })
+                };
+                let flush = next_method(&mut engine, "Kitesurf.flushProfile").await;
+                engine.reply(request_id(&flush), json!({}));
+                let status = timeout(WAIT, flushing).await.unwrap().unwrap().unwrap();
+                assert_eq!(serde_json::to_value(&status).unwrap(), expected);
+                drop(status);
+                broker.engine_lost();
+                assert!(!timeout(WAIT, broker.wait_terminal()).await.unwrap());
+            }
+            engine.kill();
+            timeout(WAIT, async {
+                while budget.used() != (MAX_FRAME_BYTES, 0) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(budget.used(), (MAX_FRAME_BYTES, 0));
+        }
+    }
+}
+
+#[tokio::test]
+async fn typed_profile_http_status_flush_fields_and_exhaustion_stay_compatible() {
+    use crate::relay::{HostServer, SessionInfo};
+    use crate::services::{ProfileBackend, SqliteProfile};
+    use crate::transport::{MAX_FRAME_BYTES, ORDINARY_BYTES};
+    for sqlite in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn ProfileBackend> = if sqlite {
+            Arc::new(SqliteProfile::open(&directory.path().join("状态.db"), true).unwrap())
+        } else {
+            Arc::new(MemoryProfile::new("http://fixture.invalid").unwrap())
+        };
+        let expected = backend.status().unwrap();
+        let profile = Arc::new(ProfileService::new(backend));
+        let mut engine = fake_engine().await;
+        let observer = Arc::new(Observer::disabled());
+        let upstream = Upstream::connect(&UpstreamAddress::Tcp(engine.address), observer.clone())
+            .await
+            .unwrap();
+        let broker = BrokerHandle::start(upstream, profile.clone(), observer.clone());
+        let budget = broker.payload_budget();
+        let raw = crate::cdp_raw::LeasedRaw::literal("{}", &budget).unwrap();
+        let session = SessionInfo::from_raw(&raw, &budget, "test").unwrap();
+        drop(raw);
+        let host = HostServer::bind(
+            0,
+            broker.clone(),
+            session,
+            "generation".into(),
+            "recovery".into(),
+            profile,
+            observer,
+        )
+        .unwrap();
+        let request = tokio::spawn(status_http(host.port(), false));
+        let targets = next_method(&mut engine, "Target.getTargets").await;
+        engine.reply(request_id(&targets), json!({"targetInfos":[]}));
+        let (code, body) = timeout(WAIT, request).await.unwrap().unwrap();
+        assert_eq!(code, "HTTP/1.1 200 OK");
+        assert_eq!(body["profile"], expected);
+        let held = budget
+            .try_acquire(ORDINARY_BYTES - budget.used().0, false)
+            .unwrap();
+        let request = tokio::spawn(status_http(host.port(), true));
+        let flush = next_method(&mut engine, "Kitesurf.flushProfile").await;
+        engine.reply(request_id(&flush), json!({}));
+        let (code, body) = timeout(WAIT, request).await.unwrap().unwrap();
+        assert_eq!(code, "HTTP/1.1 409 Conflict");
+        assert_eq!(body, json!({"error":"Profile status unavailable"}));
+        assert!(broker.session().await.unwrap().alive);
+        drop(held);
+        let request = tokio::spawn(status_http(host.port(), true));
+        let flush = next_method(&mut engine, "Kitesurf.flushProfile").await;
+        engine.reply(request_id(&flush), json!({}));
+        let (code, body) = timeout(WAIT, request).await.unwrap().unwrap();
+        assert_eq!(code, "HTTP/1.1 200 OK");
+        assert_eq!(body, expected);
+        broker.engine_lost();
+        assert!(!timeout(WAIT, broker.wait_terminal()).await.unwrap());
+        host.stop().await;
+        drop(host);
+        engine.kill();
+        timeout(WAIT, async {
+            while budget.used() != (MAX_FRAME_BYTES, 0) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+}
+
+async fn status_http(port: u16, flush: bool) -> (String, Value) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let route = if flush { "POST /flush" } else { "GET /session" };
+    stream.write_all(format!("{route} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let mut bytes = Vec::new();
+    timeout(WAIT, stream.read_to_end(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap();
+    (
+        head.lines().next().unwrap().to_owned(),
+        serde_json::from_str(body).unwrap(),
+    )
 }
 
 #[tokio::test]
