@@ -1177,19 +1177,19 @@ impl Broker {
         drop(text);
         drop(ingress);
         let mut value = value;
-        let Some(client) = self.clients.get(&client_id) else {
-            return;
-        };
-        if client.ids.lock().unwrap().contains(&external_id) {
+        if let Err(message) = self.check_request(client_id, &value, external_id, &method) {
             self.send_error(
                 client_id,
                 external_id,
                 -32000,
-                "Duplicate in-flight request id",
+                message,
                 error_session(&value),
             );
             return;
         }
+        let Some(client) = self.clients.get(&client_id) else {
+            return;
+        };
         let permits = client
             .slots
             .clone()
@@ -1207,6 +1207,7 @@ impl Broker {
             return;
         };
         let metadata = value.metadata.take().unwrap();
+        // actor 内无 await；权限检查及双槽成功后登记 ID，构成唯一语义准入点。
         client.ids.lock().unwrap().insert(external_id);
         value.lease = Some(Arc::new(RequestLease {
             _client: local,
@@ -1250,59 +1251,17 @@ impl Broker {
         external_id: i64,
         method: &str,
     ) {
-        let Some(client) = self.clients.get(&client_id) else {
+        if let Err(message) = self.check_request(client_id, &request, external_id, method) {
+            self.send_error(
+                client_id,
+                external_id,
+                -32000,
+                message,
+                error_session(&request),
+            );
             return;
-        };
+        }
         let session = error_session(&request);
-        if self.lifecycle != Lifecycle::Running {
-            let message = if self.lifecycle == Lifecycle::Flushing {
-                "Browser is flushing"
-            } else {
-                "Browser is closing"
-            };
-            self.send_error(client_id, external_id, -32000, message, session);
-            return;
-        }
-        if client.role == Role::Viewer && !VIEW_METHODS.contains(&method) {
-            self.send_error(
-                client_id,
-                external_id,
-                -32000,
-                "Viewer connection cannot control the browser",
-                session,
-            );
-            return;
-        }
-        if client.role == Role::Controller {
-            let valid = !client.retired
-                && self.active_controller == Some(client_id)
-                && self.controller.as_deref() == Some(client.owner.as_str())
-                && client.epoch == self.control_epoch;
-            if !valid {
-                self.send_error(
-                    client_id,
-                    external_id,
-                    -32000,
-                    "Control has changed; reconnect and observe before acting",
-                    session,
-                );
-                return;
-            }
-        }
-        if self.has_external_pending(client_id, external_id) && request.lease.is_none() {
-            self.send_error(
-                client_id,
-                external_id,
-                -32000,
-                "Duplicate in-flight request id",
-                session,
-            );
-            return;
-        }
-        if let Err(message) = self.validate_session(client_id, session.as_deref()) {
-            self.send_error(client_id, external_id, -32000, message, session);
-            return;
-        }
         if method == "Browser.close" {
             self.request_close_from_client(client_id, external_id, session);
             if let Some(close) = self.close.as_mut() {
@@ -1522,13 +1481,49 @@ impl Broker {
         self.pump_management();
     }
 
-    fn has_external_pending(&self, client: ClientId, external_id: i64) -> bool {
-        self.pending.values().any(|pending| {
-            pending.client == Some(client) && pending.external_id == Some(external_id)
-        }) || self
-            .management_queue
-            .iter()
-            .any(|work| work.client == client && work.external_id == external_id)
+    /// 无副作用预检先于槽位/身份准入；排队后派发再次校验，不把 timeout 当取消。
+    fn check_request(
+        &self,
+        client_id: ClientId,
+        request: &Request,
+        external_id: i64,
+        method: &str,
+    ) -> Result<(), &'static str> {
+        let client = self.clients.get(&client_id).ok_or("Client is closed")?;
+        if client.closed {
+            return Err("Client is closed");
+        }
+        if self.lifecycle != Lifecycle::Running {
+            return Err(if self.lifecycle == Lifecycle::Flushing {
+                "Browser is flushing"
+            } else {
+                "Browser is closing"
+            });
+        }
+        if client.role == Role::Viewer && !VIEW_METHODS.contains(&method) {
+            return Err("Viewer connection cannot control the browser");
+        }
+        if client.role == Role::Controller
+            && (client.retired
+                || self.active_controller != Some(client_id)
+                || self.controller.as_deref() != Some(client.owner.as_str())
+                || client.epoch != self.control_epoch)
+        {
+            return Err("Control has changed; reconnect and observe before acting");
+        }
+        let owns_id = request
+            .lease
+            .as_ref()
+            .is_some_and(|lease| lease.id == external_id && Arc::ptr_eq(&lease.ids, &client.ids));
+        if !owns_id && client.ids.lock().unwrap().contains(&external_id) {
+            return Err("Duplicate in-flight request id");
+        }
+        let session = request.get("sessionId").and_then(Value::as_str);
+        self.validate_session(client_id, session)?;
+        if let Some(message) = self.managed_session_error(client_id, method, request, session) {
+            return Err(message);
+        }
+        Ok(())
     }
 
     fn send_error(

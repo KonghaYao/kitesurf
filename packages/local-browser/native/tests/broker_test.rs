@@ -227,6 +227,55 @@ fn message(value: &Value) -> &str {
         .expect("error message")
 }
 
+#[test]
+fn production_request_and_output_limits_stay_fixed() {
+    assert_eq!(super::MAX_PENDING_PER_CLIENT, 64);
+    assert_eq!(super::MAX_PENDING_GLOBAL, 512);
+    assert_eq!(super::MAX_INTERNAL_PENDING, 32);
+    assert_eq!(super::CLIENT_QUEUE_FRAMES, 64);
+    assert_eq!(super::CLIENT_QUEUE_BYTES, 32 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn page_waiting_rejects_unauthorized_requests_before_slot_admission() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut page = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page".into(),
+        },
+        Role::Viewer,
+        "viewer",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    for text in [
+        r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"1"}}"#,
+        r#"{"id":1,"method":"Page.enable","sessionId":"foreign"}"#,
+        r#"{"id":1,"method":"Target.detachFromTarget","params":{"sessionId":"foreign"}}"#,
+    ] {
+        send(&page, &broker, text).await;
+        let rejected = next_frame(&mut page).await;
+        assert_eq!(rejected["id"], 1);
+        assert!(rejected.get("error").is_some());
+        assert_eq!(broker.budget_snapshot().await.0, 0);
+    }
+    send(&page, &broker, r#"{"id":1,"method":"Page.enable"}"#).await;
+    send(&page, &broker, r#"{"id":1,"method":"Page.disable"}"#).await;
+    assert!(message(&next_frame(&mut page).await).contains("Duplicate"));
+    assert_eq!(broker.budget_snapshot().await.0, 1);
+    engine.reply(request_id(&attach), json!({"sessionId":"primary"}));
+    let dispatched = next_request(&mut engine).await;
+    assert_eq!(dispatched["method"], "Page.enable");
+    engine.reply(request_id(&dispatched), json!({}));
+    assert!(next_frame(&mut page).await.get("result").is_some());
+    assert_eq!(broker.budget_snapshot().await.0, 0);
+    expect_no_request(&mut engine).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
 #[tokio::test]
 async fn active_and_queued_management_share_the_64_request_limit() {
     let mut engine = fake_engine().await;
@@ -262,6 +311,7 @@ async fn management_payloads_cannot_retain_18_times_8_mib() {
     let mut engine = fake_engine().await;
     let broker = broker(&engine).await;
     let client = connect(&broker, Endpoint::Browser, Role::Viewer, "viewer").await;
+    let mut cancelled = client.cancel.clone();
     send(
         &client,
         &broker,
@@ -283,7 +333,19 @@ async fn management_payloads_cannot_retain_18_times_8_mib() {
             &json!({"id":100+id,"method":"Target.setDiscoverTargets"}).to_string(),
         )
         .await;
-        let barrier = next_method(&mut engine, "Target.setDiscoverTargets").await;
+        let barrier = timeout(WAIT, async {
+            tokio::select! {
+                request = next_method(&mut engine, "Target.setDiscoverTargets") => Some(request),
+                _ = cancelled.wait_for(|closed| *closed) => None,
+            }
+        })
+        .await
+        .expect("budget pressure must reply or cancel promptly");
+        let Some(barrier) = barrier else {
+            assert!(*client.cancel.borrow());
+            assert!(broker.session().await.unwrap().alive);
+            break;
+        };
         engine.reply(request_id(&barrier), json!({}));
         if *client.cancel.borrow() {
             break;
