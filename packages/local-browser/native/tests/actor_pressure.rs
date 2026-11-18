@@ -11,7 +11,7 @@ use tokio::sync::{oneshot, Notify, Semaphore};
 // 固定表覆盖场景线程、blocking worker 与任意线程的 free/realloc；不忽略小 allocation。
 // runtime 与有限 harness 也在观测值中；fixture/伪上游排除，不是 SQLite/native/RSS 保证。
 // scope 只决定新分配是否入表；释放不依赖 scope，线程 join 后必须 live=0。
-// 阶段与小尺寸事件环只写固定数组，不能在 tracking 路径分配；供残留归因。
+// 固定数组不分配；phase 是时间窗，owner 仅显式测试标签，丢失由 snapshot flags 报告。
 pub(crate) mod allocations {
     use std::cell::Cell;
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -38,6 +38,25 @@ pub(crate) mod allocations {
         PHASE.store(value, Ordering::Relaxed);
     }
 
+    // owner 只在测试显式 scope 内设置；未标注的分配不能由 phase 反推 owner。
+    pub const OWNER_NONE: u32 = 0;
+    pub const OWNER_LEASE_HOLD: u32 = 1;
+    thread_local! {
+        static OWNER: Cell<u32> = const { Cell::new(OWNER_NONE) };
+    }
+    pub struct OwnerScope(u32);
+    pub fn owner_scope(value: u32) -> OwnerScope {
+        OwnerScope(OWNER.with(|owner| owner.replace(value)))
+    }
+    impl Drop for OwnerScope {
+        fn drop(&mut self) {
+            OWNER.with(|owner| owner.set(self.0));
+        }
+    }
+    fn owner() -> u32 {
+        OWNER.try_with(Cell::get).unwrap_or(OWNER_NONE)
+    }
+
     #[derive(Clone, Copy, Debug, Default)]
     pub struct Stats {
         pub live: usize,
@@ -48,10 +67,22 @@ pub(crate) mod allocations {
     }
     #[derive(Clone, Copy, Debug, Default)]
     pub struct Record {
+        pub pointer: usize,
         pub size: usize,
         pub thread: usize,
         pub phase: u32,
-        pub seq: u32,
+        pub owner: u32,
+        pub seq: u64,
+    }
+    impl Record {
+        const EMPTY: Self = Self {
+            pointer: 0,
+            size: 0,
+            thread: 0,
+            phase: 0,
+            owner: OWNER_NONE,
+            seq: 0,
+        };
     }
     #[derive(Clone, Copy, Debug, Default)]
     pub struct Event {
@@ -61,17 +92,93 @@ pub(crate) mod allocations {
         pub pointer: usize,
         pub thread: usize,
         pub phase: u32,
+        pub owner: u32,
+        pub seq: u64,
+    }
+    impl Event {
+        const EMPTY: Self = Self {
+            add: false,
+            found: false,
+            size: 0,
+            pointer: 0,
+            thread: 0,
+            phase: 0,
+            owner: OWNER_NONE,
+            seq: 0,
+        };
+    }
+    // 容量有限时用 flags 与总数报告丢失；records 的 live 是快照时真实 live 条数。
+    #[derive(Clone, Copy, Debug)]
+    pub struct Records {
+        pub items: [Record; RECORDS],
+        pub count: usize,
+        pub live: usize,
+        pub truncated: bool,
+    }
+    // 只覆盖 <=SMALL 的事件；total 是写入总数，count 是当前可读窗口。
+    #[derive(Clone, Copy, Debug)]
+    pub struct Events {
+        pub items: [Event; EVENTS],
+        pub count: usize,
+        pub total: u64,
+        pub overwritten: bool,
+    }
+    #[derive(Clone, Copy, Debug)]
+    pub struct Snapshot {
+        pub stats: Stats,
+        pub records: Records,
+        pub events: Events,
     }
     const SMALL: usize = 128;
-    const EVENTS: usize = 256;
+    pub const EVENTS: usize = 256;
     pub const RECORDS: usize = 32;
+    #[derive(Clone, Copy)]
+    struct Slot {
+        pointer: usize,
+        size: usize,
+        thread: usize,
+        phase: u32,
+        owner: u32,
+        seq: u64,
+    }
+    impl Slot {
+        const EMPTY: Self = Self {
+            pointer: 0,
+            size: 0,
+            thread: 0,
+            phase: 0,
+            owner: OWNER_NONE,
+            seq: 0,
+        };
+        const GONE: Self = Self {
+            pointer: usize::MAX,
+            size: 0,
+            thread: 0,
+            phase: 0,
+            owner: OWNER_NONE,
+            seq: 0,
+        };
+        fn live(&self) -> bool {
+            !matches!(self.pointer, 0 | usize::MAX)
+        }
+        fn record(&self) -> Record {
+            Record {
+                pointer: self.pointer,
+                size: self.size,
+                thread: self.thread,
+                phase: self.phase,
+                owner: self.owner,
+                seq: self.seq,
+            }
+        }
+    }
     struct Tracker {
         stats: Stats,
-        seq: u32,
-        slots: [(usize, usize, usize, u32, u32); 32768],
+        seq: u64,
+        slots: [Slot; 32768],
         events: [Event; EVENTS],
         event_head: usize,
-        event_count: usize,
+        events_total: u64,
     }
     static TRACKER: Mutex<Tracker> = Mutex::new(Tracker {
         stats: Stats {
@@ -82,17 +189,10 @@ pub(crate) mod allocations {
             overflow: false,
         },
         seq: 0,
-        slots: [(0, 0, 0, 0, 0); 32768],
-        events: [Event {
-            add: false,
-            found: false,
-            size: 0,
-            pointer: 0,
-            thread: 0,
-            phase: 0,
-        }; EVENTS],
+        slots: [Slot::EMPTY; 32768],
+        events: [Event::EMPTY; EVENTS],
         event_head: 0,
-        event_count: 0,
+        events_total: 0,
     });
     thread_local! {
         static ENABLED: Cell<bool> = const { Cell::new(false) };
@@ -128,16 +228,24 @@ pub(crate) mod allocations {
             let start = (pointer >> 4).wrapping_mul(0x9e3779b1) % self.slots.len();
             for offset in 0..self.slots.len() {
                 let index = (start + offset) % self.slots.len();
-                if self.slots[index].0 == pointer {
+                if self.slots[index].pointer == pointer {
                     return Some(index);
                 }
-                if self.slots[index].0 == 0 {
+                if self.slots[index].pointer == 0 {
                     return None;
                 }
             }
             None
         }
-        fn event(&mut self, add: bool, found: bool, size: usize, pointer: usize) {
+        fn event(
+            &mut self,
+            add: bool,
+            found: bool,
+            size: usize,
+            pointer: usize,
+            seq: u64,
+            owner: u32,
+        ) {
             if size > SMALL {
                 return;
             }
@@ -148,9 +256,11 @@ pub(crate) mod allocations {
                 pointer,
                 thread: thread(),
                 phase: PHASE.load(Ordering::Relaxed),
+                owner,
+                seq,
             };
             self.event_head = (self.event_head + 1) % EVENTS;
-            self.event_count = (self.event_count + 1).min(EVENTS);
+            self.events_total = self.events_total.saturating_add(1);
         }
         fn add(&mut self, pointer: usize, size: usize) {
             if pointer == 0 {
@@ -160,28 +270,37 @@ pub(crate) mod allocations {
             self.stats.peak = self.stats.peak.max(self.stats.live);
             self.stats.count += 1;
             self.seq = self.seq.wrapping_add(1);
+            let seq = self.seq;
             let phase = PHASE.load(Ordering::Relaxed);
+            let owner = owner();
             let start = (pointer >> 4).wrapping_mul(0x9e3779b1) % self.slots.len();
             for offset in 0..self.slots.len() {
                 let index = (start + offset) % self.slots.len();
-                if matches!(self.slots[index].0, 0 | usize::MAX) {
-                    self.slots[index] = (pointer, size, thread(), phase, self.seq);
+                if !self.slots[index].live() {
+                    self.slots[index] = Slot {
+                        pointer,
+                        size,
+                        thread: thread(),
+                        phase,
+                        owner,
+                        seq,
+                    };
                     LIVE.fetch_add(1, Ordering::Relaxed);
-                    self.event(true, true, size, pointer);
+                    self.event(true, true, size, pointer, seq, owner);
                     return;
                 }
             }
             self.stats.overflow = true;
-            self.event(true, false, size, pointer);
+            self.event(true, false, size, pointer, seq, owner);
         }
         fn remove(&mut self, pointer: usize) -> bool {
             if let Some(index) = self.index(pointer) {
                 let slot = self.slots[index];
-                self.stats.live -= slot.1;
-                self.stats.cross_thread_frees += usize::from(slot.2 != thread());
-                self.slots[index] = (usize::MAX, 0, 0, 0, 0);
+                self.stats.live -= slot.size;
+                self.stats.cross_thread_frees += usize::from(slot.thread != thread());
+                self.slots[index] = Slot::GONE;
                 LIVE.fetch_sub(1, Ordering::Relaxed);
-                self.event(false, true, slot.1, pointer);
+                self.event(false, true, slot.size, pointer, slot.seq, slot.owner);
                 return true;
             }
             false
@@ -202,7 +321,7 @@ pub(crate) mod allocations {
         }
         let mut tracker = TRACKER.lock().unwrap();
         if !tracker.remove(pointer as usize) && ENABLED.try_with(Cell::get).unwrap_or(false) {
-            tracker.event(false, false, size, pointer as usize);
+            tracker.event(false, false, size, pointer as usize, 0, owner());
         }
     }
     // mutex 覆盖 System.realloc；旧地址重用不能抢先覆盖记录，峰值按旧新并存计。
@@ -230,62 +349,99 @@ pub(crate) mod allocations {
         assert_eq!(tracker.stats.live, 0);
         tracker.stats = Stats::default();
         tracker.seq = 0;
-        tracker.slots.fill((0, 0, 0, 0, 0));
-        tracker.events.fill(Event::default());
+        tracker.slots.fill(Slot::EMPTY);
+        tracker.events.fill(Event::EMPTY);
         tracker.event_head = 0;
-        tracker.event_count = 0;
+        tracker.events_total = 0;
     }
     pub fn stats() -> Stats {
         TRACKER.lock().unwrap().stats
     }
-    pub fn records() -> ([Record; RECORDS], usize) {
-        let tracker = TRACKER.lock().unwrap();
-        let mut records = [Record::default(); RECORDS];
-        let mut count = 0;
-        for slot in tracker.slots.iter() {
-            if slot.0 == 0 || slot.0 == usize::MAX || count == RECORDS {
-                continue;
+    impl Tracker {
+        fn record_snapshot(&self) -> Records {
+            let mut items = [Record::EMPTY; RECORDS];
+            let mut live = 0;
+            for slot in &self.slots {
+                if !slot.live() {
+                    continue;
+                }
+                live += 1;
+                if live <= RECORDS {
+                    items[live - 1] = slot.record();
+                }
             }
-            records[count] = Record {
-                size: slot.1,
-                thread: slot.2,
-                phase: slot.3,
-                seq: slot.4,
+            Records {
+                items,
+                count: live.min(RECORDS),
+                live,
+                truncated: live > RECORDS,
+            }
+        }
+        fn event_snapshot(&self) -> Events {
+            let total = self.events_total;
+            let count = total.min(EVENTS as u64) as usize;
+            let start = if total >= EVENTS as u64 {
+                self.event_head
+            } else {
+                0
             };
-            count += 1;
+            let mut items = [Event::EMPTY; EVENTS];
+            for (offset, event) in items[..count].iter_mut().enumerate() {
+                *event = self.events[(start + offset) % EVENTS];
+            }
+            Events {
+                items,
+                count,
+                total,
+                overwritten: total > EVENTS as u64,
+            }
         }
-        (records, count)
     }
-    pub fn events() -> ([Event; RECORDS], usize) {
+    // 单次加锁取得一致的 stats/records/events；不返回被覆盖区间，也不隐藏省略数。
+    pub fn snapshot() -> Snapshot {
         let tracker = TRACKER.lock().unwrap();
-        let take = tracker.event_count.min(RECORDS);
-        let mut events = [Event::default(); RECORDS];
-        for (output, offset) in events.iter_mut().zip(0..take) {
-            let index = (tracker.event_head + EVENTS - take + offset) % EVENTS;
-            *output = tracker.events[index];
+        Snapshot {
+            stats: tracker.stats,
+            records: tracker.record_snapshot(),
+            events: tracker.event_snapshot(),
         }
-        (events, take)
     }
     // 只用固定快照；格式化在释放 tracker 锁并暂停 tracking 后，避免递归分配。
     pub fn describe() -> String {
         use std::fmt::Write as _;
-        let stats = stats();
-        let (records, record_count) = records();
-        let (events, event_count) = events();
+        let view = snapshot();
         let _quiet = Scope::suspend();
-        let mut text = format!("{stats:?}");
-        for record in &records[..record_count] {
+        let mut text = format!(
+            "{:?} records=(shown={},live={},truncated={},omitted={}) events=(shown={},total={},overwritten={},dropped={}) attribution=(phase=global-window,owner=test-tag-only)",
+            view.stats,
+            view.records.count,
+            view.records.live,
+            view.records.truncated,
+            view.records.live - view.records.count,
+            view.events.count,
+            view.events.total,
+            view.events.overwritten,
+            view.events.total - view.events.count as u64,
+        );
+        for record in &view.records.items[..view.records.count] {
             let _ = write!(
                 text,
-                " rec(size={},thread={},phase={},seq={})",
-                record.size, record.thread, record.phase, record.seq
+                " rec(ptr={},size={},thread={},phase={},owner={},seq={})",
+                record.pointer, record.size, record.thread, record.phase, record.owner, record.seq
             );
         }
-        for event in &events[..event_count] {
+        for event in &view.events.items[..view.events.count] {
             let _ = write!(
                 text,
-                " ev(add={},found={},size={},ptr={},thread={},phase={})",
-                event.add, event.found, event.size, event.pointer, event.thread, event.phase
+                " ev(add={},found={},size={},ptr={},thread={},phase={},owner={},seq={})",
+                event.add,
+                event.found,
+                event.size,
+                event.pointer,
+                event.thread,
+                event.phase,
+                event.owner,
+                event.seq
             );
         }
         text
@@ -1006,6 +1162,8 @@ fn run_combined(branch: Branch) {
 
 // 64 B 来自 PayloadLease 的 hold 向量：owner 是 lease，drop 时释放并归还 permits。
 // 预算回到基线仍见 64 B 残留时，不能归因于仍存活的 lease（permit 会占预算）。
+// owner 标签由测试在真实 hold 入口前设置，不是生产调用点的自动归因。
+// 两 semaphore 首次 release 会惰性分配 64 B；在 tracking 外预热，避免混入 hold 归因。
 #[test]
 fn lease_hold_small_owner_is_tracked_and_released() {
     let _serial = allocations::SERIAL.lock().unwrap();
@@ -1013,21 +1171,47 @@ fn lease_hold_small_owner_is_tracked_and_released() {
     let held = std::thread::spawn(|| {
         let budget = crate::transport::PayloadBudget::default();
         let slots = Arc::new(Semaphore::new(4));
+        drop(budget.try_acquire(64, false).unwrap());
+        drop(slots.clone().try_acquire_owned().unwrap());
         let scope = allocations::Scope::enter();
         allocations::phase(allocations::PHASE_SLOW);
         let mut lease = budget.try_acquire(64, false).unwrap();
-        lease.hold(slots.clone().try_acquire_owned().unwrap());
-        lease.hold(slots.clone().try_acquire_owned().unwrap());
-        let (records, count) = allocations::records();
-        assert!(
-            records[..count].iter().any(|record| record.size == 64),
+        let permit = slots.clone().try_acquire_owned().unwrap();
+        let baseline = allocations::snapshot();
+        {
+            let _owner = allocations::owner_scope(allocations::OWNER_LEASE_HOLD);
+            lease.hold(permit);
+        }
+        let tagged = allocations::snapshot();
+        assert_eq!(tagged.records.live, baseline.records.live + 1);
+        assert_eq!(tagged.stats.live, baseline.stats.live + 64);
+        let record = tagged.records.items[..tagged.records.count]
+            .iter()
+            .find(|record| record.owner == allocations::OWNER_LEASE_HOLD)
+            .unwrap_or_else(|| panic!("{}", allocations::describe()));
+        assert_eq!(record.size, 64);
+        let (pointer, seq) = (record.pointer, record.seq);
+        let held = tagged.stats.live;
+        drop(lease);
+        let released = allocations::snapshot();
+        assert_eq!(
+            released.stats.live,
+            baseline.stats.live,
             "{}",
             allocations::describe()
         );
-        let held = allocations::stats().live;
-        drop(lease);
+        assert!(released.records.items[..released.records.count]
+            .iter()
+            .all(|record| record.seq != seq));
+        let free = released.events.items[..released.events.count]
+            .iter()
+            .rev()
+            .find(|event| !event.add && event.found && event.seq == seq)
+            .unwrap_or_else(|| panic!("{}", allocations::describe()));
+        assert_eq!(free.pointer, pointer);
+        assert_eq!(free.owner, allocations::OWNER_LEASE_HOLD);
         drop(scope);
-        held
+        held - baseline.stats.live
     })
     .join()
     .unwrap();
@@ -1233,4 +1417,172 @@ fn cross_thread_all_sizes_realloc_and_join_settle() {
     assert!(final_stats.cross_thread_frees > 0);
     assert!(final_stats.peak >= 3 + 8196);
     println!("cross-thread-all-sizes {final_stats:?}");
+}
+
+// 负控一：最早 64 B leak 的 add 已被 300 次分配/释放挤出可读环，必须由总数报告。
+#[test]
+fn diagnostic_event_ring_reports_overwrite_and_identity() {
+    let _serial = allocations::SERIAL.lock().unwrap();
+    allocations::reset();
+    let _scope = allocations::Scope::enter();
+    let leak = Vec::<u8>::with_capacity(64);
+    for _ in 0..300 {
+        let block = Vec::<u8>::with_capacity(64);
+        assert_eq!(block.capacity(), 64);
+    }
+    let view = allocations::snapshot();
+    assert_eq!(view.events.total, 601);
+    assert_eq!(view.events.count, allocations::EVENTS);
+    assert!(view.events.overwritten);
+    assert_eq!(view.events.total - view.events.count as u64, 345);
+    assert_eq!(view.records.live, 1);
+    assert!(!view.records.truncated);
+    let record = view.records.items[0];
+    assert_eq!(record.size, 64);
+    assert_eq!(record.pointer, leak.as_ptr() as usize);
+    assert!(
+        view.events.items[..view.events.count]
+            .iter()
+            .all(|event| event.seq != record.seq),
+        "{}",
+        allocations::describe()
+    );
+    let oldest = &view.events.items[..2];
+    assert!(oldest[0].add && oldest[0].found);
+    assert!(!oldest[1].add && oldest[1].found);
+    assert_eq!(oldest[0].seq, oldest[1].seq);
+    let tail = &view.events.items[view.events.count - 2..view.events.count];
+    assert!(tail[0].add && tail[0].found);
+    assert!(!tail[1].add && tail[1].found);
+    assert_eq!(tail[0].seq, tail[1].seq);
+    assert_eq!(tail[0].pointer, tail[1].pointer);
+    drop(leak);
+    let final_view = allocations::snapshot();
+    assert_eq!(final_view.stats.live, 0);
+    assert_eq!(final_view.events.total, 602);
+}
+
+// 负控二：41 条 live 只展示 32 条，必须带 truncated/omitted；恰好 32 条不能误报。
+#[test]
+fn diagnostic_records_report_truncation_and_exact_capacity() {
+    let _serial = allocations::SERIAL.lock().unwrap();
+    allocations::reset();
+    let _scope = allocations::Scope::enter();
+    let mut blocks: [Vec<u8>; 41] = std::array::from_fn(|_| Vec::<u8>::with_capacity(64));
+    let mut pointers = [0usize; 41];
+    for (pointer, block) in pointers.iter_mut().zip(&blocks) {
+        *pointer = block.as_ptr() as usize;
+    }
+    let full = allocations::snapshot();
+    assert_eq!(full.records.live, 41);
+    assert_eq!(full.records.count, allocations::RECORDS);
+    assert!(full.records.truncated);
+    assert_eq!(full.records.live - full.records.count, 9);
+    assert_eq!(full.events.total, 41);
+    assert!(!full.events.overwritten);
+    for (index, record) in full.records.items[..full.records.count].iter().enumerate() {
+        assert_eq!(record.size, 64);
+        assert!(pointers.contains(&record.pointer));
+        assert!(record.seq != 0);
+        assert!(full.records.items[..index]
+            .iter()
+            .all(|prior| prior.pointer != record.pointer && prior.seq != record.seq));
+    }
+    for block in &mut blocks[..9] {
+        *block = Vec::new();
+    }
+    let boundary = allocations::snapshot();
+    assert_eq!(boundary.records.live, allocations::RECORDS);
+    assert_eq!(boundary.records.count, allocations::RECORDS);
+    assert!(!boundary.records.truncated);
+    assert_eq!(boundary.records.live - boundary.records.count, 0);
+    assert_eq!(boundary.events.total, 50);
+    for record in &boundary.records.items[..boundary.records.count] {
+        assert!(pointers[9..].contains(&record.pointer));
+    }
+    drop(blocks);
+    let final_view = allocations::snapshot();
+    assert_eq!(final_view.stats.live, 0);
+    assert_eq!(final_view.events.total, 82);
+}
+
+// 合成地址只作 tracker key，不解引用也不交给 allocator；验证地址重用后的 identity。
+#[test]
+fn diagnostic_identity_distinguishes_reused_address() {
+    let _serial = allocations::SERIAL.lock().unwrap();
+    allocations::reset();
+    let _scope = allocations::Scope::enter();
+    let address = 0x1000 as *mut u8;
+    let first = allocations::allocated(64, || address);
+    let first_view = allocations::snapshot();
+    assert_eq!(first_view.records.live, 1);
+    let first_record = first_view.records.items[0];
+    assert_eq!(first_record.pointer, address as usize);
+    allocations::freed(first, 64);
+    let empty = allocations::snapshot();
+    assert_eq!(empty.records.live, 0);
+    assert_eq!(empty.events.total, 2);
+    assert!(!empty.events.items[1].add && empty.events.items[1].found);
+    assert_eq!(empty.events.items[1].seq, first_record.seq);
+    let second = allocations::allocated(64, || address);
+    let second_view = allocations::snapshot();
+    assert_eq!(second_view.records.live, 1);
+    let second_record = second_view.records.items[0];
+    assert_eq!(second_record.pointer, address as usize);
+    assert_ne!(second_record.seq, first_record.seq);
+    assert_eq!(second_view.events.total, 3);
+    assert_eq!(second_view.events.items[1].seq, first_record.seq);
+    assert!(second_view.events.items[2].add && second_view.events.items[2].found);
+    assert_eq!(second_view.events.items[2].seq, second_record.seq);
+    allocations::freed(second, 64);
+    let done = allocations::snapshot();
+    assert_eq!(done.stats.live, 0);
+    assert_eq!(done.stats.count, 2);
+    assert_eq!(done.stats.peak, 64);
+    assert_eq!(done.events.items[3].seq, second_record.seq);
+}
+
+// describe 只暂停自身格式化；快照前 live 与 realloc 旧/新峰仍由真实 allocator 参与。
+#[test]
+fn diagnostic_snapshot_survives_describe_and_reports_realloc_peak() {
+    let _serial = allocations::SERIAL.lock().unwrap();
+    allocations::reset();
+    let _scope = allocations::Scope::enter();
+    let block = Vec::<u8>::with_capacity(64);
+    let pointer = block.as_ptr() as usize;
+    let before = allocations::snapshot();
+    assert_eq!(before.records.live, 1);
+    let record = before.records.items[0];
+    assert_eq!(record.pointer, pointer);
+    let described = allocations::describe();
+    let after = allocations::snapshot();
+    assert_eq!(before.stats.live, after.stats.live);
+    assert!(described.contains("records=(shown=1,live=1,truncated=false,omitted=0)"));
+    assert!(described.contains("events=(shown=1,total=1,overwritten=false,dropped=0)"));
+    assert!(described.contains("rec(ptr="));
+    {
+        let _quiet = allocations::Scope::suspend();
+        let worker = std::thread::spawn(move || drop(block));
+        worker.join().unwrap();
+    }
+    let freed = allocations::snapshot();
+    assert_eq!(freed.stats.live, 0);
+    assert_eq!(freed.stats.cross_thread_frees, 1);
+    let mut bytes = Vec::<u8>::with_capacity(64);
+    let old = bytes.capacity();
+    assert_eq!(old, 64);
+    bytes.reserve_exact(65);
+    assert_eq!(bytes.capacity(), 65);
+    let reallocated = allocations::snapshot();
+    assert_eq!(reallocated.stats.live, bytes.capacity());
+    assert_eq!(reallocated.stats.peak, old + bytes.capacity());
+    assert!(
+        reallocated.records.items[..reallocated.records.count]
+            .iter()
+            .any(|record| record.pointer == bytes.as_ptr() as usize
+                && record.size == bytes.capacity())
+    );
+    drop(bytes);
+    let final_view = allocations::snapshot();
+    assert_eq!(final_view.stats.live, 0);
 }
