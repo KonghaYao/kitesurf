@@ -283,6 +283,95 @@ impl ProfileBackend for SqliteProfile {
     }
 }
 
+/// 仅 test-faults 变体：按控制文件中的一次性指令包装真实后端，不改磁盘语义。
+#[cfg(feature = "test-faults")]
+pub struct FaultProfile {
+    inner: Arc<dyn ProfileBackend>,
+    control: PathBuf,
+    gate: Mutex<()>,
+}
+
+#[cfg(feature = "test-faults")]
+impl FaultProfile {
+    pub fn new(inner: Arc<dyn ProfileBackend>, control: PathBuf) -> Self {
+        Self {
+            inner,
+            control,
+            gate: Mutex::new(()),
+        }
+    }
+
+    fn take(&self, verb: &str) -> bool {
+        let Ok(_gate) = self.gate.lock() else {
+            return false;
+        };
+        let Ok(text) = std::fs::read_to_string(&self.control) else {
+            return false;
+        };
+        if !text.lines().any(|line| line.trim() == verb) {
+            return false;
+        }
+        let kept: Vec<&str> = text.lines().filter(|line| line.trim() != verb).collect();
+        let mut next = kept.join("\n");
+        if !next.is_empty() {
+            next.push('\n');
+        }
+        std::fs::write(&self.control, next).is_ok()
+    }
+
+    /// 暂停只在下一次 save 入口生效；测试移除指令后继续，超时防止挂死。
+    fn wait_resume(&self) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            let paused = std::fs::read_to_string(&self.control)
+                .map(|text| text.lines().any(|line| line.trim() == "pause-save"))
+                .unwrap_or(false);
+            if !paused {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+#[cfg(feature = "test-faults")]
+impl ProfileBackend for FaultProfile {
+    fn load(&self, owner: &[u16]) -> Result<LoadResult, ProfileError> {
+        self.inner.load(owner)
+    }
+
+    fn save(
+        &self,
+        owner: &[u16],
+        revision: &StateJson,
+        state: Option<&StateJson>,
+    ) -> Result<(), ProfileError> {
+        self.wait_resume();
+        let reject = self.take("reject-save");
+        let drop_reply = !reject && self.take("drop-save-reply");
+        if reject {
+            return Err(ProfileError::invalid_state());
+        }
+        let result = self.inner.save(owner, revision, state);
+        match result {
+            Ok(()) if drop_reply => Err(ProfileError::conflict()),
+            other => other,
+        }
+    }
+
+    fn status(&self) -> Result<Value, ProfileError> {
+        self.inner.status()
+    }
+
+    fn kind(&self) -> &'static str {
+        self.inner.kind()
+    }
+
+    fn display(&self) -> String {
+        self.inner.display()
+    }
+}
+
 struct ConnectionTasks {
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }

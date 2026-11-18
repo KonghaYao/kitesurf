@@ -33,6 +33,15 @@ fn main() {
             eprintln!("fake engine failed");
             std::process::exit(7);
         }
+        "diagnostic-exit" => {
+            eprint!("[ks-gc] {{\"at\":1,\"done\":2,\"extra\":\"synthetic-output-sensitive\"}} UnCaUgHt Error");
+            std::process::exit(0);
+        }
+        "delayed-exit" => {
+            std::thread::sleep(Duration::from_millis(100));
+            eprint!("workerd INTERNAL   ERROR synthetic-output-sensitive");
+            std::process::exit(7);
+        }
         "silent" => sleep(),
         "inherit" => inherit(),
         "hold" => {

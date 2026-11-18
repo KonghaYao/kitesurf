@@ -139,6 +139,7 @@ export async function startNativeHost({
   profile,
   createProfile = false,
   env,
+  expectedFailure = false,
 }) {
   const directory = mkdtempSync(join(tmpdir(), "ks-native-host-"));
   const observerPath = observe || join(directory, "observe.jsonl");
@@ -186,7 +187,12 @@ export async function startNativeHost({
   child.stderr.on("data", (chunk) => {
     stderr += chunk;
   });
-  const exit = once(child, "exit").then(([code, signal]) => ({ code, signal }));
+  const exit = once(child, "close").then(([code, signal]) => {
+    if (!expectedFailure && (readEvents(observerPath).some((event) => event.kind === "engine-diagnostic") || /uncaught|internal[\s_-]+error/i.test(stderr))) {
+      process.exitCode = 1;
+    }
+    return { code, signal };
+  });
   const ready = await new Promise((resolve, reject) => {
     const timer = setTimeout(
       () => reject(new Error(`no ready line; stderr: ${stderr.slice(-4000)}`)),
@@ -214,9 +220,15 @@ export async function startNativeHost({
         ),
       );
     });
-  }).catch((error) => {
-    child.kill("SIGKILL");
+  }).catch(async (error) => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    const status = await withTimeout(exit, 10_000);
+    if (status.timeout) {
+      child.kill("SIGKILL");
+      await exit;
+    }
     rmSync(runRoot, { recursive: true, force: true });
+    if (expectedFailure && !status.timeout && status.code !== 0) return { failed: true };
     throw error;
   });
   const host = {
@@ -242,7 +254,14 @@ export async function startNativeHost({
         const status = await withTimeout(exit, timeout);
         if (status.timeout) {
           child.kill("SIGKILL");
+          await exit;
           throw new Error(`host did not exit after ${signal}; stderr: ${stderr.slice(-4000)}`);
+        }
+        if (!expectedFailure) {
+          const fatal = readEvents(observerPath).some((event) => event.kind === "engine-diagnostic");
+          if (fatal || /uncaught|internal[\s_-]+error/i.test(stderr)) {
+            throw new Error("unexpected engine fatal diagnostic");
+          }
         }
         return status;
       } finally {

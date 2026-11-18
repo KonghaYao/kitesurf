@@ -6,7 +6,6 @@
 // 事件。stdout/stderr、控制管道和子进程退出并行监控；关闭时先发 SIGTERM，超时后升级为
 // SIGKILL，并回收子进程。
 
-use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -14,12 +13,14 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
 
 use crate::observe::Observer;
@@ -28,7 +29,8 @@ use crate::HostResult;
 
 const CONTROL_FD: RawFd = 3;
 const LISTENER_FD: RawFd = 4;
-const LINE_TAIL_LIMIT: usize = 200;
+const FONT_MARKER: &str = "[kitesurf-fonts] registered ";
+const FONT_PHRASE: &str = " Latin UA fonts (";
 
 pub enum EngineSocket {
     /// 该路径由 workerd 自己绑定；宿主随后连接它。
@@ -142,13 +144,92 @@ enum ControlMessage {
     Invalid(String),
 }
 
+/// 引擎输出只以固定类别计数保留；原始行（含页面日志）不落盘、不回传给 client。
+#[derive(Default)]
+struct OutputCounts {
+    stdout: AtomicU64,
+    stderr: AtomicU64,
+}
+
+impl OutputCounts {
+    fn bump(&self, stream: &'static str) {
+        let counter = if stream == "stdout" {
+            &self.stdout
+        } else {
+            &self.stderr
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn summary(&self) -> String {
+        let (stdout, stderr) = self.lines();
+        format!("; output lines: stdout {stdout}, stderr {stderr}")
+    }
+
+    fn lines(&self) -> (u64, u64) {
+        (
+            self.stdout.load(Ordering::Relaxed),
+            self.stderr.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineDiagnostic {
+    Uncaught,
+    InternalError,
+    OutputReadFailed,
+}
+
+impl EngineDiagnostic {
+    pub fn category(self) -> &'static str {
+        match self {
+            Self::Uncaught => "uncaught",
+            Self::InternalError => "internal-error",
+            Self::OutputReadFailed => "output-read-failed",
+        }
+    }
+}
+
+struct Diagnostics {
+    fatal: watch::Sender<Option<EngineDiagnostic>>,
+    uncaught: AtomicU64,
+    internal: AtomicU64,
+    read_failed: AtomicU64,
+}
+
+impl Diagnostics {
+    fn record(&self, diagnostic: EngineDiagnostic, observer: &Observer) {
+        let counter = match diagnostic {
+            EngineDiagnostic::Uncaught => &self.uncaught,
+            EngineDiagnostic::InternalError => &self.internal,
+            EngineDiagnostic::OutputReadFailed => &self.read_failed,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        self.fatal.send_if_modified(|fatal| {
+            if fatal.is_some() {
+                return false;
+            }
+            *fatal = Some(diagnostic);
+            true
+        });
+        observer.with(
+            "engine-diagnostic",
+            json!({ "category": diagnostic.category() }),
+        );
+        eprintln!("kitesurf: engine-diagnostic: {}", diagnostic.category());
+    }
+}
+
 pub struct RunningEngine {
     pid: u32,
     pub socket: EngineSocket,
     control: mpsc::UnboundedReceiver<ControlMessage>,
     exit: Option<oneshot::Receiver<std::process::ExitStatus>>,
     exit_status: Option<ExitInfo>,
-    tail: Arc<Mutex<VecDeque<String>>>,
+    counts: Arc<OutputCounts>,
+    diagnostics: Arc<Diagnostics>,
+    readers: Vec<JoinHandle<()>>,
     observer: Arc<Observer>,
     pub socket_name: String,
     startup_timeout: Duration,
@@ -158,19 +239,24 @@ pub struct RunningEngine {
 impl RunningEngine {
     /// 等待指定 socket 的 listen 事件；其他事件或提前退出均视为失败。
     pub async fn wait_ready(&mut self) -> HostResult<ListenInfo> {
+        let mut fatal = self.fatal_watch();
+        self.check_diagnostics()?;
         let deadline = Instant::now() + self.startup_timeout;
         let Some(exit) = self.exit.as_mut() else {
             return Err("engine exit watcher is gone".into());
         };
         let observer = self.observer.clone();
-        let tail_handle = self.tail.clone();
+        let counts_handle = self.counts.clone();
         let socket_name = self.socket_name.clone();
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            let tail = tail_text(&tail_handle);
-            return Err(format!("engine did not listen on {socket_name} in time{tail}").into());
+            let counts = counts_handle.summary();
+            return Err(format!("engine did not listen on {socket_name} in time{counts}").into());
         }
         tokio::select! {
+          _ = fatal.wait_for(|value| value.is_some()) => {
+            Err("engine fatal diagnostic".into())
+          }
           message = self.control.recv() => match message {
             Some(ControlMessage::Listen { socket, port }) => {
               if socket != socket_name {
@@ -186,6 +272,9 @@ impl RunningEngine {
                 "engine-listen",
                 json!({ "socket": socket, "port": port, "path": path }),
               );
+              if self.diagnostics.fatal.borrow().is_some() {
+                return Err("engine fatal diagnostic".into());
+              }
               Ok(ListenInfo { port })
             }
             Some(ControlMessage::Invalid(line)) => {
@@ -200,8 +289,8 @@ impl RunningEngine {
                 }));
                 self.exit_status = Some(info);
                 self.reaped = true;
-                let tail = tail_text(&tail_handle);
-                Err(format!("engine exited during startup ({info}){tail}").into())
+                let counts = counts_handle.summary();
+                Err(format!("engine exited during startup ({info}){counts}").into())
               } else {
                 Err("engine control pipe closed during startup".into())
               }
@@ -213,12 +302,12 @@ impl RunningEngine {
             }));
             self.exit_status = Some(info);
             self.reaped = true;
-            let tail = tail_text(&tail_handle);
-            Err(format!("engine exited during startup ({info}){tail}").into())
+            let counts = counts_handle.summary();
+            Err(format!("engine exited during startup ({info}){counts}").into())
           }
           _ = tokio::time::sleep(remaining) => {
-            let tail = tail_text(&tail_handle);
-            Err(format!("engine did not listen on {socket_name} in time{tail}").into())
+            let counts = counts_handle.summary();
+            Err(format!("engine did not listen on {socket_name} in time{counts}").into())
           }
         }
     }
@@ -237,20 +326,40 @@ impl RunningEngine {
         }
     }
 
-    /// 只等待一次子进程退出；后续调用返回已记住的状态。
+    pub fn fatal_watch(&self) -> watch::Receiver<Option<EngineDiagnostic>> {
+        self.diagnostics.fatal.subscribe()
+    }
+
+    pub fn check_diagnostics(&self) -> HostResult<()> {
+        if self.diagnostics.fatal.borrow().is_some() {
+            return Err("engine fatal diagnostic".into());
+        }
+        Ok(())
+    }
+
+    async fn drain_output(&mut self) {
+        while let Some(reader) = self.readers.last_mut() {
+            if reader.await.is_err() {
+                self.diagnostics
+                    .record(EngineDiagnostic::OutputReadFailed, &self.observer);
+            }
+            self.readers.pop();
+        }
+    }
+
+    /// 等待取消不会丢失 reap receiver；返回前必须排空两条输出管道。
     pub async fn wait_exit(&mut self) -> ExitInfo {
-        if let Some(status) = self.exit_status {
-            return status;
+        if self.exit_status.is_none() {
+            if let Some(exit) = self.exit.as_mut() {
+                let frame = exit
+                    .await
+                    .unwrap_or_else(|_| std::process::ExitStatus::from_raw(1 << 8));
+                self.exit_status = Some(ExitInfo::from_status(frame));
+                self.reaped = true;
+                self.exit = None;
+            }
         }
-        if let Some(exit) = self.exit.take() {
-            let frame = exit
-                .await
-                .unwrap_or_else(|_| std::process::ExitStatus::from_raw(0));
-            let info = ExitInfo::from_status(frame);
-            self.exit_status = Some(info);
-            self.reaped = true;
-            return info;
-        }
+        self.drain_output().await;
         self.exit_status.unwrap_or(ExitInfo {
             code: None,
             signal: None,
@@ -263,34 +372,42 @@ impl RunningEngine {
 
     /// 先 SIGTERM，限时等待，再 SIGKILL；等待任务在任一路径上都会回收子进程。
     pub async fn shutdown(&mut self) -> ExitInfo {
-        if let Some(status) = self.exit_status {
-            return status;
+        if !self.has_exited() {
+            kill(self.pid, libc::SIGTERM);
         }
-        kill(self.pid, libc::SIGTERM);
-        if let Ok(status) = timeout(Duration::from_secs(5), self.wait_exit()).await {
-            self.observer.with(
-        "engine-exit",
-        json!({ "kind": "engine-exit", "code": status.code, "signal": status.signal, "reaped": true }),
-      );
-            return status;
-        }
-        kill(self.pid, libc::SIGKILL);
-        let status = self.wait_exit().await;
+        let status = match timeout(Duration::from_secs(5), self.wait_exit()).await {
+            Ok(status) => status,
+            Err(_) => {
+                kill(self.pid, libc::SIGKILL);
+                self.wait_exit().await
+            }
+        };
+        let (stdout, stderr) = self.counts.lines();
         self.observer.with(
-      "engine-exit",
-      json!({ "kind": "engine-exit", "code": status.code, "signal": status.signal, "reaped": true }),
-    );
+            "engine-exit",
+            json!({ "code": status.code, "signal": status.signal, "reaped": self.reaped,
+                "stdoutLines": stdout, "stderrLines": stderr,
+                "fatal": self.check_diagnostics().is_err(),
+                "uncaught": self.diagnostics.uncaught.load(Ordering::Relaxed),
+                "internalErrors": self.diagnostics.internal.load(Ordering::Relaxed),
+                "outputReadFailures": self.diagnostics.read_failed.load(Ordering::Relaxed) }),
+        );
         status
     }
 }
 
-fn tail_text(tail: &Arc<Mutex<VecDeque<String>>>) -> String {
-    let tail = tail.lock().expect("tail");
-    if tail.is_empty() {
-        return String::new();
-    }
-    let joined = tail.iter().cloned().collect::<Vec<_>>().join(" | ");
-    format!("; last output: {joined}")
+/// 只识别字体加载器自己的计数行；重新输出时仅保留两个数字字段，其他内容丢弃。
+fn font_registration(line: &str) -> Option<(u64, u64)> {
+    let rest = line.split_once(FONT_MARKER)?.1;
+    let (families, rest) = rest.split_once(FONT_PHRASE)?;
+    let (bytes, rest) = rest.split_once(" bytes)")?;
+    let families = families.parse::<u64>().ok()?;
+    let bytes = bytes.parse::<u64>().ok()?;
+    let rest = rest.trim();
+    let rest = rest.strip_prefix("in ")?;
+    let rest = rest.strip_suffix("ms")?;
+    rest.parse::<f64>().ok()?;
+    Some((families, bytes))
 }
 
 impl Drop for RunningEngine {
@@ -341,19 +458,37 @@ pub async fn spawn(spec: EngineSpec) -> HostResult<RunningEngine> {
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let tail = Arc::new(Mutex::new(VecDeque::with_capacity(LINE_TAIL_LIMIT)));
+    let counts = Arc::new(OutputCounts::default());
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let control_file = unsafe { File::from_raw_fd(read_fd) };
     spawn_control_reader(control_file, control_tx);
 
+    let (fatal, _) = watch::channel(None);
+    let diagnostics = Arc::new(Diagnostics {
+        fatal,
+        uncaught: AtomicU64::new(0),
+        internal: AtomicU64::new(0),
+        read_failed: AtomicU64::new(0),
+    });
+    let mut readers = Vec::new();
     let observer = spec.observer.clone();
-    let tail_for_stdout = tail.clone();
-    let tail_for_stderr = tail.clone();
     if let Some(stdout) = stdout {
-        spawn_line_reader("stdout", stdout, observer.clone(), tail_for_stdout);
+        readers.push(spawn_line_reader(
+            "stdout",
+            stdout,
+            observer.clone(),
+            counts.clone(),
+            diagnostics.clone(),
+        ));
     }
     if let Some(stderr) = stderr {
-        spawn_line_reader("stderr", stderr, observer, tail_for_stderr);
+        readers.push(spawn_line_reader(
+            "stderr",
+            stderr,
+            observer,
+            counts.clone(),
+            diagnostics.clone(),
+        ));
     }
 
     let (exit_tx, exit_rx) = oneshot::channel();
@@ -369,7 +504,9 @@ pub async fn spawn(spec: EngineSpec) -> HostResult<RunningEngine> {
         control: control_rx,
         exit: Some(exit_rx),
         exit_status: None,
-        tail,
+        counts,
+        diagnostics,
+        readers,
         observer: spec.observer,
         socket_name: spec.socket_name,
         startup_timeout: spec.startup_timeout,
@@ -418,42 +555,262 @@ fn spawn_control_reader(file: File, sender: mpsc::UnboundedSender<ControlMessage
     });
 }
 
-fn spawn_line_reader<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
-    stream: &'static str,
-    reader: R,
-    observer: Arc<Observer>,
-    tail: Arc<Mutex<VecDeque<String>>>,
-) {
-    tokio::spawn(async move {
-        use tokio::io::AsyncBufReadExt;
-        let mut lines = tokio::io::BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if stream == "stdout" {
-                eprintln!("[engine] {line}");
+struct OutputScanner {
+    line: Vec<u8>,
+    tail: Vec<u8>,
+    oversized: bool,
+    fatal: u8,
+    seen: bool,
+}
+
+impl OutputScanner {
+    fn new() -> Self {
+        Self {
+            line: Vec::new(),
+            tail: Vec::new(),
+            oversized: false,
+            fatal: 0,
+            seen: false,
+        }
+    }
+
+    fn byte(&mut self, byte: u8, diagnostics: &Diagnostics, observer: &Observer) {
+        self.seen = true;
+        // ASCII 空白显式含 VT；Rust 的 is_ascii_whitespace 不含它。
+        let normalized = if matches!(
+            byte,
+            b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r' | b'-' | b'_'
+        ) {
+            b' '
+        } else {
+            byte.to_ascii_lowercase()
+        };
+        if normalized != b' ' || self.tail.last() != Some(&b' ') {
+            self.tail.push(normalized);
+        }
+        if self.tail.len() > 64 {
+            self.tail.remove(0);
+        }
+        self.detect(
+            b"uncaught",
+            1,
+            EngineDiagnostic::Uncaught,
+            diagnostics,
+            observer,
+        );
+        self.detect(
+            b"internal error",
+            2,
+            EngineDiagnostic::InternalError,
+            diagnostics,
+            observer,
+        );
+        if !self.oversized {
+            if self.line.len() == 8192 {
+                self.line.clear();
+                self.oversized = true;
             } else {
-                eprintln!("[engine:err] {line}");
-            }
-            if let Some(marker) = line.find("[ks-gc]") {
-                if let Ok(value) = serde_json::from_str::<Value>(line[marker + 7..].trim()) {
-                    let mut event = value;
-                    if let Value::Object(map) = &mut event {
-                        map.insert("kind".to_string(), json!("gc"));
-                    }
-                    observer.record(event);
-                }
-            }
-            if let Ok(mut guard) = tail.lock() {
-                if guard.len() == LINE_TAIL_LIMIT {
-                    guard.pop_front();
-                }
-                guard.push_back(line);
+                self.line.push(byte);
             }
         }
-    });
+    }
+
+    fn detect(
+        &mut self,
+        pattern: &[u8],
+        bit: u8,
+        kind: EngineDiagnostic,
+        diagnostics: &Diagnostics,
+        observer: &Observer,
+    ) {
+        if self.fatal & bit == 0 && self.tail.ends_with(pattern) {
+            self.fatal |= bit;
+            diagnostics.record(kind, observer);
+        }
+    }
+
+    fn finish(&mut self, stream: &'static str, counts: &OutputCounts, observer: &Observer) {
+        if !self.seen {
+            return;
+        }
+        counts.bump(stream);
+        if self.fatal == 0 && !self.oversized {
+            safe_output(&String::from_utf8_lossy(&self.line), observer);
+        }
+        self.line.clear();
+        self.tail.clear();
+        self.oversized = false;
+        self.fatal = 0;
+        self.seen = false;
+    }
+}
+
+fn safe_output(line: &str, observer: &Observer) {
+    if let Some(marker) = line.find("[ks-gc]") {
+        if let Ok(value) = serde_json::from_str::<Value>(line[marker + 7..].trim()) {
+            let numeric = |key: &str| {
+                value.get(key).and_then(Value::as_f64).filter(|value| {
+                    value.is_finite() && *value >= 0.0 && *value <= 9_007_199_254_740_991.0
+                })
+            };
+            if let (Some(at), Some(done)) = (numeric("at"), numeric("done")) {
+                observer.record(json!({ "kind": "gc", "at": at, "done": done }));
+            }
+        }
+        return;
+    }
+    if let Some((families, bytes)) = font_registration(line) {
+        eprintln!("[engine] fonts: registered {families} Latin UA fonts ({bytes} bytes)");
+    }
+}
+
+fn spawn_line_reader<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+    stream: &'static str,
+    mut reader: R,
+    observer: Arc<Observer>,
+    counts: Arc<OutputCounts>,
+    diagnostics: Arc<Diagnostics>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut scanner = OutputScanner::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let length = match reader.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(length) => length,
+                Err(_) => {
+                    diagnostics.record(EngineDiagnostic::OutputReadFailed, &observer);
+                    break;
+                }
+            };
+            for byte in &chunk[..length] {
+                if *byte == b'\n' {
+                    scanner.finish(stream, &counts, &observer);
+                } else {
+                    scanner.byte(*byte, &diagnostics, &observer);
+                }
+            }
+        }
+        scanner.finish(stream, &counts, &observer);
+    })
 }
 
 fn kill(pid: u32, signal: i32) {
     unsafe {
         libc::kill(pid as libc::pid_t, signal);
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_scanner_finds_split_fatals_after_long_payload_before_markers() {
+        let (fatal, _) = watch::channel(None);
+        let diagnostics = Diagnostics {
+            fatal,
+            uncaught: AtomicU64::new(0),
+            internal: AtomicU64::new(0),
+            read_failed: AtomicU64::new(0),
+        };
+        let observer = Observer::disabled();
+        let mut scanner = OutputScanner::new();
+        for byte in std::iter::repeat_n(b'x', 100_000).chain(
+            b" UnCaUgHt [ks-gc] INTERNAL\t ERROR [kitesurf-fonts]"
+                .iter()
+                .copied(),
+        ) {
+            scanner.byte(byte, &diagnostics, &observer);
+            assert!(scanner.line.len() <= 8192);
+            assert!(scanner.tail.len() <= 64);
+        }
+        assert_eq!(diagnostics.uncaught.load(Ordering::Relaxed), 1);
+        assert_eq!(diagnostics.internal.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *diagnostics.fatal.borrow(),
+            Some(EngineDiagnostic::Uncaught)
+        );
+    }
+
+    #[test]
+    fn ascii_whitespace_separated_internal_error_is_fatal_at_eof() {
+        let observer = Observer::disabled();
+        // 最终排空无换行：原反例的 VT 分隔必须命中同一固定类别。
+        let (fatal, _) = watch::channel(None);
+        let diagnostics = Diagnostics {
+            fatal,
+            uncaught: AtomicU64::new(0),
+            internal: AtomicU64::new(0),
+            read_failed: AtomicU64::new(0),
+        };
+        let mut scanner = OutputScanner::new();
+        for chunk in b"workerd INTERNAL\x0bERROR".chunks(7) {
+            for byte in chunk {
+                scanner.byte(*byte, &diagnostics, &observer);
+            }
+        }
+        assert_eq!(diagnostics.internal.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *diagnostics.fatal.borrow(),
+            Some(EngineDiagnostic::InternalError)
+        );
+
+        // 单行 SP/TAB/VT/FF/CR 与连字符/下划线；LF 由生产 reader 划分日志行。
+        for separator in *b" \t\x0b\x0c\r-_" {
+            let (fatal, _) = watch::channel(None);
+            let diagnostics = Diagnostics {
+                fatal,
+                uncaught: AtomicU64::new(0),
+                internal: AtomicU64::new(0),
+                read_failed: AtomicU64::new(0),
+            };
+            let mut scanner = OutputScanner::new();
+            let mut bytes = vec![b'x'; 9_000];
+            bytes.extend_from_slice(b"WoRkErD InTeRnAl");
+            bytes.push(separator);
+            bytes.extend_from_slice(b"ErRoR");
+            for chunk in bytes.chunks(7) {
+                for byte in chunk {
+                    scanner.byte(*byte, &diagnostics, &observer);
+                }
+            }
+            assert_eq!(
+                diagnostics.internal.load(Ordering::Relaxed),
+                1,
+                "separator {separator:#04x}"
+            );
+            assert_eq!(
+                *diagnostics.fatal.borrow(),
+                Some(EngineDiagnostic::InternalError),
+                "separator {separator:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn gc_reconstructs_numeric_allowlist_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events");
+        let observer = Observer::create(&path).unwrap();
+        safe_output(
+            r#"[ks-gc] {"at":1,"done":2,"extra":{"secret":"synthetic-output-sensitive"}}"#,
+            &observer,
+        );
+        for invalid in [
+            r#"{"at":"1","done":2}"#,
+            r#"{"at":-1,"done":2}"#,
+            r#"{"at":1,"done":{}}"#,
+            r#"{"at":1e100,"done":2}"#,
+        ] {
+            safe_output(&format!("[ks-gc] {invalid}"), &observer);
+        }
+        let text = std::fs::read_to_string(path).unwrap();
+        let values: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(values, vec![json!({"kind":"gc","at":1.0,"done":2.0})]);
     }
 }

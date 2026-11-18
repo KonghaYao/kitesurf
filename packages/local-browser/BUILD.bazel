@@ -103,6 +103,115 @@ node_test(
     ]
 ]
 
+# T4 公共 broker 契约：同一套断言分别跑 native（默认）和 Node oracle；Rust 内部时序由
+# native:broker_test 证明。
+[
+    node_test(
+        name = name,
+        size = "large",
+        timeout = "long",
+        args = ["test/broker-contract.test.mjs"],
+        data = [
+            ":runtime",
+            "//packages/engine:local_dist",
+            "//packages/engine:assets",
+            "//packages/local-browser/font-host:kitesurf-font-host",
+        ] + (
+            [
+                "//packages/local-browser/native:generated_config",
+                "//packages/local-browser/native:kitesurf-native",
+                "//packages/local-browser/native:native_assets",
+                "//packages/local-browser/native:workerd_bin",
+            ]
+            if kind == "native"
+            else []
+        ) + glob(["test/*.mjs"]),
+        env = (
+            {
+                "KITESURF_CONFIG_DIR": "$(rootpath //packages/local-browser/native:generated_config)",
+                "KITESURF_ENGINE_ASSETS": "$(rootpath //packages/local-browser/native:native_assets)",
+                "KITESURF_NATIVE_HOST": "$(rootpath //packages/local-browser/native:kitesurf-native)",
+                "KITESURF_WORKERD": "$(rootpath //packages/local-browser/native:workerd_bin)",
+                "KITESURF_BROKER_KIND": "native",
+            }
+            if kind == "native"
+            else {
+                "KITESURF_BROKER_KIND": "node",
+            }
+        ),
+    )
+    for name, kind in [
+        ("broker_contract_test", "native"),
+        ("broker_oracle_test", "node"),
+    ]
+]
+
+# T4 真实 workerd：多 client、重连保持 generation/session/tabs、page endpoint 与 viewer 隔离。
+node_test(
+    name = "broker_engine_test",
+    size = "large",
+    timeout = "long",
+    args = ["test/broker-engine.test.mjs"],
+    data = [
+        ":node_modules/ws",
+        ":runtime",
+        "//packages/local-browser/native:generated_config",
+        "//packages/local-browser/native:kitesurf-native",
+        "//packages/local-browser/native:native_assets",
+        "//packages/local-browser/native:workerd_bin",
+    ] + glob(["test/*.mjs"]),
+    env = {
+        "KITESURF_CONFIG_DIR": "$(rootpath //packages/local-browser/native:generated_config)",
+        "KITESURF_ENGINE_ASSETS": "$(rootpath //packages/local-browser/native:native_assets)",
+        "KITESURF_NATIVE_HOST": "$(rootpath //packages/local-browser/native:kitesurf-native)",
+        "KITESURF_WORKERD": "$(rootpath //packages/local-browser/native:workerd_bin)",
+    },
+)
+
+# supervisor 诊断与关闭状态机的真实 workerd 定向回归。
+node_test(
+    name = "broker_safety_test",
+    size = "large",
+    timeout = "long",
+    args = ["test/broker-safety.test.mjs"],
+    data = [
+        ":node_modules/ws",
+        ":runtime",
+        "//packages/local-browser/native:generated_config",
+        "//packages/local-browser/native:kitesurf-native",
+        "//packages/local-browser/native:native_assets",
+        "//packages/local-browser/native:workerd_bin",
+    ] + glob(["test/*.mjs"]),
+    env = {
+        "KITESURF_CONFIG_DIR": "$(rootpath //packages/local-browser/native:generated_config)",
+        "KITESURF_ENGINE_ASSETS": "$(rootpath //packages/local-browser/native:native_assets)",
+        "KITESURF_NATIVE_HOST": "$(rootpath //packages/local-browser/native:kitesurf-native)",
+        "KITESURF_WORKERD": "$(rootpath //packages/local-browser/native:workerd_bin)",
+    },
+)
+
+# T4 私有故障注入：真实 workerd + SQLite 在 commit 后丢回复，随后提交新值。
+node_test(
+    name = "broker_profile_failure_test",
+    size = "large",
+    timeout = "long",
+    args = ["test/broker-profile-failure.test.mjs"],
+    data = [
+        ":node_modules/ws",
+        ":runtime",
+        "//packages/local-browser/native:generated_config",
+        "//packages/local-browser/native:kitesurf-native-faults",
+        "//packages/local-browser/native:native_assets",
+        "//packages/local-browser/native:workerd_bin",
+    ] + glob(["test/*.mjs"]),
+    env = {
+        "KITESURF_CONFIG_DIR": "$(rootpath //packages/local-browser/native:generated_config)",
+        "KITESURF_ENGINE_ASSETS": "$(rootpath //packages/local-browser/native:native_assets)",
+        "KITESURF_NATIVE_HOST": "$(rootpath //packages/local-browser/native:kitesurf-native-faults)",
+        "KITESURF_WORKERD": "$(rootpath //packages/local-browser/native:workerd_bin)",
+    },
+)
+
 node_test(
     name = "profile_test",
     args = ["test/profile-store.test.mjs", "test/attachments.test.mjs"],

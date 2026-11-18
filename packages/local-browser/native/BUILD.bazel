@@ -16,6 +16,15 @@ js_binary(
     entry_point = "scripts/materialize-codec-patches.mjs",
 )
 
+rust_test(
+    name = "codec_budget_test",
+    size = "small",
+    srcs = ["tests/codec_budget_test.rs"],
+    edition = "2021",
+    rustc_env_files = [":cargo_env"],
+    deps = [":kitesurf_local_host"] + all_crate_deps(package_name = "", normal = True),
+)
+
 cargo_toml_env_vars(
     name = "cargo_env",
     src = "Cargo.toml",
@@ -38,6 +47,28 @@ rust_binary(
     rustc_env_files = [":cargo_env"],
     deps = [":kitesurf_local_host"] + all_crate_deps(package_name = "", normal = True),
     visibility = ["//visibility:public"],
+)
+
+# 与发行二进制相同的源码，只多启用 test-faults；测试注入不进入发行产物。
+rust_library(
+    name = "kitesurf_local_host_faults",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]) + ["tests/broker_test.rs"],
+    crate_name = "kitesurf_local_host",
+    crate_features = ["test-faults"],
+    crate_root = "src/lib.rs",
+    edition = "2021",
+    rustc_env_files = [":cargo_env"],
+    deps = all_crate_deps(package_name = "", normal = True),
+)
+
+rust_binary(
+    name = "kitesurf-native-faults",
+    srcs = ["src/main.rs"],
+    crate_features = ["test-faults"],
+    edition = "2021",
+    rustc_env_files = [":cargo_env"],
+    deps = [":kitesurf_local_host_faults"] + all_crate_deps(package_name = "", normal = True),
+    visibility = ["//packages/local-browser:__pkg__"],
 )
 
 rust_binary(
@@ -71,6 +102,19 @@ rust_test(
 )
 
 rust_test(
+    name = "broker_test",
+    size = "small",
+    crate = ":kitesurf_local_host_faults",
+    crate_features = ["test-faults"],
+    edition = "2021",
+    rustc_env_files = [":cargo_env"],
+    deps = all_crate_deps(
+        package_name = "",        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "unit_test",
     crate = ":kitesurf_local_host",
     edition = "2021",
@@ -96,9 +140,13 @@ rust_test(
 )
 
 rust_lint_tests(targets = [
+    ":codec_budget_test",
+    ":broker_test",
     ":fake_engine",
     ":kitesurf-native",
+    ":kitesurf-native-faults",
     ":kitesurf_local_host",
+    ":kitesurf_local_host_faults",
     ":profile_harness",
     ":profile_test",
     ":supervisor_test",

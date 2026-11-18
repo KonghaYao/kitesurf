@@ -5,6 +5,8 @@
 // T0-T2 的原生本地宿主：进程监管、私有 profile 与资源服务，以及仅用于测试的单客户端 CDP
 // 中继。正式的 SQLite profile 与多客户端代理属于后续任务。
 
+pub mod attachments;
+pub mod broker;
 pub mod observe;
 pub mod profile;
 pub mod profile_state;

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kitesurf_local_host::observe::Observer;
-use kitesurf_local_host::supervisor::{self, EngineSocket, EngineSpec, RunningEngine};
+use kitesurf_local_host::supervisor::{self, EngineDiagnostic, EngineSocket, EngineSpec, RunningEngine};
 use kitesurf_local_host::transport::UpstreamAddress;
 use tokio::net::TcpListener;
 
@@ -71,6 +71,83 @@ async fn listen_socket() -> (TcpListener, PathBuf) {
         .await
         .expect("bind listener");
     (listener, PathBuf::from("unused-engine.sock"))
+}
+
+#[tokio::test]
+async fn exit_drains_fatal_output_and_preserves_reap_after_cancellation() {
+    for mode in ["diagnostic-exit", "delayed-exit"] {
+        let (listener, _) = listen_socket().await;
+        let mut engine = supervisor::spawn(custom(
+            mode,
+            EngineSocket::Inherited(listener),
+            Duration::from_secs(5),
+        ))
+        .await
+        .expect("spawn");
+        if mode == "delayed-exit" {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), engine.wait_exit())
+                    .await
+                    .is_err()
+            );
+        }
+        let status = engine.wait_exit().await;
+        assert_eq!(
+            status.code,
+            Some(if mode == "delayed-exit" { 7 } else { 0 })
+        );
+        assert!(engine.has_exited());
+        assert!(engine.check_diagnostics().is_err());
+        assert!(engine.fatal_watch().borrow().is_some());
+        assert_eq!(engine.shutdown().await.code, status.code);
+    }
+}
+
+#[tokio::test]
+async fn final_drain_vertical_tab_diagnostic_is_fatal_on_both_streams() {
+    // 最终排空无换行：VT 必须与 SP/TAB/FF/CR 一样作为固定类别分隔符。
+    for redirect in ["", " >&2"] {
+        let (listener, _) = listen_socket().await;
+        let script = format!("printf 'workerd INTERNAL\\013ERROR'{redirect}");
+        let spec = EngineSpec::custom(
+            "/bin/sh",
+            vec![OsString::from("-c"), OsString::from(script)],
+            EngineSocket::Inherited(listener),
+            Duration::from_secs(5),
+            Arc::new(Observer::disabled()),
+        );
+        let mut engine = supervisor::spawn(spec).await.expect("spawn");
+        let status = engine.wait_exit().await;
+        assert_eq!(status.code, Some(0));
+        assert!(engine.has_exited());
+        assert!(engine.check_diagnostics().is_err());
+        assert_eq!(
+            *engine.fatal_watch().borrow(),
+            Some(EngineDiagnostic::InternalError)
+        );
+    }
+}
+
+#[tokio::test]
+async fn production_reader_keeps_lf_as_a_log_line_boundary() {
+    for redirect in ["", " >&2"] {
+        let (listener, _) = listen_socket().await;
+        let spec = EngineSpec::custom(
+            "/bin/sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(format!("printf 'workerd INTERNAL\\nERROR'{redirect}")),
+            ],
+            EngineSocket::Inherited(listener),
+            Duration::from_secs(5),
+            Arc::new(Observer::disabled()),
+        );
+        let mut engine = supervisor::spawn(spec).await.expect("spawn");
+        assert_eq!(engine.wait_exit().await.code, Some(0));
+        assert!(engine.has_exited());
+        assert!(engine.check_diagnostics().is_ok());
+        assert_eq!(*engine.fatal_watch().borrow(), None);
+    }
 }
 
 #[tokio::test]

@@ -15,14 +15,16 @@ use std::time::Duration;
 
 use serde_json::json;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::time::timeout;
 
+use kitesurf_local_host::broker::{BrokerHandle, CloseKind};
 use kitesurf_local_host::observe::Observer;
 use kitesurf_local_host::profile::ProfileStore;
 use kitesurf_local_host::relay::{HostServer, SessionInfo};
 use kitesurf_local_host::services::{
     MemoryProfile, PrivateServices, ProfileBackend, ProfileService, SqliteProfile,
 };
+#[cfg(feature = "test-faults")]
+use kitesurf_local_host::services::FaultProfile;
 use kitesurf_local_host::supervisor::{self, EngineSocket, EngineSpec};
 use kitesurf_local_host::transport::Upstream;
 use kitesurf_local_host::{describe_error, HostResult};
@@ -306,6 +308,11 @@ async fn run() -> HostResult<bool> {
         Some(path) => Arc::new(SqliteProfile::open(path, args.create_profile)?),
         None => Arc::new(MemoryProfile::new(&args.profile_origin)?),
     };
+    #[cfg(feature = "test-faults")]
+    let backend: Arc<dyn ProfileBackend> = match std::env::var_os("KITESURF_TEST_FAULTS") {
+        Some(path) if !path.is_empty() => Arc::new(FaultProfile::new(backend, PathBuf::from(path))),
+        _ => backend,
+    };
     let profile_service = Arc::new(ProfileService::new(backend));
     let services = PrivateServices::bind(
         run_dir.path(),
@@ -330,8 +337,10 @@ async fn run() -> HostResult<bool> {
     let mut engine = supervisor::spawn(spec).await?;
     let started = async {
         engine.wait_ready().await?;
-        let upstream = Arc::new(Upstream::connect(&engine.endpoint(), observer.clone()).await?);
-        let session = upstream.request("Kitesurf.getSessionInfo", None).await?;
+        let mut upstream = Upstream::connect(&engine.endpoint(), observer.clone()).await?;
+        let session = upstream
+            .request("Kitesurf.getSessionInfo", None, Duration::from_secs(30))
+            .await?;
         let session = SessionInfo {
             session_id: session["sessionId"]
                 .as_str()
@@ -359,30 +368,36 @@ async fn run() -> HostResult<bool> {
         } else {
             "new-profile"
         };
-        let (host, close_requests) = HostServer::bind(
+        engine.check_diagnostics()?;
+        let broker = BrokerHandle::start(upstream, profile_service.clone(), observer.clone())
+            .with_diagnostics(engine.fatal_watch());
+        let host = HostServer::bind(
             args.port,
-            upstream.clone(),
+            broker.clone(),
             session,
             generation.clone(),
             recovery.to_string(),
             profile_service.clone(),
             observer.clone(),
         )?;
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
-            upstream,
-            host,
-            close_requests,
-            generation,
-        ))
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((broker, host, generation))
     }
     .await;
-    let (upstream, host, mut close_requests, generation) = match started {
+    let (broker, host, generation) = match started {
         Ok(started) => started,
         Err(error) => {
-            engine.shutdown().await;
+            let exit = engine.shutdown().await;
+            services.shutdown().await;
+            drop(services);
+            drop(profile_service);
+            let dir_path = run_dir.path().to_path_buf();
+            drop(run_dir);
+            observer.with("shutdown", json!({ "clean": false, "exit": exit.to_string(), "dirRemoved": !dir_path.exists() }));
             return Err(error);
         }
     };
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
     let port = host.port();
     let ready = json!({
       "ready": true,
@@ -397,49 +412,50 @@ async fn run() -> HostResult<bool> {
         json!({ "kind": "ready", "port": port, "generation": generation }),
     );
 
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut closed = upstream.closed_receiver();
+    let mut fatal = engine.fatal_watch();
     let clean = tokio::select! {
       _ = sigterm.recv() => {
         observer.kind("signal-sigterm");
-        true
+        let mut fatal = engine.fatal_watch();
+        tokio::select! {
+            result = broker.close(CloseKind::Host, None, None, None) => result.is_ok(),
+            _ = fatal.wait_for(|value| value.is_some()) => { broker.engine_lost(); false }
+        }
       }
       _ = sigint.recv() => {
         observer.kind("signal-sigint");
-        true
+        let mut fatal = engine.fatal_watch();
+        tokio::select! {
+            result = broker.close(CloseKind::Host, None, None, None) => result.is_ok(),
+            _ = fatal.wait_for(|value| value.is_some()) => { broker.engine_lost(); false }
+        }
       }
-      request = close_requests.recv() => {
-        observer.with("close-requested", json!({ "kind": "close-requested", "present": request.is_some() }));
-        true
-      }
-      _ = closed.changed() => {
-        let reason = closed
-          .borrow()
-          .clone()
-          .unwrap_or_else(|| "engine CDP connection closed".to_string());
-        eprintln!("kitesurf: {reason}");
-        observer.with("engine-lost", json!({ "kind": "engine-lost", "reason": reason }));
+      clean = broker.wait_terminal() => clean,
+      _ = fatal.wait_for(|value| value.is_some()) => {
+        broker.engine_lost();
         false
+      }
+      exit = engine.wait_exit() => {
+        // 正常 Browser.close 也可能先退出 workerd；等待 actor 消化已收到的关闭回复。
+        if exit.code == Some(0) && engine.check_diagnostics().is_ok() {
+            broker.wait_terminal().await
+        } else {
+            broker.engine_lost();
+            false
+        }
       }
     };
 
     host.stop().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    if clean {
-        let _ = timeout(
-            Duration::from_secs(5),
-            upstream.request("Kitesurf.flushProfile", None),
-        )
-        .await;
-    }
-    let _ = timeout(
-        Duration::from_secs(5),
-        upstream.request("Browser.close", None),
-    )
-    .await;
-    upstream.close();
     let exit = engine.shutdown().await;
+    let clean = clean
+        && engine.check_diagnostics().is_ok()
+        && broker.lost_watch().borrow().is_none()
+        && (exit.code == Some(0) || exit.signal == Some(libc::SIGTERM));
+    if engine.check_diagnostics().is_err() {
+        broker.engine_lost();
+    }
     services.shutdown().await;
     drop(services);
     drop(profile_service);
