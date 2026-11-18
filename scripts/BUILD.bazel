@@ -236,11 +236,23 @@ js_library(
 js_binary(
     name = "e2e_shard",
     data = [
+        "e2e-run.mjs",
         "//packages/engine:package_json",
         "//packages/engine:node_modules/vitest",
     ],
     entry_point = "e2e-shard.mjs",
     visibility = ["//packages/engine/test/e2e:__pkg__"],
+)
+
+node_test(
+    name = "e2e_harness_test",
+    args = ["e2e-run.test.mjs", "e2e-shard.test.mjs"],
+    data = [
+        "e2e-run.mjs",
+        "e2e-run.test.mjs",
+        "e2e-shard.mjs",
+        "e2e-shard.test.mjs",
+    ],
 )
 
 js_binary(

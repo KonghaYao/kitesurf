@@ -10,6 +10,8 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, resolve, sep } from "node:path";
 
+import { uncaughtLinesIn } from "./e2e-run.mjs";
+
 // Bazel supplies the engine directory in its bin tree, including the external repository prefix.
 // Resolve Vitest and its inputs from that same tree so it is loaded only once.
 const USAGE = `usage: node scripts/e2e-shard.mjs --engine-dist <dir> --fixtures-dist <dir> --out-dir <dir>
@@ -107,6 +109,9 @@ function main(options) {
     (file) => !ranNames.some((name) => name.endsWith(`/packages/engine/${file}`)),
   );
   if (missing.length) fail(`vitest skipped ${missing.length} file(s): ${missing.join(", ")}`, log);
+  // Workerd's uncaught lines land on stderr; Vitest can still exit 0 and pass assertions.
+  const uncaught = uncaughtLinesIn(readFileSync(log, "utf8"));
+  if (uncaught.length) fail(`workerd reported ${uncaught.length} uncaught exception line(s)`, log);
   writeFileSync(
     resolve(options.outDir, "shard.json"),
     JSON.stringify(
