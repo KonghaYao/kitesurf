@@ -53,6 +53,80 @@ bazel run //packages/local-browser:package
 The output includes the executable, licenses, a dependency inventory, and its
 SHA-256 checksum.
 
+## CDP protocol
+
+Kitesurf exposes the Chrome DevTools Protocol over WebSocket. The client does
+not have to be Chrome.
+
+| Endpoint                                 | Purpose                                                |
+| ---------------------------------------- | ------------------------------------------------------ |
+| `ws://127.0.0.1:8787/devtools/browser`   | Browser target for Puppeteer and Playwright            |
+| `ws://127.0.0.1:8787/devtools/page/<id>` | One page target                                        |
+| `GET /json/version`                      | Protocol version `1.3` and the browser WebSocket URL   |
+| `GET /json/list`                         | Open pages with their page WebSocket and DevTools URLs |
+| `GET /session`                           | Session, profile, controller and tab snapshot          |
+
+`/json/version` and `/json/list` are the discovery protocol that
+`chrome://inspect`, Puppeteer and Playwright already understand. Each page
+entry includes `devtoolsFrontendUrl`, so Chrome's inspect page can open DevTools
+directly. The port follows `--port`.
+
+Kitesurf implements the CDP domains it needs. Unsupported commands and
+Chrome-only DevTools panels are not emulated.
+
+## Core workflow: agents and Chrome DevTools
+
+The intended setup pairs Kitesurf with the
+[Chrome DevTools skill](https://github.com/ChromeDevTools/chrome-devtools-mcp).
+Kitesurf keeps the session and profile; the skill supplies the agent tools, and
+Chrome DevTools stays available for a human takeover.
+
+Start the browser:
+
+```bash
+kitesurf serve
+```
+
+Point `chrome-devtools-mcp` at it instead of letting the server launch Chrome:
+
+```json
+{
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "chrome-devtools-mcp@latest",
+        "--browser-url=http://127.0.0.1:8787",
+        "--no-usage-statistics"
+      ]
+    }
+  }
+}
+```
+
+Verified calls include `list_pages`, `navigate_page`, `take_snapshot`,
+`evaluate_script`, and `take_screenshot`. The remaining skill tools depend on
+the CDP domains Kitesurf implements; treat them as best effort.
+
+The CLI speaks the same protocol:
+
+```bash
+npx -y -p chrome-devtools-mcp@latest chrome-devtools start --browserUrl http://127.0.0.1:8787
+npx -y -p chrome-devtools-mcp@latest chrome-devtools list_pages
+```
+
+For a login or captcha, disconnect the agent controller or run
+`kitesurf control --owner human --takeover`. Then open
+`chrome://inspect/#devices`, enable network target discovery, add
+`127.0.0.1:8787`, and inspect the page. Close the DevTools window when finished;
+the tab keeps running and the agent reconnects to the same page. Cookies and
+localStorage survive `kitesurf stop` and the next `kitesurf serve`.
+
+`chrome-devtools-mcp` targets Chrome. Kitesurf implements a subset of CDP, so
+Chrome-only tools such as performance traces, Lighthouse audits, extensions, and
+heap snapshots may fail. Puppeteer and Playwright remain the stable baseline.
+
 > [!IMPORTANT]
 > Deploying the engine to Cloudflare requires Dynamic Workers, which are part
 > of the [Workers Paid plan](https://developers.cloudflare.com/dynamic-workers/pricing/).
