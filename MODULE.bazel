@@ -157,8 +157,15 @@ cargo_workspaces.vendor(
     name = "cargo_vendor",
     lockfile = "//:Cargo.lock",
 )
+cargo_workspaces.native_workspace(
+    name = "cargo_ws_native",
+    manifest = "//packages/local-browser/native:Cargo.toml",
+    lockfile = "//packages/local-browser/native:Cargo.lock",
+    patches_marker = "//packages/local-browser/native:patches/manifest.json",
+)
 use_repo(
     cargo_workspaces,
+    "cargo_ws_native",
     "cargo_vendor",
     "cargo_ws_memprof",
     "cargo_ws_core",
@@ -217,9 +224,9 @@ crate.from_cargo(
 )
 crate.from_cargo(
     name = "crates_native",
-    cargo_lockfile = "//packages/local-browser/native:Cargo.lock",
+    cargo_lockfile = "@cargo_ws_native//:Cargo.lock",
     host_tools = "@rust_tools",
-    manifests = ["//packages/local-browser/native:Cargo.toml"],
+    manifests = ["@cargo_ws_native//:Cargo.toml"],
     skip_cargo_lockfile_overwrite = True,
     supported_platform_triples = RUST_HOST_TRIPLES,
 )

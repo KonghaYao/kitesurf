@@ -12,6 +12,15 @@ resolver = "2"
 name = "kitesurf_local_host"
 path = "src/lib.rs"
 
+[[test]]
+name = "broker_test"
+path = "src/lib.rs"
+required-features = ["test-faults"]
+
+# 仅 test-faults 变体启用；发行二进制不编译该路径。
+[features]
+test-faults = []
+
 [[bin]]
 name = "kitesurf-native"
 path = "src/main.rs"
@@ -43,3 +52,7 @@ tokio = { version = "1.53.1", features = [
 ] }
 tokio-tungstenite = { version = "0.27.0", default-features = false, features = ["handshake"] }
 url = "2.5.8"
+
+[patch.crates-io]
+tungstenite = { path = "target/vendor-patched/tungstenite-0.27.0" }
+tokio-tungstenite = { path = "target/vendor-patched/tokio-tungstenite-0.27.0" }

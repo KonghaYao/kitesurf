@@ -8,6 +8,14 @@ load("//bazel:checks.bzl", "node_test")
 load("//bazel:paths.bzl", "bin_relative", "exec_path")
 load("//bazel:rust_checks.bzl", "rust_comments_test", "rust_lint_tests", "rust_nesting_test")
 
+exports_files(glob(["patches/**/*.patch"]) + ["patches/manifest.json"])
+
+js_binary(
+    name = "materialize_codec_patches",
+    data = glob(["patches/**"]),
+    entry_point = "scripts/materialize-codec-patches.mjs",
+)
+
 cargo_toml_env_vars(
     name = "cargo_env",
     src = "Cargo.toml",
@@ -20,7 +28,7 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2021",
     rustc_env_files = [":cargo_env"],
-    deps = all_crate_deps(normal = True),
+    deps = all_crate_deps(package_name = "", normal = True),
 )
 
 rust_binary(
@@ -28,7 +36,7 @@ rust_binary(
     srcs = ["src/main.rs"],
     edition = "2021",
     rustc_env_files = [":cargo_env"],
-    deps = [":kitesurf_local_host"] + all_crate_deps(normal = True),
+    deps = [":kitesurf_local_host"] + all_crate_deps(package_name = "", normal = True),
     visibility = ["//visibility:public"],
 )
 
@@ -37,7 +45,7 @@ rust_binary(
     srcs = ["examples/fake_engine.rs"],
     edition = "2021",
     rustc_env_files = [":cargo_env"],
-    deps = all_crate_deps(normal = True),
+    deps = all_crate_deps(package_name = "", normal = True),
 )
 
 # 仅测试使用的 profile 驱动；发行二进制不含该入口。
@@ -46,7 +54,7 @@ rust_binary(
     srcs = ["examples/profile_harness.rs"],
     edition = "2021",
     rustc_env_files = [":cargo_env"],
-    deps = [":kitesurf_local_host"] + all_crate_deps(normal = True),
+    deps = [":kitesurf_local_host"] + all_crate_deps(package_name = "", normal = True),
     visibility = ["//packages/local-browser:__pkg__"],
 )
 
@@ -57,7 +65,7 @@ rust_test(
     edition = "2021",
     rustc_env_files = [":cargo_env"],
     deps = [":kitesurf_local_host"] + all_crate_deps(
-        normal = True,
+        package_name = "",        normal = True,
         normal_dev = True,
     ),
 )
@@ -68,7 +76,7 @@ rust_test(
     edition = "2021",
     rustc_env_files = [":cargo_env"],
     deps = all_crate_deps(
-        normal = True,
+        package_name = "",        normal = True,
         normal_dev = True,
     ),
 )
@@ -82,7 +90,7 @@ rust_test(
     env = {"FAKE_ENGINE": "$(rootpath :fake_engine)"},
     rustc_env_files = [":cargo_env"],
     deps = [":kitesurf_local_host"] + all_crate_deps(
-        normal = True,
+        package_name = "",        normal = True,
         normal_dev = True,
     ),
 )

@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kitesurf <vendor@kitesurf.invalid>
+Date: Wed, 18 Nov 2026 00:00:00 +0000
+Subject: [PATCH] Bound and expose native codec buffers
+
+---
+diff --git a/src/protocol/mod.rs b/src/protocol/mod.rs
+--- a/src/protocol/mod.rs
++++ b/src/protocol/mod.rs
+@@ -166,7 +166,30 @@
+     context: WebSocketContext,
+ }
+ 
++/// 接收状态快照；零长度 fragment 仍由 Some(0) 表示。
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct ReadBufferState {
++    /// 未消费的输入字节。
++    pub buffered_bytes: usize,
++    /// 当前已解析帧头的完整 payload 长度。
++    pub frame_payload_len: Option<u64>,
++    /// 已合并的 fragment 字节；Some(0) 仍是进行中的消息。
++    pub fragmented_message_bytes: Option<usize>,
++}
++
+ impl<Stream> WebSocket<Stream> {
++    /// 返回 codec 当前保留的输入状态，而非上次 I/O 的字节数。
++    pub fn read_buffer_state(&self) -> ReadBufferState {
++        let mut state = self.context.frame.read_buffer_state();
++        state.fragmented_message_bytes = self.context.incomplete.as_ref().map(IncompleteMessage::len);
++        state
++    }
++
++    /// 释放空 backing；不丢弃 header、fragment 或尚未发送的数据。
++    pub fn release_empty_buffers(&mut self) {
++        self.context.frame.release_empty_buffers();
++    }
++
+     /// Convert a raw socket into a WebSocket without performing a handshake.
+     ///
+     /// Call this function if you're using Tungstenite as a part of a web framework
+@@ -604,6 +627,9 @@
+             .read_frame(
+                 stream,
+                 self.config.max_frame_size,
++                self.config.max_message_size.map(|max| {
++                    max.saturating_sub(self.incomplete.as_ref().map_or(0, IncompleteMessage::len))
++                }),
+                 matches!(self.role, Role::Server),
+                 self.config.accept_unmasked_frames,
+             )
+diff --git a/src/protocol/frame/mod.rs b/src/protocol/frame/mod.rs
+--- a/src/protocol/frame/mod.rs
++++ b/src/protocol/frame/mod.rs
+@@ -66,7 +66,7 @@
+ {
+     /// Read a frame from stream.
+     pub fn read(&mut self, max_size: Option<usize>) -> Result<Option<Frame>> {
+-        self.codec.read_frame(&mut self.stream, max_size, false, true)
++        self.codec.read_frame(&mut self.stream, max_size, None, false, true)
+     }
+ }
+ 
+@@ -120,6 +120,23 @@
+ }
+ 
+ impl FrameCodec {
++    pub(super) fn read_buffer_state(&self) -> super::ReadBufferState {
++        super::ReadBufferState {
++            buffered_bytes: self.in_buffer.len(),
++            frame_payload_len: self.header.as_ref().map(|(_, len)| *len),
++            fragmented_message_bytes: None,
++        }
++    }
++
++    pub(super) fn release_empty_buffers(&mut self) {
++        if self.in_buffer.is_empty() && self.header.is_none() {
++            self.in_buffer = BytesMut::with_capacity(self.in_buf_max_read);
++        }
++        if self.out_buffer.is_empty() {
++            self.out_buffer = Vec::new();
++        }
++    }
++
+     /// Create a new frame codec.
+     pub(super) fn new(in_buf_len: usize) -> Self {
+         Self {
+@@ -162,6 +179,7 @@
+         &mut self,
+         stream: &mut impl Read,
+         max_size: Option<usize>,
++        data_remaining: Option<usize>,
+         unmask: bool,
+         accept_unmasked: bool,
+     ) -> Result<Option<Frame>> {
+@@ -174,20 +192,32 @@
+                 let advanced = cursor.position();
+                 bytes::Buf::advance(&mut self.in_buffer, advanced as _);
+ 
+-                if let Some((_, len)) = &self.header {
+-                    let len = *len as usize;
+-
+-                    // Enforce frame size limit early
+-                    if len > max_size {
++                if let Some((header, len)) = &self.header {
++                    let limit = match header.opcode {
++                        coding::OpCode::Control(_) => {
++                            if !header.is_final {
++                                return Err(Error::Protocol(ProtocolError::FragmentedControlFrame));
++                            }
++                            if *len > 125 {
++                                return Err(Error::Protocol(ProtocolError::ControlFrameTooBig));
++                            }
++                            max_size
++                        }
++                        coding::OpCode::Data(_) => max_size.min(data_remaining.unwrap_or(usize::MAX)),
++                    };
++                    if *len > limit as u64 {
+                         return Err(Error::Capacity(CapacityError::MessageTooLong {
+-                            size: len,
+-                            max_size,
++                            size: usize::try_from(*len).unwrap_or(usize::MAX),
++                            max_size: limit,
+                         }));
+                     }
+-
+-                    // Reserve full message length only once, even for multiple
+-                    // loops or if WouldBlock errors cause multiple fn calls.
+-                    self.in_buffer.reserve(len);
++                    let len = *len as usize;
++                    // 精确请求缺少的空间；header 和累计上限均已验证。
++                    if self.in_buffer.capacity() < len {
++                        let mut buffer = BytesMut::with_capacity(len.max(self.in_buf_max_read));
++                        buffer.extend_from_slice(&self.in_buffer);
++                        self.in_buffer = buffer;
++                    }
+                 } else {
+                     self.in_buffer.reserve(FrameHeader::MAX_SIZE);
+                 }
+@@ -224,7 +254,12 @@
+             }
+         }
+ 
+-        let frame = Frame::from_payload(header, payload.freeze());
++        // payload 与 read-ahead 不共享历史大 backing；同步调用结束前释放旧 allocation。
++        let payload = bytes::Bytes::copy_from_slice(&payload);
++        let mut read_ahead = BytesMut::with_capacity(self.in_buf_max_read.max(self.in_buffer.len()));
++        read_ahead.extend_from_slice(&self.in_buffer);
++        self.in_buffer = read_ahead;
++        let frame = Frame::from_payload(header, payload);
+         trace!("received frame {frame}");
+         Ok(Some(frame))
+     }
+@@ -256,7 +291,7 @@
+ 
+         trace!("writing frame {frame}");
+ 
+-        self.out_buffer.reserve(frame.len());
++        self.out_buffer.reserve_exact(frame.len());
+         frame.format_into_buf(&mut self.out_buffer).expect("Bug: can't write to vector");
+ 
+         if self.out_buffer.len() > self.out_buffer_write_len {
+diff --git a/src/protocol/message.rs b/src/protocol/message.rs
+--- a/src/protocol/message.rs
++++ b/src/protocol/message.rs
+@@ -29,6 +29,8 @@
+ 
+         pub fn extend<T: AsRef<[u8]>>(&mut self, tail: T) -> Result<()> {
+             let mut input: &[u8] = tail.as_ref();
++            // 避免几何扩容把长期 fragment backing 扩到预算字节之外。
++            self.data.reserve_exact(input.len() + self.incomplete.map_or(0, |i| i.buffer_len as usize));
+ 
+             if let Some(mut incomplete) = self.incomplete.take() {
+                 if let Some((result, rest)) = incomplete.try_complete(input) {
+@@ -129,6 +131,7 @@
+ 
+         match self.collector {
+             IncompleteMessageCollector::Binary(ref mut v) => {
++                v.reserve_exact(tail.as_ref().len());
+                 v.extend(tail.as_ref());
+                 Ok(())
+             }

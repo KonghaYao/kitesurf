@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kitesurf <vendor@kitesurf.invalid>
+Date: Wed, 18 Nov 2026 00:00:00 +0000
+Subject: [PATCH] Bound and expose native codec buffers
+
+---
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -263,6 +263,16 @@
+         self.inner.get_mut().get_mut()
+     }
+ 
++    /// 返回底层 codec 的输入状态。
++    pub fn read_buffer_state(&self) -> tungstenite::protocol::ReadBufferState {
++        self.inner.read_buffer_state()
++    }
++
++    /// 释放空 backing，不丢弃仍保留的协议状态。
++    pub fn release_empty_buffers(&mut self) {
++        self.inner.release_empty_buffers();
++    }
++
+     /// Returns a reference to the configuration of the tungstenite stream.
+     pub fn get_config(&self) -> &WebSocketConfig {
+         self.inner.get_config()

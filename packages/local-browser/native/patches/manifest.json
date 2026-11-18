@@ -1,0 +1,16 @@
+{
+  "crates": [
+    {
+      "name": "tungstenite",
+      "version": "0.27.0",
+      "sha256": "eadc29d668c91fcc564941132e17b28a7ceb2f3ebf0b9dae3e03fd7a6748eb0d",
+      "series": ["0001-observe-and-bound-codec-buffers.patch"]
+    },
+    {
+      "name": "tokio-tungstenite",
+      "version": "0.27.0",
+      "sha256": "489a59b6730eda1b0171fcfda8b121f4bee2b35cba8645ca35c5f7ba3eb736c1",
+      "series": ["0001-forward-codec-buffer-state.patch"]
+    }
+  ]
+}

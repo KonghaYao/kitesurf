@@ -16,9 +16,13 @@ def _patched_crate_impl(rctx):
         rctx.file("Cargo.toml", manifest + "\n[workspace]\n", executable = False)
     series = rctx.path(rctx.attr.patches_marker).dirname.get_child(key)
     rctx.watch_tree(series)
-    patches = sorted(
-        [path for path in series.readdir() if path.basename.endswith(".patch")],
-        key = lambda path: path.basename,
+    patches = (
+        [series.get_child(name) for name in rctx.attr.series]
+        if rctx.attr.series
+        else sorted(
+            [path for path in series.readdir() if path.basename.endswith(".patch")],
+            key = lambda path: path.basename,
+        )
     )
     for patch in patches:
         rctx.patch(patch, strip = 1)
@@ -27,6 +31,7 @@ def _patched_crate_impl(rctx):
 _patched_crate = repository_rule(
     implementation = _patched_crate_impl,
     attrs = {
+        "series": attr.string_list(),
         "crate": attr.string(mandatory = True),
         "patches_marker": attr.label(mandatory = True),
         "sha256": attr.string(mandatory = True),
@@ -42,15 +47,17 @@ def _cargo_workspace_impl(rctx):
         stamp.append(rctx.read(patched[name].get_child("Cargo.toml")))
         key = rctx.attr.keys[name]
         series = rctx.path(rctx.attr.patches_marker).dirname.get_child(key)
-        spec["%s %s" % (name, key[len(name) + 1:])] = {
-            "patches": [
-                str(
-                    rctx.attr.patches_marker.same_package_label(
-                        "patches/%s/%s" % (key, path.basename),
-                    ),
-                )
+        patch_names = rctx.attr.series.get(key)
+        if patch_names == None:
+            patch_names = [
+                path.basename
                 for path in sorted(series.readdir(), key = lambda path: path.basename)
                 if path.basename.endswith(".patch")
+            ]
+        spec["%s %s" % (name, key[len(name) + 1:])] = {
+            "patches": [
+                str(rctx.attr.patches_marker.same_package_label("patches/%s/%s" % (key, patch)))
+                for patch in patch_names
             ],
             "sha256": rctx.attr.sha256[key],
         }
@@ -74,6 +81,9 @@ def _cargo_workspace_impl(rctx):
             (rctx.attr.manifest, patched.keys()),
         )
 
+    if rctx.attr.root_package:
+        rctx.file("src/lib.rs", "", executable = False)
+        rctx.file("src/main.rs", "", executable = False)
     for member, manifest in rctx.attr.members.items():
         text = rctx.read(manifest)
         stamp.append(text)
@@ -99,6 +109,8 @@ def _cargo_workspace_impl(rctx):
 _cargo_workspace = repository_rule(
     implementation = _cargo_workspace_impl,
     attrs = {
+        "root_package": attr.bool(default = False),
+        "series": attr.string_list_dict(),
         "keys": attr.string_dict(mandatory = True),
         "lockfile": attr.label(mandatory = True, allow_single_file = True),
         "manifest": attr.label(mandatory = True, allow_single_file = True),
@@ -273,6 +285,36 @@ def _cargo_workspaces_impl(mctx):
     # Workspaces and vendor trees from any module, so a dependent module can build its own crates
     # against the same patched sources.
     for mod in mctx.modules:
+        for ws in mod.tags.native_workspace:
+            spec = json.decode(mctx.read(ws.patches_marker))
+            native_patched, native_keys, native_sha256, native_series = {}, {}, {}, {}
+            for crate in spec["crates"]:
+                key = "%s-%s" % (crate["name"], crate["version"])
+                repo = "native_patched_" + key
+                _patched_crate(
+                    name = repo,
+                    crate = crate["name"],
+                    version = crate["version"],
+                    sha256 = crate["sha256"],
+                    patches_marker = ws.patches_marker,
+                    series = crate["series"],
+                )
+                native_patched[crate["name"]] = "@%s//:BUILD.bazel" % repo
+                native_keys[crate["name"]] = key
+                native_sha256[key] = crate["sha256"]
+                native_series[key] = crate["series"]
+            _cargo_workspace(
+                name = ws.name,
+                manifest = ws.manifest,
+                lockfile = ws.lockfile,
+                members = {},
+                root_package = True,
+                keys = native_keys,
+                patched = native_patched,
+                patches_marker = ws.patches_marker,
+                sha256 = native_sha256,
+                series = native_series,
+            )
         for ws in mod.tags.standalone:
             _standalone_workspace(name = ws.name, lockfile = ws.lockfile, members = ws.members)
         if not tags:
@@ -298,6 +340,12 @@ def _cargo_workspaces_impl(mctx):
 cargo_workspaces = module_extension(
     implementation = _cargo_workspaces_impl,
     tag_classes = {
+        "native_workspace": tag_class(attrs = {
+            "lockfile": attr.label(mandatory = True),
+            "manifest": attr.label(mandatory = True),
+            "name": attr.string(mandatory = True),
+            "patches_marker": attr.label(mandatory = True),
+        }),
         "patched": tag_class(attrs = {
             "manifest": attr.label(mandatory = True),
             "patches_marker": attr.label(mandatory = True),
