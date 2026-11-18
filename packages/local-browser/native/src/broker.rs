@@ -1051,6 +1051,7 @@ enum UnknownKind {
         id: u64,
     },
     RetirementDetach {
+        id: u64,
         session: String,
     },
     QuarantineDetach {
@@ -1095,12 +1096,26 @@ enum ManagedStage {
     },
 }
 
+/// 已发送的退休命令由 retirement ID、上游 ID 与 operation 共同标识。
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RetireOp {
+    upstream: u64,
+    operation: RetireOperation,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetireOperation {
+    AutoDisable,
+    Detach,
+}
+
 struct Retirement {
     id: u64,
     client: ClientId,
-    pending: Option<u64>,
+    pending: Option<RetireOp>,
     stage: RetireStage,
-    blocked: bool,
+    awaiting: Option<RetireOp>,
+    failed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2740,13 +2755,11 @@ impl Broker {
                 }
             }
             PendingKind::RetirementAuto { id: retirement } => {
-                self.block_retirement(retirement);
-                let retire_client = self
-                    .retirements
-                    .iter()
-                    .find(|retire| retire.id == retirement)
-                    .map(|retire| retire.client);
-                if let Some(retire_client) = retire_client {
+                let op = RetireOp {
+                    upstream: id,
+                    operation: RetireOperation::AutoDisable,
+                };
+                if let Some(retire_client) = self.await_retirement(retirement, op) {
                     self.record_unknown(
                         id,
                         Unknown {
@@ -2765,13 +2778,11 @@ impl Broker {
                 id: retirement,
                 session,
             } => {
-                self.block_retirement(retirement);
-                let retire_client = self
-                    .retirements
-                    .iter()
-                    .find(|retire| retire.id == retirement)
-                    .map(|retire| retire.client);
-                if let Some(retire_client) = retire_client {
+                let op = RetireOp {
+                    upstream: id,
+                    operation: RetireOperation::Detach,
+                };
+                if let Some(retire_client) = self.await_retirement(retirement, op) {
                     self.record_unknown(
                         id,
                         Unknown {
@@ -2781,7 +2792,10 @@ impl Broker {
                             role: Some(Role::Controller),
                             epoch,
                             method,
-                            kind: UnknownKind::RetirementDetach { session },
+                            kind: UnknownKind::RetirementDetach {
+                                id: retirement,
+                                session,
+                            },
                         },
                     );
                 }
@@ -2834,11 +2848,15 @@ impl Broker {
         }
     }
 
-    fn block_retirement(&mut self, id: u64) {
-        if let Some(retire) = self.retirements.iter_mut().find(|retire| retire.id == id) {
-            retire.pending = None;
-            retire.blocked = true;
+    /// 超时只把已发送的退休操作转入等待槽，保留清理身份且绝不重放。
+    fn await_retirement(&mut self, id: u64, op: RetireOp) -> Option<ClientId> {
+        let retire = self.retirements.iter_mut().find(|retire| retire.id == id)?;
+        if retire.pending != Some(op) {
+            return None;
         }
+        retire.pending = None;
+        retire.awaiting = Some(op);
+        Some(retire.client)
     }
 
     fn complete_unknown(&mut self, id: u64, value: &Received) {
@@ -2895,20 +2913,14 @@ impl Broker {
                     self.maybe_reap_client(entry.client);
                 }
             }
-            UnknownKind::RetirementAuto { id } => {
-                let retire_client = self
-                    .retirements
-                    .iter()
-                    .find(|retire| retire.id == id)
-                    .map(|retire| retire.client);
-                if let Some(client) = retire_client {
-                    if self.attachments.auto_owner == Some(client) {
-                        self.attachments.auto_owner = None;
-                    }
-                }
+            UnknownKind::RetirementAuto { id: retirement } => {
+                self.late_retirement_auto(id, retirement, failed);
             }
-            UnknownKind::RetirementDetach { session } => {
-                self.attachments.forget(&session);
+            UnknownKind::RetirementDetach {
+                id: retirement,
+                session,
+            } => {
+                self.late_retirement_detach(id, retirement, &session, failed);
             }
             UnknownKind::Close => {
                 if failed {
@@ -2953,13 +2965,13 @@ impl Broker {
                 let _ = reply.send(result);
             }
             PendingKind::RetirementAuto { id: retirement } => {
-                self.retirement_auto_response(retirement, value);
+                self.retirement_auto_response(id, retirement, value);
             }
             PendingKind::RetirementDetach {
                 id: retirement,
                 session,
             } => {
-                self.retirement_detach_response(retirement, &session, value);
+                self.retirement_detach_response(id, retirement, &session, value);
             }
             PendingKind::QuarantineDetach { session } => {
                 self.quarantine_detach_response(&session, value);
@@ -3783,7 +3795,8 @@ impl Broker {
             } else {
                 RetireStage::Detach
             },
-            blocked: false,
+            awaiting: None,
+            failed: false,
         });
         self.pump_retirements();
     }
@@ -3799,7 +3812,8 @@ impl Broker {
         loop {
             let index = self.retirements.iter().position(|retire| {
                 retire.pending.is_none()
-                    && !retire.blocked
+                    && retire.awaiting.is_none()
+                    && !retire.failed
                     && !self
                         .pending
                         .values()
@@ -3816,9 +3830,8 @@ impl Broker {
                 continue;
             }
             if stage == RetireStage::Auto {
-                if self.spawn_retire_auto(id, client).is_none() {
-                    self.retirements[index].blocked = true;
-                }
+                // 发送前容量不足保持 Ready；不记 unknown，等释放后由 pump 重试。
+                let _ = self.spawn_retire_auto(id, client);
                 return;
             }
             let session = self.attachments.first_session(client);
@@ -3827,9 +3840,8 @@ impl Broker {
                 self.maybe_reap_client(client);
                 continue;
             };
-            if self.spawn_retire_detach(id, client, &session).is_none() {
-                self.retirements[index].blocked = true;
-            }
+            // 发送前容量不足保持 Ready；不记 unknown，等释放后由 pump 重试。
+            let _ = self.spawn_retire_detach(id, client, &session);
             return;
         }
     }
@@ -3853,7 +3865,10 @@ impl Broker {
                     .iter_mut()
                     .find(|retire| retire.id == retirement)
                 {
-                    retire.pending = Some(id);
+                    retire.pending = Some(RetireOp {
+                        upstream: id,
+                        operation: RetireOperation::AutoDisable,
+                    });
                 }
                 let _ = client;
                 Some(id)
@@ -3889,7 +3904,10 @@ impl Broker {
                     .iter_mut()
                     .find(|retire| retire.id == retirement)
                 {
-                    retire.pending = Some(id);
+                    retire.pending = Some(RetireOp {
+                        upstream: id,
+                        operation: RetireOperation::Detach,
+                    });
                 }
                 let _ = client;
                 Some(id)
@@ -3898,7 +3916,7 @@ impl Broker {
         }
     }
 
-    fn retirement_auto_response(&mut self, retirement: u64, value: &Received) {
+    fn retirement_auto_response(&mut self, upstream: u64, retirement: u64, value: &Received) {
         let Some(retire) = self
             .retirements
             .iter_mut()
@@ -3906,18 +3924,32 @@ impl Broker {
         else {
             return;
         };
-        retire.pending = None;
-        if value.has_error() {
-            retire.blocked = true;
+        let op = RetireOp {
+            upstream,
+            operation: RetireOperation::AutoDisable,
+        };
+        if retire.pending != Some(op) {
             return;
         }
-        if self.attachments.auto_owner == Some(retire.client) {
+        retire.pending = None;
+        if value.has_error() {
+            retire.failed = true;
+            return;
+        }
+        let client = retire.client;
+        if self.attachments.auto_owner == Some(client) {
             self.attachments.auto_owner = None;
         }
         retire.stage = RetireStage::Detach;
     }
 
-    fn retirement_detach_response(&mut self, retirement: u64, session: &str, value: &Received) {
+    fn retirement_detach_response(
+        &mut self,
+        upstream: u64,
+        retirement: u64,
+        session: &str,
+        value: &Received,
+    ) {
         let Some(retire) = self
             .retirements
             .iter_mut()
@@ -3925,12 +3957,83 @@ impl Broker {
         else {
             return;
         };
-        retire.pending = None;
-        if value.has_error() {
-            retire.blocked = true;
+        let op = RetireOp {
+            upstream,
+            operation: RetireOperation::Detach,
+        };
+        if retire.pending != Some(op) {
             return;
         }
-        self.attachments.forget(session);
+        retire.pending = None;
+        if value.has_error() {
+            retire.failed = true;
+            return;
+        }
+        let client = retire.client;
+        if self.attachments.owner(session) == Some(client) {
+            self.attachments.forget(session);
+        }
+    }
+
+    /// 迟到成功只解除精确匹配的等待操作；迟到错误保留归属并转入确认失败。
+    fn late_retirement_auto(&mut self, upstream: u64, retirement: u64, failed: bool) {
+        let op = RetireOp {
+            upstream,
+            operation: RetireOperation::AutoDisable,
+        };
+        let Some(retire) = self
+            .retirements
+            .iter_mut()
+            .find(|retire| retire.id == retirement)
+        else {
+            return;
+        };
+        if retire.awaiting != Some(op) {
+            return;
+        }
+        retire.awaiting = None;
+        if failed {
+            retire.failed = true;
+            return;
+        }
+        let client = retire.client;
+        if self.attachments.auto_owner == Some(client) {
+            self.attachments.auto_owner = None;
+        }
+        retire.stage = RetireStage::Detach;
+    }
+
+    /// 迟到 detach 成功只删除仍属于本 retirement 的 session，不碰新 owner。
+    fn late_retirement_detach(
+        &mut self,
+        upstream: u64,
+        retirement: u64,
+        session: &str,
+        failed: bool,
+    ) {
+        let op = RetireOp {
+            upstream,
+            operation: RetireOperation::Detach,
+        };
+        let Some(retire) = self
+            .retirements
+            .iter_mut()
+            .find(|retire| retire.id == retirement)
+        else {
+            return;
+        };
+        if retire.awaiting != Some(op) {
+            return;
+        }
+        retire.awaiting = None;
+        if failed {
+            retire.failed = true;
+            return;
+        }
+        let client = retire.client;
+        if self.attachments.owner(session) == Some(client) {
+            self.attachments.forget(session);
+        }
     }
 
     fn quarantine_detach_response(&mut self, session: &str, value: &Received) {
@@ -3987,6 +4090,7 @@ impl Broker {
 
     fn pump_control(&mut self) {
         if self.control_active.is_some() {
+            self.pump_blocked_control();
             self.control_progress();
             return;
         }
@@ -4015,6 +4119,14 @@ impl Broker {
                 return;
             }
         }
+        // 显式 control 是确认失败后唯一允许的清理重试；等待中的结果绝不重放。
+        let mut retried = false;
+        for retire in &mut self.retirements {
+            if retire.failed && retire.awaiting.is_none() {
+                retire.failed = false;
+                retried = true;
+            }
+        }
         let old_epoch = self.control_epoch;
         self.control_epoch = self.control_epoch.saturating_add(1);
         self.controller = Some(owner.clone());
@@ -4034,6 +4146,71 @@ impl Broker {
         });
         self.control_progress();
         self.pump_retirements();
+        if retried {
+            self.control_progress();
+        }
+    }
+
+    /// 已回复的屏障接受新显式请求重试确认失败清理；未决结果只回固定冲突。
+    fn pump_blocked_control(&mut self) {
+        let Some(active) = self.control_active.as_ref() else {
+            return;
+        };
+        if !active.replied || self.control_queue.is_empty() {
+            return;
+        }
+        if self
+            .retirements
+            .iter()
+            .any(|retire| retire.awaiting.is_some())
+            || self.unknown_blocks_control()
+        {
+            self.reply_control_queue(
+                "Control cleanup could not be confirmed; retry after the old session settles",
+            );
+            return;
+        }
+        if !self.retirements.iter().any(|retire| retire.failed) {
+            return;
+        }
+        let Some((owner, takeover, reply)) = self.control_queue.pop_front() else {
+            return;
+        };
+        if !valid_owner(&owner) {
+            let _ = reply.send(Err(ControlError::Other(
+                "A short owner name is required".to_string(),
+            )));
+            return;
+        }
+        if let Some(current) = &self.controller {
+            if current != &owner && !takeover {
+                let _ = reply.send(Err(ControlError::conflict(Some(current.clone()))));
+                return;
+            }
+        }
+        self.control_active = None;
+        let old_epoch = self.control_epoch;
+        self.control_epoch = self.control_epoch.saturating_add(1);
+        self.controller = Some(owner.clone());
+        let previous = self.active_controller.take();
+        if let Some(previous) = previous {
+            if let Some(state) = self.clients.get_mut(&previous) {
+                state.retired = true;
+            }
+            self.start_retirement(previous);
+        }
+        for retire in &mut self.retirements {
+            retire.failed = false;
+        }
+        self.control_active = Some(ActiveControl {
+            owner,
+            old_epoch,
+            reply: Some(reply),
+            deadline: Instant::now() + CONTROL_DEADLINE,
+            replied: false,
+        });
+        self.pump_retirements();
+        self.control_progress();
     }
 
     fn control_progress(&mut self) {
@@ -4059,20 +4236,25 @@ impl Broker {
             self.pump_after_change();
             return;
         }
-        if active.deadline <= Instant::now() && !active.replied {
-            let Some(mut active) = self.control_active.take() else {
-                return;
-            };
-            if let Some(reply) = active.reply.take() {
-                let _ = reply.send(Err(ControlError::Other(
-                    "Control cleanup could not be confirmed; retry after the old session settles"
-                        .to_string(),
-                )));
-            }
-            active.replied = true;
-            self.control_active = Some(active);
-            self.observer.kind("control-blocked");
+        let confirmed_failure = self.retirements.iter().any(|retire| retire.failed);
+        if !active.replied && (confirmed_failure || active.deadline <= Instant::now()) {
+            self.fail_control(
+                "Control cleanup could not be confirmed; retry after the old session settles",
+            );
         }
+    }
+
+    /// 只回复一次固定的 blocked 错误；屏障保留到清理解除或显式重试。
+    fn fail_control(&mut self, message: &str) {
+        let Some(mut active) = self.control_active.take() else {
+            return;
+        };
+        if let Some(reply) = active.reply.take() {
+            let _ = reply.send(Err(ControlError::Other(message.to_string())));
+        }
+        active.replied = true;
+        self.control_active = Some(active);
+        self.observer.kind("control-blocked");
     }
 
     fn reply_control_queue(&mut self, message: &str) {

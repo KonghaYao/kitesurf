@@ -4286,3 +4286,386 @@ async fn late_attach_retirement_reaps_only_after_detach_confirmation() {
     engine.kill();
     assert!(!broker.wait_terminal().await);
 }
+#[tokio::test]
+async fn retirement_detach_late_success_advances_the_original_retirement() {
+    let mut engine = fake_engine().await;
+    let broker = broker_with_deadlines(
+        &engine,
+        Duration::from_secs(120),
+        Duration::from_millis(500),
+    )
+    .await;
+    let mut alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+    for index in 1..=2 {
+        let target = format!("target-{index}");
+        let session = format!("session-{index}");
+        let id = index as u64;
+        send(
+            &alice,
+            &broker,
+            &format!(
+                r#"{{"id":{id},"method":"Target.attachToTarget","params":{{"targetId":"{target}","flatten":true}}}}"#
+            ),
+        )
+        .await;
+        let attach = next_request(&mut engine).await;
+        assert_eq!(attach["method"], "Target.attachToTarget");
+        engine.reply(request_id(&attach), json!({ "sessionId": session }));
+        assert_eq!(next_frame(&mut alice).await["result"]["sessionId"], session);
+    }
+    let mut control = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.control("bob".to_string(), true).await })
+    };
+    let first = next_request(&mut engine).await;
+    assert_eq!(first["method"], "Target.detachFromTarget");
+    assert_eq!(first["params"]["sessionId"], "session-1");
+    assert!(
+        timeout(Duration::from_millis(150), &mut control)
+            .await
+            .is_err(),
+        "takeover waits for the sent detach"
+    );
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.2 != 1 {}
+    })
+    .await
+    .expect("detach timeout must become unknown");
+    expect_no_request(&mut engine).await;
+    assert_eq!(
+        broker.flush().await.err(),
+        Some("Control change is in progress".to_string())
+    );
+    assert_eq!(
+        receive_ack(&broker, r#"{"method":"Unknown.opaque"}"#)
+            .await
+            .1,
+        2
+    );
+    engine.reply(request_id(&first), json!({}));
+    let second = next_request(&mut engine).await;
+    assert_eq!(second["method"], "Target.detachFromTarget");
+    assert_eq!(second["params"]["sessionId"], "session-2");
+    engine.reply(request_id(&first), json!({}));
+    expect_no_request(&mut engine).await;
+    assert!(
+        timeout(Duration::from_millis(100), &mut control)
+            .await
+            .is_err(),
+        "a duplicate late reply must not advance the next detach"
+    );
+    assert_eq!(
+        receive_ack(&broker, r#"{"method":"Unknown.opaque"}"#)
+            .await
+            .1,
+        1
+    );
+    engine.reply(request_id(&second), json!({}));
+    let takeover = timeout(WAIT, control)
+        .await
+        .expect("takeover completes after the matching replies")
+        .expect("control task")
+        .ok()
+        .expect("takeover ok");
+    assert_eq!(takeover, ("bob".to_string(), 2));
+    assert_eq!(
+        receive_ack(&broker, r#"{"method":"Unknown.opaque"}"#)
+            .await
+            .1,
+        0
+    );
+    let mut bob = connect(&broker, Endpoint::Browser, Role::Controller, "bob").await;
+    send(
+        &bob,
+        &broker,
+        r#"{"id":1,"method":"Runtime.evaluate","sessionId":"session-1"}"#,
+    )
+    .await;
+    let rejected = next_frame(&mut bob).await;
+    assert!(
+        message(&rejected).contains("expired or belongs to another"),
+        "{rejected}"
+    );
+    expect_no_request(&mut engine).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn retirement_late_error_keeps_the_attachment_until_an_explicit_retry() {
+    let mut engine = fake_engine().await;
+    let broker = broker_with_deadlines(
+        &engine,
+        Duration::from_secs(120),
+        Duration::from_millis(500),
+    )
+    .await;
+    let mut alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+    send(
+        &alice,
+        &broker,
+        r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"target-1","flatten":true}}"#,
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["method"], "Target.attachToTarget");
+    engine.reply(request_id(&attach), json!({ "sessionId": "session-1" }));
+    assert_eq!(next_frame(&mut alice).await["id"], 1);
+    let mut first_control = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.control("bob".to_string(), true).await })
+    };
+    let first = next_request(&mut engine).await;
+    assert_eq!(first["method"], "Target.detachFromTarget");
+    assert_eq!(first["params"]["sessionId"], "session-1");
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.2 != 1 {}
+    })
+    .await
+    .expect("detach timeout must become unknown");
+    engine.push(json!({
+      "id": request_id(&first),
+      "error": { "code": -32000, "message": "detach rejected" }
+    }));
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.2 != 0 {}
+    })
+    .await
+    .expect("late error must resolve the unknown");
+    let blocked = timeout(WAIT, &mut first_control)
+        .await
+        .expect("blocked control returns")
+        .expect("control task");
+    assert!(
+        blocked.is_err(),
+        "a late error must not authorize the new controller"
+    );
+    assert_eq!(
+        receive_ack(&broker, r#"{"method":"Unknown.opaque"}"#)
+            .await
+            .1,
+        1
+    );
+    engine.reply(request_id(&first), json!({}));
+    expect_no_request(&mut engine).await;
+    assert_eq!(
+        receive_ack(&broker, r#"{"method":"Unknown.opaque"}"#)
+            .await
+            .1,
+        1
+    );
+    let mut retry = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.control("bob".to_string(), true).await })
+    };
+    let second = next_request(&mut engine).await;
+    assert_eq!(second["method"], "Target.detachFromTarget");
+    assert_eq!(second["params"]["sessionId"], "session-1");
+    assert_ne!(request_id(&second), request_id(&first));
+    engine.reply(request_id(&first), json!({}));
+    assert!(
+        timeout(Duration::from_millis(100), &mut retry)
+            .await
+            .is_err(),
+        "a stale success must not resolve the retry"
+    );
+    assert_eq!(
+        receive_ack(&broker, r#"{"method":"Unknown.opaque"}"#)
+            .await
+            .1,
+        1
+    );
+    engine.push(json!({
+      "id": request_id(&second),
+      "error": { "code": -32000, "message": "detach rejected" }
+    }));
+    let blocked = timeout(WAIT, &mut retry)
+        .await
+        .expect("failed retry returns")
+        .expect("control task");
+    assert!(
+        blocked.is_err(),
+        "a failed retry must still not authorize the controller"
+    );
+    assert_eq!(
+        receive_ack(&broker, r#"{"method":"Unknown.opaque"}"#)
+            .await
+            .1,
+        1
+    );
+    let retry = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.control("bob".to_string(), true).await })
+    };
+    let third = next_request(&mut engine).await;
+    assert_eq!(third["method"], "Target.detachFromTarget");
+    assert_eq!(third["params"]["sessionId"], "session-1");
+    engine.reply(request_id(&third), json!({}));
+    let takeover = timeout(WAIT, retry)
+        .await
+        .expect("takeover completes after the confirmed retry")
+        .expect("control task")
+        .ok()
+        .expect("takeover ok");
+    assert_eq!(takeover, ("bob".to_string(), 4));
+    assert_eq!(
+        receive_ack(&broker, r#"{"method":"Unknown.opaque"}"#)
+            .await
+            .1,
+        0
+    );
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+async fn enable_auto_attach(
+    engine: &mut FakeEngine,
+    broker: &BrokerHandle,
+    alice: &mut TestClient,
+) {
+    send(
+        alice,
+        broker,
+        r#"{"id":1,"method":"Target.setAutoAttach","params":{"autoAttach":true,"flatten":true}}"#,
+    )
+    .await;
+    let enable = next_request(engine).await;
+    assert_eq!(enable["method"], "Target.setAutoAttach");
+    engine.reply(request_id(&enable), json!({}));
+    let targets = next_method(engine, "Target.getTargets").await;
+    engine.reply(request_id(&targets), json!({ "targetInfos": [] }));
+    assert_eq!(next_frame(alice).await["id"], 1);
+}
+
+#[tokio::test]
+async fn retirement_auto_late_success_advances_to_the_detach_stage() {
+    let mut engine = fake_engine().await;
+    let broker = broker_with_deadlines(
+        &engine,
+        Duration::from_secs(120),
+        Duration::from_millis(500),
+    )
+    .await;
+    let mut alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+    enable_auto_attach(&mut engine, &broker, &mut alice).await;
+    engine.event(json!({
+      "method": "Target.attachedToTarget",
+      "params": { "sessionId": "auto-session", "targetInfo": { "targetId": "auto-target" } }
+    }));
+    assert_eq!(
+        next_frame(&mut alice).await["method"],
+        "Target.attachedToTarget"
+    );
+    let mut control = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.control("bob".to_string(), true).await })
+    };
+    let disable = next_request(&mut engine).await;
+    assert_eq!(disable["method"], "Target.setAutoAttach");
+    assert_eq!(disable["params"]["autoAttach"], false);
+    assert!(
+        timeout(Duration::from_millis(150), &mut control)
+            .await
+            .is_err(),
+        "takeover waits for the sent auto disable"
+    );
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.2 != 1 {}
+    })
+    .await
+    .expect("auto disable timeout must become unknown");
+    assert_eq!(
+        receive_ack(&broker, r#"{"method":"Unknown.opaque"}"#)
+            .await
+            .1,
+        1
+    );
+    engine.reply(request_id(&disable), json!({}));
+    let detach = next_request(&mut engine).await;
+    assert_eq!(detach["method"], "Target.detachFromTarget");
+    assert_eq!(detach["params"]["sessionId"], "auto-session");
+    engine.reply(request_id(&detach), json!({}));
+    let takeover = timeout(WAIT, control)
+        .await
+        .expect("takeover completes after the auto detach")
+        .expect("control task")
+        .ok()
+        .expect("takeover ok");
+    assert_eq!(takeover, ("bob".to_string(), 2));
+    assert_eq!(
+        receive_ack(&broker, r#"{"method":"Unknown.opaque"}"#)
+            .await
+            .1,
+        0
+    );
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn retirement_auto_late_error_keeps_the_auto_owner() {
+    let mut engine = fake_engine().await;
+    let broker = broker_with_deadlines(
+        &engine,
+        Duration::from_secs(120),
+        Duration::from_millis(500),
+    )
+    .await;
+    let mut alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+    enable_auto_attach(&mut engine, &broker, &mut alice).await;
+    engine.event(json!({
+      "method": "Target.attachedToTarget",
+      "params": { "sessionId": "auto-session", "targetInfo": { "targetId": "auto-target" } }
+    }));
+    assert_eq!(
+        next_frame(&mut alice).await["method"],
+        "Target.attachedToTarget"
+    );
+    let mut control = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.control("bob".to_string(), true).await })
+    };
+    let disable = next_request(&mut engine).await;
+    assert_eq!(disable["method"], "Target.setAutoAttach");
+    assert_eq!(disable["params"]["autoAttach"], false);
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.2 != 1 {}
+    })
+    .await
+    .expect("auto disable timeout must become unknown");
+    engine.push(json!({
+      "id": request_id(&disable),
+      "error": { "code": -32000, "message": "auto disable failed" }
+    }));
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.2 != 0 {}
+    })
+    .await
+    .expect("late auto error must resolve the unknown");
+    assert_eq!(
+        receive_ack(&broker, r#"{"method":"Unknown.opaque"}"#)
+            .await
+            .1,
+        1
+    );
+    assert_eq!(
+        receive_ack(
+            &broker,
+            r#"{"method":"Target.attachedToTarget","params":{"sessionId":"auto-late","targetInfo":{"targetId":"auto-late-target"}}}"#
+        )
+        .await
+        .1,
+        2
+    );
+    expect_no_request(&mut engine).await;
+    let blocked = timeout(WAIT, &mut control)
+        .await
+        .expect("blocked control returns")
+        .expect("control task");
+    assert!(
+        blocked.is_err(),
+        "a late auto error must not authorize the new controller"
+    );
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
