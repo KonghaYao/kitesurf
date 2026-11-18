@@ -565,7 +565,8 @@ fn adversarial_chunks_keys_and_scalars_remain_bounded() {
     let budget = PayloadBudget::default();
     drop(budget.json_scratch());
     let mut scratch = budget.json_scratch();
-    assert_eq!(std::mem::size_of::<RawSpan>(), 8);
+    // owner token + 范围；后继 BackfillSelection 必须按 size_of 计费。
+    assert_eq!(std::mem::size_of::<RawSpan>(), 16);
     let mut fields = String::with_capacity(MAX_FRAME_BYTES);
     fields.push('{');
     while fields.len() + 12 <= MAX_FRAME_BYTES {
@@ -662,6 +663,202 @@ fn array_spans_fixed_output_and_failure_paths() {
     assert!(stats.largest <= 8192);
     drop(occupied);
     drop(backing);
+    assert_eq!(budget.used().0, MAX_FRAME_BYTES);
+}
+
+#[test]
+fn spans_are_bound_to_their_owning_backing() {
+    let budget = PayloadBudget::default();
+    let mut scratch = budget.json_scratch();
+    let a = owned(r#"{"id":1,"params":{"targetId":"a"}}"#.into(), &budget);
+    let b = owned(r#"{"id":9,"params":{"targetId":"b"}}"#.into(), &budget);
+    let a_env = RawEnvelope::parse(a.clone(), ParsePolicy::ClientOpaque, &mut scratch).unwrap();
+    let b_env = RawEnvelope::parse(b.clone(), ParsePolicy::ClientOpaque, &mut scratch).unwrap();
+    let id = a_env.field("id").span().unwrap();
+    let params = a_env.field("params").span().unwrap();
+    assert_eq!(a_env.backing().text(id).unwrap(), "1");
+    assert!(b_env.backing().text(id).is_err());
+    assert!(b_env.backing().raw(id, &mut scratch).is_err());
+    assert!(b_env
+        .backing()
+        .copy_span_to_ordinary(id, &budget, &mut scratch)
+        .is_err());
+    assert!(select_fields(
+        b_env.backing(),
+        params,
+        ["targetId"],
+        DuplicatePolicy::LastWins,
+        &mut scratch
+    )
+    .is_err());
+    assert!(visit_object(b_env.backing(), params, &mut scratch, |_, _, _| Ok(())).is_err());
+    let arrays_a = owned(r#"{"params":[{"x":1}]}"#.into(), &budget);
+    let arrays_b = owned(r#"{"params":[{"x":9}]}"#.into(), &budget);
+    let arrays_a = RawEnvelope::parse(arrays_a, ParsePolicy::ClientOpaque, &mut scratch).unwrap();
+    let arrays_b = RawEnvelope::parse(arrays_b, ParsePolicy::ClientOpaque, &mut scratch).unwrap();
+    let array_span = arrays_a.field("params").span().unwrap();
+    assert!(visit_array(arrays_b.backing(), array_span, &mut scratch, |_| Ok(())).is_err());
+    // 同长度 full span：不同 owner 即同内容也拒绝。
+    assert!(b_env
+        .backing()
+        .raw(a_env.backing().full_span(), &mut scratch)
+        .is_err());
+    let cloned = a.clone();
+    assert_eq!(
+        cloned
+            .raw(a_env.backing().full_span(), &mut scratch)
+            .unwrap()
+            .get(),
+        a.as_str()
+    );
+    // copy 产生新 owner，即使文本相同也双向拒绝。
+    let copied = a
+        .copy_span_to_ordinary(a.full_span(), &budget, &mut scratch)
+        .unwrap();
+    assert_eq!(copied.as_str(), a.as_str());
+    assert!(a.raw(copied.full_span(), &mut scratch).is_err());
+    assert!(copied.raw(a.full_span(), &mut scratch).is_err());
+    assert_eq!(
+        copied.raw(copied.full_span(), &mut scratch).unwrap().get(),
+        a.as_str()
+    );
+    // UTF-8 多字节 child span 同 offset 也不同 owner。
+    let utf8_a = owned(r#"{"id":"中"}"#.into(), &budget);
+    let utf8_b = owned(r#"{"id":"文"}"#.into(), &budget);
+    let utf8_a = RawEnvelope::parse(utf8_a, ParsePolicy::ClientOpaque, &mut scratch).unwrap();
+    let utf8_b = RawEnvelope::parse(utf8_b, ParsePolicy::ClientOpaque, &mut scratch).unwrap();
+    let utf8_span = utf8_a.field("id").span().unwrap();
+    assert!(utf8_b.backing().raw(utf8_span, &mut scratch).is_err());
+    assert_eq!(utf8_a.backing().text(utf8_span).unwrap(), r#""中""#);
+    // 嵌套 visitor 保存的子 span 同样绑定原 owner。
+    let nested_a = owned(r#"{"params":{"targetId":"a"}}"#.into(), &budget);
+    let nested_b = owned(r#"{"params":{"targetId":"b"}}"#.into(), &budget);
+    let nested_a = RawEnvelope::parse(nested_a, ParsePolicy::ClientOpaque, &mut scratch).unwrap();
+    let nested_b = RawEnvelope::parse(nested_b, ParsePolicy::ClientOpaque, &mut scratch).unwrap();
+    let nested_params = nested_a.field("params").span().unwrap();
+    let mut child = None;
+    visit_object(
+        nested_a.backing(),
+        nested_params,
+        &mut scratch,
+        |key, value, text| {
+            if text.equals(key, "targetId")? {
+                child = Some(nested_a.backing().span_of(value)?);
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    let child = child.unwrap();
+    assert!(nested_b.backing().raw(child, &mut scratch).is_err());
+    assert_eq!(nested_a.backing().text(child).unwrap(), r#""a""#);
+    // 原 owner 销毁后重建，旧 span 不得因地址复用而别名。
+    let stale = {
+        let old = owned(r#"{"id":7}"#.into(), &budget);
+        let old_env = RawEnvelope::parse(old, ParsePolicy::ClientOpaque, &mut scratch).unwrap();
+        old_env.field("id").span().unwrap()
+    };
+    let replacement = owned(r#"{"id":7}"#.into(), &budget);
+    let replacement =
+        RawEnvelope::parse(replacement, ParsePolicy::ClientOpaque, &mut scratch).unwrap();
+    assert_eq!(replacement.backing().text(stale), Err(RawError::Invalid));
+    assert_eq!(
+        replacement
+            .backing()
+            .text(replacement.field("id").span().unwrap()),
+        Ok("7")
+    );
+    // 失败后 scratch 仍可继续使用。
+    assert_eq!(a_env.backing().raw(id, &mut scratch).unwrap().get(), "1");
+}
+
+#[test]
+fn array_callbacks_preserve_raw_error_categories_and_resources() {
+    let budget = PayloadBudget::default();
+    let mut scratch = budget.json_scratch();
+    let array = owned("[1,2,3]".into(), &budget);
+    let object = owned(r#"{"a":1}"#.into(), &budget);
+    let categories = [
+        (RawError::Invalid, "invalid"),
+        (RawError::Limit, "limit"),
+        (RawError::Budget, "budget"),
+        (RawError::Duplicate, "duplicate"),
+    ];
+    for (error, label) in categories {
+        assert_eq!(
+            visit_array(&array, array.full_span(), &mut scratch, |_| Err(error)),
+            Err(error),
+            "array {label}"
+        );
+        assert_eq!(
+            visit_object(&object, object.full_span(), &mut scratch, |_, _, _| Err(
+                error
+            )),
+            Err(error),
+            "object {label}"
+        );
+    }
+    // serde 自身格式错误仍是 Invalid。
+    for text in ["[1,", "[1] trailing", "{}"] {
+        let malformed = owned(text.into(), &budget);
+        assert_eq!(
+            visit_array(&malformed, malformed.full_span(), &mut scratch, |_| Ok(())),
+            Err(RawError::Invalid),
+            "{text}"
+        );
+    }
+    for text in [r#"{"a":1"#, r#"{"a":1} trailing"#, "[]"] {
+        let malformed = owned(text.into(), &budget);
+        assert_eq!(
+            visit_object(
+                &malformed,
+                malformed.full_span(),
+                &mut scratch,
+                |_, _, _| { Ok(()) }
+            ),
+            Err(RawError::Invalid),
+            "{text}"
+        );
+    }
+    // 回调错误优先于 trailing 语法错误，成功回调不吞 trailing。
+    let trailing = owned("[1] trailing".into(), &budget);
+    assert_eq!(
+        visit_array(&trailing, trailing.full_span(), &mut scratch, |_| Err(
+            RawError::Budget
+        )),
+        Err(RawError::Budget)
+    );
+    assert_eq!(
+        visit_array(&trailing, trailing.full_span(), &mut scratch, |_| Ok(())),
+        Err(RawError::Invalid)
+    );
+    // 错误注入不泄漏临时分配，scratch/lease 之后仍可复用。
+    let stats = measure(|| {
+        for (error, _) in categories {
+            assert_eq!(
+                visit_array(&array, array.full_span(), &mut scratch, |_| Err(error)),
+                Err(error)
+            );
+        }
+        assert_eq!(
+            visit_array(&array, array.full_span(), &mut scratch, |_| Ok(())),
+            Ok(())
+        );
+    });
+    assert_eq!(stats.live, 0);
+    assert_eq!(
+        decode_identity(
+            serde_json::from_str::<&RawValue>(r#""ok""#).unwrap(),
+            &budget,
+            &mut scratch
+        )
+        .unwrap()
+        .as_str(),
+        "ok"
+    );
+    drop(array);
+    drop(object);
+    drop(trailing);
     assert_eq!(budget.used().0, MAX_FRAME_BYTES);
 }
 

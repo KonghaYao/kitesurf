@@ -4,6 +4,7 @@
 
 use std::fmt;
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
@@ -32,12 +33,26 @@ impl std::error::Error for RawError {}
 
 type Result<T> = std::result::Result<T, RawError>;
 
+// owner token 只分配不回收；溢出 fail-closed，绝不 wrap 后复用旧 token。
+static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+
+fn next_owner_token() -> Result<u64> {
+    NEXT_OWNER
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+            token.checked_add(1)
+        })
+        .map_err(|_| RawError::Limit)
+}
+
+// token 是每个 owner 固定 8 字节 metadata，与 backing lease 同寿命；
+// 无全局注册表，span 复制不分配。后继接入必须按 owner 记录计费。
 struct RawOwner {
+    token: u64,
     text: String,
     _lease: PayloadLease,
 }
 
-/// clone 只共享 backing 和 lease；复制必须经 copy_span_to_ordinary 先取得普通预算。
+/// clone 只共享 backing、lease 与 token；复制必须经 copy_span_to_ordinary 先取得普通预算。
 #[derive(Clone)]
 pub struct LeasedRaw(Arc<RawOwner>);
 
@@ -47,6 +62,7 @@ impl LeasedRaw {
             return Err(RawError::Limit);
         }
         Ok(Self(Arc::new(RawOwner {
+            token: next_owner_token()?,
             text,
             _lease: lease,
         })))
@@ -58,12 +74,16 @@ impl LeasedRaw {
 
     pub fn full_span(&self) -> RawSpan {
         RawSpan {
+            owner: self.0.token,
             start: 0,
             end: self.0.text.len() as u32,
         }
     }
 
     pub fn text(&self, span: RawSpan) -> Result<&str> {
+        if span.owner != self.0.token {
+            return Err(RawError::Invalid);
+        }
         self.as_str()
             .get(span.start as usize..span.end as usize)
             .ok_or(RawError::Invalid)
@@ -105,15 +125,17 @@ impl LeasedRaw {
             return Err(RawError::Invalid);
         }
         Ok(RawSpan {
+            owner: self.0.token,
             start: start as u32,
             end: end as u32,
         })
     }
 }
 
-/// 范围只由当前 backing 内的借用 token 产生，不保存自引用或裸指针。
+/// 16 bytes：owner token 加范围。clone 共享 token，跨 owner 一律拒绝。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RawSpan {
+    owner: u64,
     start: u32,
     end: u32,
 }
@@ -280,7 +302,10 @@ pub fn visit_object<'a>(
     de.end().map_err(|_| RawError::Invalid)
 }
 
-struct ArrayVisitor<'a, F>(&'a mut F);
+struct ArrayVisitor<'a, F> {
+    visitor: &'a mut F,
+    error: &'a mut Option<RawError>,
+}
 impl<'de, F> Visitor<'de> for ArrayVisitor<'_, F>
 where
     F: FnMut(&'de RawValue) -> Result<()>,
@@ -291,7 +316,10 @@ where
     }
     fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> std::result::Result<(), S::Error> {
         while let Some(value) = seq.next_element::<&RawValue>()? {
-            (self.0)(value).map_err(S::Error::custom)?;
+            if let Err(error) = (self.visitor)(value) {
+                *self.error = Some(error);
+                return Err(S::Error::custom(error));
+            }
         }
         Ok(())
     }
@@ -306,8 +334,12 @@ pub fn visit_array<'a>(
     let text = backing.text(span)?;
     preflight(text, ParsePolicy::ClientOpaque)?;
     let mut de = serde_json::Deserializer::from_str(text);
-    de.deserialize_seq(ArrayVisitor(&mut visitor))
-        .map_err(|_| RawError::Invalid)?;
+    let mut error = None;
+    de.deserialize_seq(ArrayVisitor {
+        visitor: &mut visitor,
+        error: &mut error,
+    })
+    .map_err(|_| error.unwrap_or(RawError::Invalid))?;
     de.end().map_err(|_| RawError::Invalid)
 }
 
