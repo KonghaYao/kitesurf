@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(all(test, feature = "test-faults"))]
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -70,7 +70,18 @@ impl Default for PayloadBudget {
     }
 }
 
+/// 与 codec 复用同一同步工作区；MutexGuard 不可 Send，不得跨 await 保存。
+pub struct JsonScratchGuard<'a> {
+    _guard: MutexGuard<'a, ()>,
+}
+
 impl PayloadBudget {
+    pub fn json_scratch(&self) -> JsonScratchGuard<'_> {
+        JsonScratchGuard {
+            _guard: self.copy.lock().unwrap(),
+        }
+    }
+
     pub fn try_acquire(&self, bytes: usize, internal: bool) -> Option<PayloadLease> {
         let pool = self.pool(internal);
         let permit = pool

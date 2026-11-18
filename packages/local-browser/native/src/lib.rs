@@ -7,6 +7,7 @@
 
 pub mod attachments;
 pub mod broker;
+pub mod cdp_raw;
 pub mod observe;
 pub mod profile;
 pub mod profile_state;

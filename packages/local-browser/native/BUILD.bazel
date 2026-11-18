@@ -30,6 +30,21 @@ rust_test(
     deps = [":kitesurf_local_host"] + all_crate_deps(package_name = "", normal = True),
 )
 
+rust_test(
+    name = "raw_envelope_test",
+    size = "small",
+    srcs = [
+        "src/cdp_raw.rs",
+        "src/transport.rs",
+        "tests/raw_envelope_test.rs",
+    ],
+    crate_features = ["test-faults"],
+    crate_root = "tests/raw_envelope_test.rs",
+    edition = "2021",
+    rustc_env_files = [":cargo_env"],
+    deps = [":kitesurf_local_host"] + all_crate_deps(package_name = "", normal = True),
+)
+
 cargo_toml_env_vars(
     name = "cargo_env",
     src = "Cargo.toml",
@@ -146,6 +161,7 @@ rust_test(
 
 rust_lint_tests(targets = [
     ":codec_budget_test",
+    ":raw_envelope_test",
     ":broker_test",
     ":fake_engine",
     ":kitesurf-native",
