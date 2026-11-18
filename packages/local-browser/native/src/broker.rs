@@ -2011,24 +2011,17 @@ impl Broker {
         if retire && !was_closed && attached && self.lifecycle != Lifecycle::Lost {
             self.start_retirement(client);
         }
-        if !attached && self.clients.get(&client).is_some_and(|state| state.closed) {
-            let pending = self
-                .pending
-                .values()
-                .any(|pending| pending.client == Some(client));
-            if !pending {
-                self.clients.remove(&client);
-            }
-        }
+        self.maybe_reap_client(client);
     }
 
     fn client_closed(&mut self, client: ClientId) {
+        if self.clients.get(&client).is_some_and(|state| state.closed) {
+            self.maybe_reap_client(client);
+            return;
+        }
         let Some(state) = self.clients.get_mut(&client) else {
             return;
         };
-        if state.closed {
-            return;
-        }
         state.closed = true;
         state.page_queue.clear();
         state.page_queue_bytes = 0;
@@ -2042,13 +2035,48 @@ impl Broker {
             self.start_retirement(client);
             return;
         }
-        let has_pending = self
-            .pending
+        self.maybe_reap_client(client);
+    }
+
+    /// 关闭且 pending/unknown、管理操作、retirement、attachment 引用全部清空才可回收。
+    fn client_referenced(&self, client: ClientId) -> bool {
+        self.pending
             .values()
-            .any(|pending| pending.client == Some(client));
-        if !has_pending {
-            self.clients.remove(&client);
+            .any(|pending| pending.client == Some(client))
+            || self
+                .unknown
+                .values()
+                .any(|unknown| unknown.client == Some(client))
+            || self
+                .management_queue
+                .iter()
+                .any(|work| work.client == client)
+            || self
+                .management_active
+                .as_ref()
+                .is_some_and(|active| active.work.client == client)
+            || self
+                .retirements
+                .iter()
+                .any(|retire| retire.client == client)
+            || self
+                .close
+                .as_ref()
+                .is_some_and(|state| state.client == Some(client))
+            || self.attachments.has_client(client)
+    }
+
+    /// 只在完整状态转换之后调用；lease 随各自 owner 结束，不能按计数提前释放。
+    fn maybe_reap_client(&mut self, client: ClientId) {
+        if self.close.as_ref().is_some_and(|state| state.succeeded) {
+            return;
         }
+        if !self.clients.get(&client).is_some_and(|state| state.closed)
+            || self.client_referenced(client)
+        {
+            return;
+        }
+        self.clients.remove(&client);
     }
 }
 
@@ -2506,7 +2534,9 @@ impl Broker {
         };
         let Some(session) = session else { return };
         let Some(attachment) = self.attachments.forget(&session) else {
-            self.attachments.release_quarantine(&session);
+            if let Some(entry) = self.attachments.release_quarantine(&session) {
+                self.maybe_reap_client(entry.client);
+            }
             return;
         };
         let recipient = attachment.client;
@@ -2519,6 +2549,7 @@ impl Broker {
             return;
         }
         self.deliver_event(recipient, &value);
+        self.maybe_reap_client(recipient);
     }
 
     fn handle_response(&mut self, mut value: Received) {
@@ -2798,6 +2829,9 @@ impl Broker {
             }
         }
         self.pump_after_change();
+        if let Some(client) = client {
+            self.maybe_reap_client(client);
+        }
     }
 
     fn block_retirement(&mut self, id: u64) {
@@ -2811,6 +2845,7 @@ impl Broker {
         let Some(unknown) = self.unknown.remove(&id) else {
             return;
         };
+        let client = unknown.client;
         let attached = attach_session(value);
         let target = if unknown.method == "Target.attachToBrowserTarget" {
             Some("browser".to_string())
@@ -2856,8 +2891,8 @@ impl Broker {
             UnknownKind::QuarantineDetach { session } => {
                 if failed {
                     self.attachments.block_quarantine(&session);
-                } else {
-                    self.attachments.release_quarantine(&session);
+                } else if let Some(entry) = self.attachments.release_quarantine(&session) {
+                    self.maybe_reap_client(entry.client);
                 }
             }
             UnknownKind::RetirementAuto { id } => {
@@ -2885,12 +2920,16 @@ impl Broker {
             UnknownKind::Plain | UnknownKind::Flush => {}
         }
         self.pump_after_change();
+        if let Some(client) = client {
+            self.maybe_reap_client(client);
+        }
     }
 
     fn complete_pending(&mut self, id: u64, value: &Received) {
         let Some(pending) = self.pending.remove(&id) else {
             return;
         };
+        let client = pending.client;
         self.release_pending(&pending);
         match pending.kind {
             PendingKind::Client => {
@@ -2927,6 +2966,9 @@ impl Broker {
             }
         }
         self.pump_after_change();
+        if let Some(client) = client {
+            self.maybe_reap_client(client);
+        }
     }
 
     fn release_pending(&mut self, pending: &Pending) {
@@ -3727,9 +3769,7 @@ impl Broker {
         }
         let was_auto = self.attachments.auto_owner == Some(client);
         if self.attachments.count_for(client) == 0 && !was_auto {
-            if self.clients.get(&client).is_some_and(|state| state.closed) {
-                self.clients.remove(&client);
-            }
+            self.maybe_reap_client(client);
             return;
         }
         let id = self.next_retirement;
@@ -3784,9 +3824,7 @@ impl Broker {
             let session = self.attachments.first_session(client);
             let Some(session) = session else {
                 self.retirements.remove(index);
-                if self.clients.get(&client).is_some_and(|state| state.closed) {
-                    self.clients.remove(&client);
-                }
+                self.maybe_reap_client(client);
                 continue;
             };
             if self.spawn_retire_detach(id, client, &session).is_none() {
@@ -3898,8 +3936,8 @@ impl Broker {
     fn quarantine_detach_response(&mut self, session: &str, value: &Received) {
         if value.has_error() {
             self.attachments.block_quarantine(session);
-        } else {
-            self.attachments.release_quarantine(session);
+        } else if let Some(entry) = self.attachments.release_quarantine(session) {
+            self.maybe_reap_client(entry.client);
         }
     }
 
@@ -4370,12 +4408,16 @@ impl Broker {
         if let Some(reply) = state.reply.take() {
             let _ = reply.send(Err(message.clone()));
         }
+        let client = state.client;
         if let (CloseKind::Cdp, Some(client), Some(external)) =
-            (state.kind, state.client, state.external_id)
+            (state.kind, client, state.external_id)
         {
             self.send_error(client, external, -32000, &message, state.explicit_session);
         }
         self.pump_after_change();
+        if let Some(client) = client {
+            self.maybe_reap_client(client);
+        }
     }
 
     fn close_restricted(&mut self, _message: String) {
@@ -4394,6 +4436,9 @@ impl Broker {
         let session = state.explicit_session.take();
         if let (CloseKind::Cdp, Some(client), Some(external)) = (kind, client, external) {
             self.send_error(client, external, -32000, &message, session);
+        }
+        if let Some(client) = client {
+            self.maybe_reap_client(client);
         }
     }
 

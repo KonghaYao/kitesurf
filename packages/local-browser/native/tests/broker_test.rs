@@ -1093,6 +1093,32 @@ async fn connect(broker: &BrokerHandle, endpoint: Endpoint, role: Role, owner: &
     }
 }
 
+async fn connect_when_reaped(broker: &BrokerHandle, owner: &str) -> TestClient {
+    timeout(WAIT, async {
+        loop {
+            let request = ReserveRequest {
+                endpoint: Endpoint::Browser,
+                role: Role::Viewer,
+                owner: owner.to_string(),
+            };
+            let Ok(reservation) = broker.reserve(request).await else {
+                continue;
+            };
+            let id = reservation.id();
+            let (writer, frames) = mpsc::channel(64);
+            let (cancel, cancelled) = watch::channel(false);
+            assert!(broker.commit(reservation, writer, cancel).await, "commit");
+            return TestClient {
+                id,
+                frames,
+                cancel: cancelled,
+            };
+        }
+    })
+    .await
+    .expect("disconnected client slot was not reaped")
+}
+
 async fn send(client: &TestClient, broker: &BrokerHandle, text: &str) {
     assert!(broker.frame(client.id, text.to_string()).await);
 }
@@ -3997,6 +4023,251 @@ async fn backfill_attach_late_success_after_client_close_never_reaches_a_new_cli
     let attached = next_frame(&mut newcomer).await;
     assert_eq!(attached["id"], 2);
     assert_eq!(attached["result"]["sessionId"], "newcomer-session");
+    expect_no_request(&mut engine).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn disconnected_clients_reap_after_ordinary_replies() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let baseline = broker.payload_budget().used();
+    let mut held = Vec::new();
+    for index in 0..32 {
+        let client = connect(
+            &broker,
+            Endpoint::Browser,
+            Role::Viewer,
+            &format!("reply-{index}"),
+        )
+        .await;
+        send(
+            &client,
+            &broker,
+            &format!(r#"{{"id":1,"method":"DOM.getDocument","params":{{"depth":{index}}}}}"#),
+        )
+        .await;
+        let request = next_request(&mut engine).await;
+        assert_eq!(request["method"], "DOM.getDocument");
+        broker.closed(client.id);
+        broker.writer_gone(client.id);
+        held.push((client, request));
+    }
+    assert!(
+        broker
+            .reserve(ReserveRequest {
+                endpoint: Endpoint::Browser,
+                role: Role::Viewer,
+                owner: "extra".to_string(),
+            })
+            .await
+            .is_err(),
+        "pending replies must keep client slots"
+    );
+    for (_, request) in &held {
+        engine.reply(request_id(request), json!({ "root": {} }));
+    }
+    drop(held);
+    let mut extra = connect_when_reaped(&broker, "extra").await;
+    send(&extra, &broker, r#"{"id":1,"method":"Browser.getVersion"}"#).await;
+    let version = next_request(&mut engine).await;
+    assert_eq!(version["method"], "Browser.getVersion");
+    engine.reply(request_id(&version), json!({ "userAgent": "fake" }));
+    assert_eq!(next_frame(&mut extra).await["id"], 1);
+    drop(extra);
+    broker.budget_snapshot().await;
+    let used = broker.payload_budget().used();
+    assert_eq!(used.0, baseline.0, "{used:?} vs {baseline:?}");
+    assert!(used.1 <= baseline.1, "{used:?} vs {baseline:?}");
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn disconnected_clients_reap_after_ordinary_errors() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut held = Vec::new();
+    for index in 0..32 {
+        let client = connect(
+            &broker,
+            Endpoint::Browser,
+            Role::Viewer,
+            &format!("error-{index}"),
+        )
+        .await;
+        send(
+            &client,
+            &broker,
+            &format!(r#"{{"id":1,"method":"DOM.getDocument","params":{{"depth":{index}}}}}"#),
+        )
+        .await;
+        let request = next_request(&mut engine).await;
+        assert_eq!(request["method"], "DOM.getDocument");
+        broker.closed(client.id);
+        broker.writer_gone(client.id);
+        held.push((client, request));
+    }
+    assert!(
+        broker
+            .reserve(ReserveRequest {
+                endpoint: Endpoint::Browser,
+                role: Role::Viewer,
+                owner: "extra".to_string(),
+            })
+            .await
+            .is_err(),
+        "pending errors must keep client slots"
+    );
+    for (_, request) in &held {
+        engine.push(json!({
+          "id": request_id(request),
+          "error": { "code": -32000, "message": "synthetic failure" }
+        }));
+    }
+    drop(held);
+    let mut extra = connect_when_reaped(&broker, "extra").await;
+    send(&extra, &broker, r#"{"id":1,"method":"Browser.getVersion"}"#).await;
+    let version = next_request(&mut engine).await;
+    assert_eq!(version["method"], "Browser.getVersion");
+    engine.reply(request_id(&version), json!({ "userAgent": "fake" }));
+    assert_eq!(next_frame(&mut extra).await["id"], 1);
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn unknown_identity_keeps_the_slot_until_the_late_reply() {
+    let mut engine = fake_engine().await;
+    let broker =
+        broker_with_deadlines(&engine, Duration::from_millis(400), Duration::from_secs(30)).await;
+    let mut idle = Vec::new();
+    for index in 0..31 {
+        idle.push(
+            connect(
+                &broker,
+                Endpoint::Browser,
+                Role::Viewer,
+                &format!("idle-{index}"),
+            )
+            .await,
+        );
+    }
+    let mut owner = connect(&broker, Endpoint::Browser, Role::Viewer, "late-owner").await;
+    send(&owner, &broker, r#"{"id":1,"method":"DOM.getDocument"}"#).await;
+    let request = next_request(&mut engine).await;
+    let expired = next_frame(&mut owner).await;
+    assert!(
+        message(&expired).contains("outcome may be unknown"),
+        "{expired}"
+    );
+    // 64 个未取走的 Pong 占满写端配额，第 65 个让 broker 主动断开该 client。
+    let budget = broker.payload_budget();
+    for _ in 0..65 {
+        let lease = budget.try_acquire(1, false).expect("pong lease");
+        assert!(broker.pong(owner.id, vec![0], lease));
+    }
+    assert_eq!(broker.budget_snapshot().await.2, 1);
+    assert!(
+        broker
+            .reserve(ReserveRequest {
+                endpoint: Endpoint::Browser,
+                role: Role::Viewer,
+                owner: "extra".to_string(),
+            })
+            .await
+            .is_err(),
+        "an unresolved reply must keep the client slot"
+    );
+    drop(owner);
+    drop(idle);
+    engine.reply(request_id(&request), json!({ "root": {} }));
+    let mut extra = connect_when_reaped(&broker, "extra").await;
+    send(&extra, &broker, r#"{"id":1,"method":"Browser.getVersion"}"#).await;
+    let version = next_request(&mut engine).await;
+    assert_eq!(version["method"], "Browser.getVersion");
+    engine.reply(request_id(&version), json!({ "userAgent": "fake" }));
+    assert_eq!(next_frame(&mut extra).await["id"], 1);
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn late_attach_retirement_reaps_only_after_detach_confirmation() {
+    let mut engine = fake_engine().await;
+    let broker = broker_with_deadlines(
+        &engine,
+        Duration::from_secs(120),
+        Duration::from_millis(400),
+    )
+    .await;
+    let mut idle = Vec::new();
+    for index in 0..31 {
+        idle.push(
+            connect(
+                &broker,
+                Endpoint::Browser,
+                Role::Viewer,
+                &format!("idle-{index}"),
+            )
+            .await,
+        );
+    }
+    let owner = connect(&broker, Endpoint::Browser, Role::Viewer, "attach-owner").await;
+    send(
+        &owner,
+        &broker,
+        r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"late-target","flatten":true}}"#,
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["method"], "Target.attachToTarget");
+    broker.closed(owner.id);
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.2 != 1 {}
+    })
+    .await
+    .expect("attach timeout must become unknown");
+    assert!(
+        broker
+            .reserve(ReserveRequest {
+                endpoint: Endpoint::Browser,
+                role: Role::Viewer,
+                owner: "extra".to_string(),
+            })
+            .await
+            .is_err(),
+        "unknown attach identity must keep the client slot"
+    );
+    engine.reply(request_id(&attach), json!({ "sessionId": "late-session" }));
+    let detach = next_request(&mut engine).await;
+    assert_eq!(detach["method"], "Target.detachFromTarget");
+    assert_eq!(detach["params"]["sessionId"], "late-session");
+    assert!(
+        broker
+            .reserve(ReserveRequest {
+                endpoint: Endpoint::Browser,
+                role: Role::Viewer,
+                owner: "extra".to_string(),
+            })
+            .await
+            .is_err(),
+        "late attach must keep the retired client until detach is confirmed"
+    );
+    engine.reply(request_id(&detach), json!({}));
+    let mut extra = connect_when_reaped(&broker, "extra").await;
+    send(
+        &extra,
+        &broker,
+        r#"{"id":1,"method":"DOM.getDocument","sessionId":"late-session"}"#,
+    )
+    .await;
+    let rejected = next_frame(&mut extra).await;
+    assert!(
+        message(&rejected).contains("expired or belongs to another"),
+        "{rejected}"
+    );
     expect_no_request(&mut engine).await;
     engine.kill();
     assert!(!broker.wait_terminal().await);

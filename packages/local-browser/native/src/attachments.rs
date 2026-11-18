@@ -98,6 +98,17 @@ impl Attachments {
             .count()
     }
 
+    /// client 槽只有在 session、intent、quarantine 与 auto owner 全部清空后才可回收。
+    pub fn has_client(&self, client: ClientId) -> bool {
+        self.auto_owner == Some(client)
+            || self
+                .sessions
+                .values()
+                .any(|attachment| attachment.client == client)
+            || self.explicit.values().any(|intent| intent.client == client)
+            || self.quarantine.values().any(|entry| entry.client == client)
+    }
+
     /// 派发前占一个 client/global 槽；在途 attach 与早期事件共享该预留。
     pub fn reserve(&mut self, target: &str, client: ClientId, epoch: u64) -> AttachmentReservation {
         if self.explicit.contains_key(target) {
