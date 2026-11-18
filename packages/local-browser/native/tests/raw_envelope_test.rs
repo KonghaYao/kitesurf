@@ -418,6 +418,79 @@ fn escaped_keys_duplicates_presence_and_fixed_selection() {
 }
 
 #[test]
+fn borrowed_identity_and_cleanup_reserve_work_with_zero_ordinary_bytes() {
+    let budget = PayloadBudget::default();
+    let backing = owned(
+        r#"{"sessionId":"old","session\u0049d":"known\ud83d\ude00"}"#.into(),
+        &budget,
+    );
+    let raw = RawEnvelope::parse(
+        backing,
+        ParsePolicy::UpstreamStrict,
+        &mut budget.json_scratch(),
+    )
+    .unwrap();
+    let baseline = budget.used();
+    let held = budget
+        .try_acquire(ORDINARY_BYTES - baseline.0, false)
+        .unwrap();
+    let mut scratch = budget.json_scratch();
+    let node = raw.node("sessionId").unwrap();
+    let mut buffer = [0; 4096];
+    assert_eq!(
+        node.identity_text(&mut buffer, &mut scratch).unwrap(),
+        Some("known😀")
+    );
+    assert!(matches!(
+        node.string(&budget, &mut scratch),
+        Err(RawError::Budget)
+    ));
+    let identity = node
+        .cleanup_identity(&budget, &mut scratch)
+        .unwrap()
+        .unwrap();
+    assert_eq!(identity.as_str(), "known😀");
+    assert_eq!(budget.used().0, ORDINARY_BYTES);
+    assert!(budget.used().1 > baseline.1);
+    let shared = identity.clone();
+    drop(identity);
+    assert_eq!(shared.as_str(), "known😀");
+    drop(shared);
+    assert_eq!(budget.used().1, baseline.1);
+    drop(scratch);
+    drop(held);
+    assert_eq!(budget.used(), baseline);
+    assert!(budget.high_water().1 <= transport::INTERNAL_BYTES);
+}
+
+#[test]
+fn borrowed_identity_preserves_limit_invalid_and_owner_errors() {
+    let budget = PayloadBudget::default();
+    let mut buffer = [0; 4096];
+    let mut scratch = budget.json_scratch();
+    for (text, expected) in [
+        (format!(r#""{}""#, "x".repeat(4097)), RawError::Limit),
+        (r#""\uD800""#.to_string(), RawError::Invalid),
+    ] {
+        let backing = owned(text, &budget);
+        let node = backing.node();
+        assert_eq!(node.identity_text(&mut buffer, &mut scratch), Err(expected));
+        assert!(
+            matches!(node.cleanup_identity(&budget, &mut scratch), Err(error) if error == expected)
+        );
+    }
+    let first = owned(r#"{"sessionId":"s"}"#.into(), &budget);
+    let first = RawEnvelope::parse(first, ParsePolicy::UpstreamStrict, &mut scratch).unwrap();
+    let second = owned("{}".into(), &budget);
+    let second = RawEnvelope::parse(second, ParsePolicy::UpstreamStrict, &mut scratch).unwrap();
+    let span = first.node("sessionId").unwrap().span();
+    assert_eq!(
+        second.at(span).identity_text(&mut buffer, &mut scratch),
+        Err(RawError::Invalid)
+    );
+}
+
+#[test]
 fn chunk_boundaries_identity_and_shared_owner_leases() {
     let budget = PayloadBudget::default();
     let mut scratch = budget.json_scratch();

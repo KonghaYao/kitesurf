@@ -184,12 +184,20 @@ pub struct LeasedTargets {
     pub raw: LeasedRaw,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventMethod {
+    Attached,
+    Detached,
+    Discovery,
+    Other,
+}
+
 struct Received {
     raw: RawEnvelope,
-    method: Option<LeasedIdentity>,
-    outer: Option<LeasedIdentity>,
-    session: Option<LeasedIdentity>,
-    target: Option<LeasedIdentity>,
+    method: Option<EventMethod>,
+    outer: Option<RawSpan>,
+    session: Option<RawSpan>,
+    target: Option<RawSpan>,
     attached: Option<LeasedIdentity>,
 }
 
@@ -197,30 +205,43 @@ impl Received {
     fn parse(raw: RawEnvelope, budget: &PayloadBudget) -> Result<Self, cdp_raw::RawError> {
         let mut scratch = budget.json_scratch();
         let response = raw.id(&mut scratch).is_some();
-        let mut string = |path: &[&str]| {
-            let mut node = raw.node(path[0]);
-            for key in &path[1..] {
-                node = node.and_then(|node| node.field(key, &mut scratch));
-            }
-            node.map(|node| node.string(budget, &mut scratch))
-                .transpose()
-                .map(Option::flatten)
+        let string = |node: Option<cdp_raw::RawNode<'_>>,
+                      scratch: &mut crate::transport::JsonScratchGuard<'_>| {
+            let mut buffer = [0; 4096];
+            node.map(|node| {
+                node.identity_text(&mut buffer, scratch)
+                    .map(|text| text.map(|_| node.span()))
+            })
+            .transpose()
+            .map(Option::flatten)
         };
-        let method = if response { None } else { string(&["method"])? };
+        let method = if response {
+            None
+        } else {
+            string(raw.node("method"), &mut scratch)?
+                .map(|span| Self::event_method(raw.at(span), &mut scratch))
+        };
         let outer = if response {
             None
         } else {
-            string(&["sessionId"])?
+            string(raw.node("sessionId"), &mut scratch)?
         };
-        let attachment = method.as_deref() == Some("Target.attachedToTarget");
-        let detached = method.as_deref() == Some("Target.detachedFromTarget");
-        let session = if attachment || detached {
-            string(&["params", "sessionId"])?
+        let params = raw.node("params");
+        let session = if matches!(method, Some(EventMethod::Attached | EventMethod::Detached)) {
+            string(
+                params.and_then(|node| node.field("sessionId", &mut scratch)),
+                &mut scratch,
+            )?
         } else {
             None
         };
-        let target = if attachment {
-            string(&["params", "targetInfo", "targetId"])?
+        let target = if method == Some(EventMethod::Attached) {
+            string(
+                params
+                    .and_then(|node| node.field("targetInfo", &mut scratch))
+                    .and_then(|node| node.field("targetId", &mut scratch)),
+                &mut scratch,
+            )?
         } else {
             None
         };
@@ -233,6 +254,28 @@ impl Received {
             target,
             attached,
         })
+    }
+
+    fn event_method(
+        node: cdp_raw::RawNode<'_>,
+        scratch: &mut crate::transport::JsonScratchGuard<'_>,
+    ) -> EventMethod {
+        if node.equals("Target.attachedToTarget", scratch) {
+            EventMethod::Attached
+        } else if node.equals("Target.detachedFromTarget", scratch) {
+            EventMethod::Detached
+        } else if [
+            "Target.targetCreated",
+            "Target.targetInfoChanged",
+            "Target.targetDestroyed",
+        ]
+        .iter()
+        .any(|method| node.equals(method, scratch))
+        {
+            EventMethod::Discovery
+        } else {
+            EventMethod::Other
+        }
     }
 
     fn has_error(&self) -> bool {
@@ -311,6 +354,8 @@ enum BrokerCommand {
     },
     #[cfg(all(test, feature = "test-faults"))]
     BudgetSnapshot(oneshot::Sender<(usize, usize, usize, usize)>),
+    #[cfg(all(test, feature = "test-faults"))]
+    ReceiveAck(LeasedRaw, oneshot::Sender<(bool, usize)>),
     ProfileStatus {
         token: u64,
         result: Result<Value, String>,
@@ -1179,6 +1224,14 @@ impl Broker {
     fn command(&mut self, command: BrokerCommand) {
         match command {
             #[cfg(all(test, feature = "test-faults"))]
+            BrokerCommand::ReceiveAck(raw, reply) => {
+                self.upstream_event(UpstreamEvent::Raw(raw));
+                let _ = reply.send((
+                    matches!(self.lifecycle, Lifecycle::Running),
+                    self.attachments.count(),
+                ));
+            }
+            #[cfg(all(test, feature = "test-faults"))]
             BrokerCommand::BudgetSnapshot(reply) => {
                 let _ = reply.send((
                     MAX_PENDING_GLOBAL - self.request_slots.available_permits(),
@@ -1881,9 +1934,12 @@ impl Broker {
             return;
         }
         if matches!(state.endpoint, Endpoint::Page { .. }) {
-            let primary = state.primary.clone();
-            let outer = value.outer.as_deref();
-            if primary.is_none() || outer != primary.as_deref() {
+            let primary = state.primary.as_deref();
+            let budget = self.upstream.handle.budget.clone();
+            let mut scratch = budget.json_scratch();
+            if !value.outer.is_some_and(|span| {
+                primary.is_some_and(|primary| value.raw.at(span).equals(primary, &mut scratch))
+            }) {
                 return;
             }
         }
@@ -2193,8 +2249,8 @@ impl Broker {
             };
             let value = match Received::parse(raw, &self.upstream.handle.budget) {
                 Ok(value) => value,
-                Err(_) => {
-                    self.handle_lost("upstream identity limit exceeded".into());
+                Err(error) => {
+                    self.receive_error(error);
                     return;
                 }
             };
@@ -2214,6 +2270,16 @@ impl Broker {
         }
     }
 
+    fn receive_error(&mut self, error: cdp_raw::RawError) {
+        let reason = match error {
+            cdp_raw::RawError::Budget => "upstream cleanup metadata budget exhausted",
+            cdp_raw::RawError::Limit => "upstream identity limit exceeded",
+            cdp_raw::RawError::Invalid => "invalid upstream metadata owner",
+            cdp_raw::RawError::Duplicate => "invalid upstream metadata fields",
+        };
+        self.handle_lost(reason.into());
+    }
+
     /// 事件只有在能证明归属时才投递；无 session 的普通事件不广播。
     fn own_attachment(
         &mut self,
@@ -2229,24 +2295,18 @@ impl Broker {
     }
 
     fn handle_event(&mut self, value: Received) {
-        let Some(method) = value.method.clone() else {
+        let Some(method) = value.method else {
             return;
         };
-        let outer = value.outer.clone();
-        if method.as_str() == "Target.attachedToTarget" {
-            self.attached_event(value, outer);
+        if method == EventMethod::Attached {
+            self.attached_event(value);
             return;
         }
-        if method.as_str() == "Target.detachedFromTarget" {
+        if method == EventMethod::Detached {
             self.detached_event(value);
             return;
         }
-        if outer.is_none()
-            && matches!(
-                method.as_str(),
-                "Target.targetCreated" | "Target.targetInfoChanged" | "Target.targetDestroyed"
-            )
-        {
+        if value.outer.is_none() && method == EventMethod::Discovery {
             let recipients = self
                 .clients
                 .iter()
@@ -2263,23 +2323,66 @@ impl Broker {
             }
             return;
         }
-        let Some(outer) = outer else {
+        let Some(outer) = value.outer else {
             return;
         };
-        let Some(owner) = self.attachments.owner(&outer) else {
-            return;
+        let budget = self.upstream.handle.budget.clone();
+        let owner = {
+            let mut scratch = budget.json_scratch();
+            let mut buffer = [0; 4096];
+            let session = value
+                .raw
+                .at(outer)
+                .identity_text(&mut buffer, &mut scratch)
+                .ok()
+                .flatten();
+            session.and_then(|session| self.attachments.owner(session))
         };
-        self.deliver_event(owner, &value);
+        if let Some(owner) = owner {
+            self.deliver_event(owner, &value);
+        }
     }
 
-    fn attached_event(&mut self, value: Received, outer: Option<LeasedIdentity>) {
-        let Some(session) = value.session.clone() else {
+    // span 已在 parse 中验证类型、4096-byte 上限和 Unicode；后续只借用同一不可变 owner。
+    fn attached_event(&mut self, value: Received) {
+        let Some(session_span) = value.session else {
             return;
         };
-        let Some(target) = value.target.clone() else {
+        let Some(target_span) = value.target else {
             return;
         };
-        let Some(owner) = self.attachments.resolve_owner(outer.as_deref(), &target) else {
+        let budget = self.upstream.handle.budget.clone();
+        let mut session_buffer = [0; 4096];
+        let mut target_buffer = [0; 4096];
+        let mut outer_buffer = [0; 4096];
+        let (session, target, outer) = {
+            let mut scratch = budget.json_scratch();
+            let session = value
+                .raw
+                .at(session_span)
+                .identity_text(&mut session_buffer, &mut scratch)
+                .ok()
+                .flatten();
+            let target = value
+                .raw
+                .at(target_span)
+                .identity_text(&mut target_buffer, &mut scratch)
+                .ok()
+                .flatten();
+            let outer = value.outer.and_then(|span| {
+                value
+                    .raw
+                    .at(span)
+                    .identity_text(&mut outer_buffer, &mut scratch)
+                    .ok()
+                    .flatten()
+            });
+            (session, target, outer)
+        };
+        let (Some(session), Some(target)) = (session, target) else {
+            return;
+        };
+        let Some(owner) = self.attachments.resolve_owner(outer, target) else {
             return;
         };
         let Some(state) = self.clients.get(&owner) else {
@@ -2287,14 +2390,14 @@ impl Broker {
         };
         let epoch = state.epoch;
         let retired = state.closed || state.retired;
-        let known = self.attachments.attachment(&session).is_some();
+        let known = self.attachments.attachment(session).is_some();
         if !known
             && (self.attachments.count() >= MAX_ATTACHMENTS
                 || self.attachments.count_for(owner) >= MAX_ATTACHMENTS_PER_CLIENT)
         {
             return;
         }
-        self.own_attachment(owner, epoch, &session, &target, outer.as_deref());
+        self.own_attachment(owner, epoch, session, target, outer);
         if retired {
             self.start_retirement(owner);
             return;
@@ -2303,17 +2406,25 @@ impl Broker {
     }
 
     fn detached_event(&mut self, value: Received) {
-        let Some(session) = value.session.clone() else {
-            return;
+        let Some(span) = value.session else { return };
+        let budget = self.upstream.handle.budget.clone();
+        let attachment = {
+            let mut scratch = budget.json_scratch();
+            let mut buffer = [0; 4096];
+            value
+                .raw
+                .at(span)
+                .identity_text(&mut buffer, &mut scratch)
+                .ok()
+                .flatten()
+                .and_then(|session| self.attachments.forget(session))
         };
-        let Some(recipient) = self.attachments.owner(&session) else {
-            return;
-        };
+        let Some(attachment) = attachment else { return };
+        let recipient = attachment.client;
         let primary = self
             .clients
             .get(&recipient)
-            .is_some_and(|state| state.primary.as_deref() == Some(session.as_str()));
-        self.attachments.forget(&session);
+            .is_some_and(|state| state.primary.as_deref() == Some(attachment.session.as_str()));
         if primary {
             self.disconnect_client(recipient, 1008, "Target expired", true);
             return;
@@ -2347,12 +2458,12 @@ impl Broker {
                 .node("result")
                 .and_then(|node| node.field("sessionId", &mut scratch));
             value.attached = match attached
-                .map(|node| node.string(&budget, &mut scratch))
+                .map(|node| node.cleanup_identity(&budget, &mut scratch))
                 .transpose()
             {
                 Ok(attached) => attached.flatten(),
-                Err(_) => {
-                    self.handle_lost("upstream identity limit exceeded".into());
+                Err(error) => {
+                    self.receive_error(error);
                     return;
                 }
             };

@@ -60,7 +60,13 @@ impl Attachments {
             .saturating_mul(2)
             .saturating_add(target.len())
             .saturating_add(parent.map_or(0, str::len));
-        let Some(payload) = self.budget.try_acquire(bytes, false) else {
+        // 已送出的 attach 必须登记归属以便退休清理；只允许有 attachment 槽的 metadata
+        // 借 cleanup reserve，不能借给事件 payload 或客户端输出，forget 时随 attachment 释放。
+        let Some(payload) = self.budget.try_acquire(bytes, false).or_else(|| {
+            (bytes <= 4 * 4096)
+                .then(|| self.budget.try_acquire(bytes, true))
+                .flatten()
+        }) else {
             return false;
         };
         self.sessions.insert(

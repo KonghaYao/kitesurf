@@ -120,6 +120,13 @@ pub struct RawNode<'a> {
 }
 
 impl RawEnvelope {
+    pub fn at(&self, span: RawSpan) -> RawNode<'_> {
+        RawNode {
+            backing: self.backing(),
+            span,
+        }
+    }
+
     pub fn node(&self, name: &str) -> Option<RawNode<'_>> {
         self.field(name).span().map(|span| RawNode {
             backing: &self.backing,
@@ -182,6 +189,44 @@ impl<'a> RawNode<'a> {
             return Ok(None);
         }
         decode_identity(self.raw(scratch)?, budget, scratch).map(Some)
+    }
+
+    /// 同步身份视图只借调用方固定栈；不申请普通预算，也不能越过 raw owner。
+    pub fn identity_text<'b>(
+        self,
+        buffer: &'b mut [u8; IDENTITY_BYTES],
+        _scratch: &mut JsonScratchGuard<'_>,
+    ) -> Result<Option<&'b str>> {
+        let text = self.text()?;
+        if !text.starts_with('"') {
+            return Ok(None);
+        }
+        let mut length = 0usize;
+        string_chunks(text, |chunk| {
+            let end = length.saturating_add(chunk.len());
+            if let Some(output) = buffer.get_mut(length..end) {
+                output.copy_from_slice(chunk.as_bytes());
+            }
+            length = end;
+            Ok(())
+        })?;
+        if length > buffer.len() {
+            return Err(RawError::Limit);
+        }
+        std::str::from_utf8(&buffer[..length])
+            .map(Some)
+            .map_err(|_| RawError::Invalid)
+    }
+
+    pub fn cleanup_identity(
+        self,
+        budget: &PayloadBudget,
+        scratch: &mut JsonScratchGuard<'_>,
+    ) -> Result<Option<LeasedIdentity>> {
+        if !self.text()?.starts_with('"') {
+            return Ok(None);
+        }
+        decode_text_in(self.raw(scratch)?, budget, IDENTITY_BYTES, true, scratch).map(Some)
     }
 
     pub fn equals(self, expected: &str, scratch: &mut JsonScratchGuard<'_>) -> bool {
@@ -648,18 +693,30 @@ pub fn decode_text(
     raw: &RawValue,
     budget: &PayloadBudget,
     limit: usize,
+    scratch: &mut JsonScratchGuard<'_>,
+) -> Result<LeasedIdentity> {
+    decode_text_in(raw, budget, limit, false, scratch)
+}
+
+fn decode_text_in(
+    raw: &RawValue,
+    budget: &PayloadBudget,
+    limit: usize,
+    internal: bool,
     _scratch: &mut JsonScratchGuard<'_>,
 ) -> Result<LeasedIdentity> {
     let mut length = 0usize;
     string_chunks(raw.get(), |chunk| {
-        length = length
-            .checked_add(chunk.len())
-            .filter(|n| *n <= limit)
-            .ok_or(RawError::Limit)?;
+        length = length.saturating_add(chunk.len());
         Ok(())
     })?;
+    if length > limit {
+        return Err(RawError::Limit);
+    }
     let charged = length + std::mem::size_of::<IdentityOwner>() + 2 * std::mem::size_of::<usize>();
-    let lease = budget.try_acquire(charged, false).ok_or(RawError::Budget)?;
+    let lease = budget
+        .try_acquire(charged, internal)
+        .ok_or(RawError::Budget)?;
     let mut text = String::with_capacity(length);
     string_chunks(raw.get(), |chunk| {
         if text.len() + chunk.len() > text.capacity() {

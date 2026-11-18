@@ -445,6 +445,70 @@ mod request_allocations {
     }
 
     #[test]
+    fn exhausted_unknown_near_frame_limit_has_no_owned_payload_allocation() {
+        use crate::cdp_raw::{LeasedRaw, ParsePolicy, RawEnvelope};
+        use crate::transport::{PayloadBudget, MAX_FRAME_BYTES, ORDINARY_BYTES, INTERNAL_BYTES};
+        use super::super::{EventMethod, Received};
+        let budget = PayloadBudget::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        drop(runtime.block_on(budget.receive(true)));
+        drop(budget.json_scratch());
+        let warm =
+            LeasedRaw::accounted("{}".into(), runtime.block_on(budget.receive(true)), &budget)
+                .unwrap();
+        let warm = RawEnvelope::parse(
+            warm,
+            ParsePolicy::UpstreamStrict,
+            &mut budget.json_scratch(),
+        )
+        .unwrap();
+        drop(Received::parse(warm, &budget).unwrap());
+        let mut text = format!(
+            r#"{{"method":"Unknown.\u006fpaque","params":{{"data":"{}"}}}}"#,
+            "\\u0061".repeat((MAX_FRAME_BYTES - 256) / 6)
+        );
+        text.shrink_to_fit();
+        let wire = text.len();
+        assert!(wire > MAX_FRAME_BYTES - 512);
+        let held = budget
+            .try_acquire(ORDINARY_BYTES - MAX_FRAME_BYTES, false)
+            .unwrap();
+        let lease = runtime.block_on(budget.receive(true));
+        TRACK.with(|track| {
+            let mut track = track.borrow_mut();
+            track.stats = Stats::default();
+            track.slots.fill((0, 0));
+            track.active = true;
+        });
+        let raw = LeasedRaw::accounted(text, lease, &budget).unwrap();
+        let raw = RawEnvelope::parse(raw, ParsePolicy::UpstreamStrict, &mut budget.json_scratch())
+            .unwrap();
+        let received = Received::parse(raw, &budget).unwrap();
+        assert!(received.method == Some(EventMethod::Other));
+        assert!(received.outer.is_none());
+        assert_eq!(budget.used(), (ORDINARY_BYTES, MAX_FRAME_BYTES + 256));
+        drop(received);
+        let stats = TRACK.with(|track| {
+            let mut track = track.borrow_mut();
+            track.active = false;
+            track.stats
+        });
+        println!(
+            "exhausted unknown wire={wire}: {stats:?}; high={:?}",
+            budget.high_water()
+        );
+        assert!(!stats.overflow);
+        assert_eq!(stats.live, 0);
+        assert!(stats.peak < 64 * 1024);
+        assert_eq!(budget.used(), (ORDINARY_BYTES, 0));
+        assert!(budget.high_water().1 <= INTERNAL_BYTES);
+        drop(held);
+        assert_eq!(budget.used(), (MAX_FRAME_BYTES, 0));
+    }
+
+    #[test]
     fn production_request_has_no_params_tree_or_copy() {
         use crate::transport::{PayloadBudget, MAX_FRAME_BYTES};
         use super::super::Request;
@@ -1347,6 +1411,344 @@ async fn page_queue_and_management_share_admission_and_cancel_releases_queued_le
     engine.reply(request_id(&attach), json!({"sessionId":"late-page"}));
     engine.kill();
     assert!(!broker.wait_terminal().await);
+}
+
+async fn receive_ack(broker: &BrokerHandle, text: &str) -> (bool, usize) {
+    let budget = broker.payload_budget();
+    let raw =
+        crate::cdp_raw::LeasedRaw::accounted(text.to_owned(), budget.receive(true).await, &budget)
+            .unwrap();
+    broker
+        .command(|reply| super::BrokerCommand::ReceiveAck(raw, reply))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn exhausted_ordinary_empty_reply_keeps_broker_alive() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let client = connect(&broker, Endpoint::Browser, Role::Viewer, "viewer").await;
+    send(
+        &client,
+        &broker,
+        r#"{"id":1,"method":"Browser.getVersion"}"#,
+    )
+    .await;
+    let request = next_request(&mut engine).await;
+    let budget = broker.payload_budget();
+    let held = budget
+        .try_acquire(crate::transport::ORDINARY_BYTES - budget.used().0, false)
+        .unwrap();
+    assert!(budget.try_acquire(1, false).is_none());
+    assert!(
+        receive_ack(
+            &broker,
+            &format!(r#"{{"id":{},"result":{{}}}}"#, request_id(&request))
+        )
+        .await
+        .0
+    );
+    assert_eq!(broker.budget_snapshot().await.0, 0);
+    drop(held);
+    broker.engine_lost();
+    assert!(!broker.wait_terminal().await);
+    engine.kill();
+}
+
+#[tokio::test]
+async fn exhausted_ordinary_known_detach_removes_attachment_without_lost() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut client = connect(&broker, Endpoint::Browser, Role::Viewer, "viewer").await;
+    send(
+        &client,
+        &broker,
+        r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"T"}}"#,
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"known"}));
+    assert_eq!(next_frame(&mut client).await["id"], 1);
+    let budget = broker.payload_budget();
+    let held = budget
+        .try_acquire(crate::transport::ORDINARY_BYTES - budget.used().0, false)
+        .unwrap();
+    assert!(budget.try_acquire(1, false).is_none());
+    assert_eq!(
+        receive_ack(
+            &broker,
+            r#"{"method":"Target.detachedFromTarget","params":{"sessionId":"known"}}"#
+        )
+        .await,
+        (true, 0)
+    );
+    assert!(broker.session().await.unwrap().alive);
+    drop(held);
+    broker.engine_lost();
+    assert!(!broker.wait_terminal().await);
+    engine.kill();
+}
+
+#[tokio::test]
+async fn exhausted_ordinary_unknown_event_is_discarded_without_lost() {
+    let engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    assert!(broker.session().await.unwrap().alive);
+    let budget = broker.payload_budget();
+    let baseline = budget.used();
+    let held = budget
+        .try_acquire(crate::transport::ORDINARY_BYTES - baseline.0, false)
+        .unwrap();
+    assert!(budget.try_acquire(1, false).is_none());
+    assert_eq!(
+        receive_ack(&broker, r#"{"method":"Unknown.opaque","params":{}}"#).await,
+        (true, 0)
+    );
+    assert_eq!(budget.used().1, baseline.1);
+    drop(held);
+    assert_eq!(budget.used(), baseline);
+    broker.engine_lost();
+    assert!(!broker.wait_terminal().await);
+    engine.kill();
+}
+
+#[tokio::test]
+async fn exhausted_ordinary_discards_unowned_event_families_without_broadcast() {
+    let engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(&broker, Endpoint::Browser, Role::Viewer, "alice").await;
+    let mut bob = connect(&broker, Endpoint::Browser, Role::Viewer, "bob").await;
+    let budget = broker.payload_budget();
+    let baseline = budget.used();
+    let held = budget
+        .try_acquire(crate::transport::ORDINARY_BYTES - baseline.0, false)
+        .unwrap();
+    for text in [
+        r#"{"method":"Runtime.consoleAPICalled","params":{"secret":"private"}}"#,
+        r#"{"method":"Network.requestWillBeSent"}"#,
+        r#"{"method":"Runtime.exceptionThrown"}"#,
+        r#"{"method":"Kitesurf.scene"}"#,
+        r#"{"method":"Target.targetCreated"}"#,
+        r#"{"method":"Target.targetInfoChanged"}"#,
+        r#"{"method":"Target.targetDestroyed"}"#,
+        r#"{"method":"Unknown.opaque","\u006dethod":"Unknown.\u006fpaque"}"#,
+        r#"{"method":"Runtime.consoleAPICalled","sessionId":"old","session\u0049d":"missing"}"#,
+        r#"{"method":"Target.attachedToTarget","params":{"sessionId":"ghost","targetInfo":{"targetId":"ghost"}}}"#,
+    ] {
+        assert!(budget.try_acquire(1, false).is_none());
+        assert_eq!(receive_ack(&broker, text).await, (true, 0));
+        assert!(alice.frames.try_recv().is_err());
+        assert!(bob.frames.try_recv().is_err());
+        assert!(!*alice.cancel.borrow());
+        assert!(!*bob.cancel.borrow());
+        assert_eq!(budget.used().1, baseline.1);
+    }
+    drop(held);
+    assert_eq!(budget.used(), baseline);
+    assert!(budget.high_water().1 <= crate::transport::INTERNAL_BYTES);
+    broker.engine_lost();
+    assert!(!broker.wait_terminal().await);
+    engine.kill();
+}
+
+#[tokio::test]
+async fn exhausted_ordinary_escaped_detach_and_runtime_isolate_slow_owner() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(&broker, Endpoint::Browser, Role::Viewer, "alice").await;
+    let mut bob = connect(&broker, Endpoint::Browser, Role::Viewer, "bob").await;
+    let mut healthy = connect(&broker, Endpoint::Browser, Role::Viewer, "healthy").await;
+    for (client, session) in [(&mut alice, "known😀"), (&mut bob, "other")] {
+        send(
+            client,
+            &broker,
+            r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"T"}}"#,
+        )
+        .await;
+        let attach = next_request(&mut engine).await;
+        engine.reply(request_id(&attach), json!({"sessionId": session}));
+        assert_eq!(next_frame(client).await["id"], 1);
+    }
+    let budget = broker.payload_budget();
+    let held = budget
+        .try_acquire(crate::transport::ORDINARY_BYTES - budget.used().0, false)
+        .unwrap();
+    assert_eq!(receive_ack(&broker, r#"{"method":"Runtime.consoleAPICalled","sessionId":"known\ud83d\ude00","session\u0049d":"missing"}"#).await, (true, 2));
+    assert!(!*alice.cancel.borrow());
+    assert!(!*bob.cancel.borrow());
+    assert_eq!(receive_ack(&broker, r#"{"method":"wrong","\u006dethod":"Target.detachedFromTarget","params":{"sessionId":"wrong","\u0073essionId":"known\ud83d\ude00"}}"#).await, (true, 1));
+    assert!(matches!(
+        alice.frames.try_recv(),
+        Ok(ClientCommand::Close { code: 1011, .. })
+    ));
+    assert!(!*bob.cancel.borrow());
+    assert!(bob.frames.try_recv().is_err());
+    // detach 释放少量 metadata；继续填满，固定后续输出失败而不是依赖 payload 大小。
+    let rest = budget
+        .try_acquire(crate::transport::ORDINARY_BYTES - budget.used().0, false)
+        .unwrap();
+    assert_eq!(
+        receive_ack(
+            &broker,
+            r#"{"method":"Runtime.consoleAPICalled","sessionId":"other"}"#
+        )
+        .await,
+        (true, 1)
+    );
+    assert!(matches!(
+        bob.frames.try_recv(),
+        Ok(ClientCommand::Close { code: 1011, .. })
+    ));
+    assert!(alice.frames.try_recv().is_err());
+    assert!(healthy.frames.try_recv().is_err());
+    assert!(!*healthy.cancel.borrow());
+    assert!(broker.session().await.unwrap().alive);
+    drop(rest);
+    drop(held);
+    let detach = next_method(&mut engine, "Target.detachFromTarget").await;
+    assert_eq!(detach["params"]["sessionId"], "other");
+    assert_eq!(
+        receive_ack(
+            &broker,
+            &format!(r#"{{"id":{},"result":{{}}}}"#, request_id(&detach))
+        )
+        .await,
+        (true, 0)
+    );
+    assert_eq!(broker.budget_snapshot().await.3, 0);
+    assert!(budget.high_water().1 <= crate::transport::INTERNAL_BYTES);
+    broker.engine_lost();
+    assert!(!broker.wait_terminal().await);
+    engine.kill();
+}
+
+#[tokio::test]
+async fn exhausted_ordinary_sent_attach_retains_cleanup_until_detach_reply() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut client = connect(&broker, Endpoint::Browser, Role::Viewer, "viewer").await;
+    send(
+        &client,
+        &broker,
+        r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"T"}}"#,
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    let budget = broker.payload_budget();
+    let baseline = budget.used().1;
+    let held = budget
+        .try_acquire(crate::transport::ORDINARY_BYTES - budget.used().0, false)
+        .unwrap();
+    assert_eq!(
+        receive_ack(
+            &broker,
+            &format!(
+                r#"{{"id":{},"result":{{"sessionId":"retained"}}}}"#,
+                request_id(&attach)
+            )
+        )
+        .await,
+        (true, 1)
+    );
+    assert!(matches!(
+        client.frames.try_recv(),
+        Ok(ClientCommand::Close { code: 1011, .. })
+    ));
+    let detach = next_method(&mut engine, "Target.detachFromTarget").await;
+    assert_eq!(detach["params"]["sessionId"], "retained");
+    assert!(budget.used().1 > baseline);
+    assert_eq!(
+        receive_ack(
+            &broker,
+            &format!(r#"{{"id":{},"result":{{}}}}"#, request_id(&detach))
+        )
+        .await,
+        (true, 0)
+    );
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    assert_eq!(budget.used().1, baseline);
+    println!(
+        "sent attach cleanup ordinary/internal={:?}; high={:?}",
+        budget.used(),
+        budget.high_water()
+    );
+    assert!(budget.high_water().1 <= crate::transport::INTERNAL_BYTES);
+    drop(held);
+    broker.engine_lost();
+    assert!(!broker.wait_terminal().await);
+    engine.kill();
+}
+
+#[tokio::test]
+async fn borrowed_event_routes_keep_intent_parent_and_auto_owner_priority() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+    let mut bob = connect(&broker, Endpoint::Browser, Role::Viewer, "bob").await;
+    send(
+        &alice,
+        &broker,
+        r#"{"id":1,"method":"Target.setAutoAttach","params":{"autoAttach":true}}"#,
+    )
+    .await;
+    let auto = next_request(&mut engine).await;
+    engine.reply(request_id(&auto), json!({}));
+    let targets = next_method(&mut engine, "Target.getTargets").await;
+    engine.reply(request_id(&targets), json!({"targetInfos":[]}));
+    assert_eq!(next_frame(&mut alice).await["id"], 1);
+    send(
+        &bob,
+        &broker,
+        r#"{"id":2,"method":"Target.attachToTarget","params":{"targetId":"explicit"}}"#,
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(receive_ack(&broker, r#"{"method":"Target.attachedToTarget","params":{"sessionId":"parent😀","targetInfo":{"targetId":"explicit"}}}"#).await, (true, 1));
+    assert_eq!(
+        next_frame(&mut bob).await["params"]["sessionId"],
+        "parent😀"
+    );
+    engine.reply(request_id(&attach), json!({"sessionId":"parent😀"}));
+    assert_eq!(next_frame(&mut bob).await["id"], 2);
+    assert_eq!(receive_ack(&broker, r#"{"method":"Target.attachedToTarget","sessionId":"wrong","session\u0049d":"parent\ud83d\ude00","params":{"sessionId":"child","targetInfo":{"targetId":"child-target"}}}"#).await, (true, 2));
+    assert_eq!(next_frame(&mut bob).await["params"]["sessionId"], "child");
+    assert!(alice.frames.try_recv().is_err());
+    assert_eq!(receive_ack(&broker, r#"{"method":"Target.attachedToTarget","params":{"sessionId":"auto","targetInfo":{"targetId":"auto-target"}}}"#).await, (true, 3));
+    assert_eq!(next_frame(&mut alice).await["params"]["sessionId"], "auto");
+    assert!(bob.frames.try_recv().is_err());
+    assert_eq!(
+        receive_ack(
+            &broker,
+            r#"{"method":"Runtime.consoleAPICalled","sessionId":"child"}"#
+        )
+        .await,
+        (true, 3)
+    );
+    assert_eq!(next_frame(&mut bob).await["sessionId"], "child");
+    assert!(alice.frames.try_recv().is_err());
+    broker.engine_lost();
+    assert!(!broker.wait_terminal().await);
+    engine.kill();
+}
+
+#[tokio::test]
+async fn exhausted_ordinary_true_identity_limit_is_not_silently_discarded() {
+    let engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let budget = broker.payload_budget();
+    let held = budget
+        .try_acquire(crate::transport::ORDINARY_BYTES - budget.used().0, false)
+        .unwrap();
+    let text = format!(r#"{{"method":"{}"}}"#, "x".repeat(4097));
+    assert!(!receive_ack(&broker, &text).await.0);
+    assert_eq!(
+        broker.lost_watch().borrow().as_deref(),
+        Some("upstream identity limit exceeded")
+    );
+    drop(held);
+    assert!(!broker.wait_terminal().await);
+    engine.kill();
 }
 
 #[tokio::test]
