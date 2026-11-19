@@ -6,19 +6,27 @@
 // 现有 /match、/face 与 /stats。它不接收路径、任意字体族或 Fontconfig 配置，也不启动
 // 子进程。
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, oneshot, watch, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 use kitesurf_font_host::{
@@ -26,10 +34,7 @@ use kitesurf_font_host::{
     MAX_FACE_BYTES,
 };
 
-use crate::services::{
-    bind_private_socket, empty_response, json_response, remove_socket, spawn_listener,
-    ConnectionHandler, ConnectionTasks,
-};
+use crate::services::{bind_private_socket, json_response, remove_socket, ConnectionTasks};
 use crate::HostResult;
 
 pub(crate) const STARTUP_FAILURE: &str =
@@ -37,7 +42,12 @@ pub(crate) const STARTUP_FAILURE: &str =
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_MATCH_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_STATS_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_CONCURRENT_REQUESTS: usize = 8;
+const MAX_CONNECTIONS: usize = 16;
+const RESPONSE_RESERVATION_BYTES: usize = MAX_FACE_BYTES;
+const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_HTTP_HEADERS: usize = 64;
 const MAX_TEXT_BYTES: usize = 4096;
 const MAX_TEXT_CODEPOINTS: usize = 256;
 const FAMILIES: &[&str] = &[
@@ -57,6 +67,9 @@ const STARTUP_SAMPLE: &str = "Aa1";
 const DEFAULT_QUEUE: usize = 4;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_BODY_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_HEADERS_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_WRITER_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(50);
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(crate) trait FontBackend {
@@ -83,13 +96,16 @@ enum FontCommand {
     Match {
         request: MatchRequest,
         reply: oneshot::Sender<Result<MatchResponse, HostError>>,
+        _lease: RequestLease,
     },
     Face {
         id: String,
         reply: oneshot::Sender<Result<Arc<Vec<u8>>, HostError>>,
+        _lease: RequestLease,
     },
     Stats {
         reply: oneshot::Sender<StatsResponse>,
+        _lease: RequestLease,
     },
     Stop,
 }
@@ -99,6 +115,9 @@ struct FontLimits {
     queue: usize,
     request: Duration,
     body: Duration,
+    headers: Duration,
+    writer: Duration,
+    connection: Duration,
     startup: Duration,
 }
 
@@ -108,8 +127,132 @@ impl Default for FontLimits {
             queue: DEFAULT_QUEUE,
             request: DEFAULT_REQUEST_TIMEOUT,
             body: DEFAULT_BODY_TIMEOUT,
+            headers: DEFAULT_HEADERS_TIMEOUT,
+            writer: DEFAULT_WRITER_TIMEOUT,
+            connection: DEFAULT_CONNECTION_TIMEOUT,
             startup: DEFAULT_STARTUP_TIMEOUT,
         }
+    }
+}
+
+struct FontBudget {
+    connections: Arc<Semaphore>,
+    requests: Arc<Semaphore>,
+    reserved: AtomicUsize,
+    #[cfg(test)]
+    active_connections: AtomicUsize,
+    #[cfg(test)]
+    dispatched: AtomicUsize,
+}
+
+impl FontBudget {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            requests: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+            reserved: AtomicUsize::new(0),
+            #[cfg(test)]
+            active_connections: AtomicUsize::new(0),
+            #[cfg(test)]
+            dispatched: AtomicUsize::new(0),
+        })
+    }
+
+    fn try_connection(self: &Arc<Self>) -> Option<ConnectionLease> {
+        let permit = self.connections.clone().try_acquire_owned().ok()?;
+        #[cfg(test)]
+        self.active_connections.fetch_add(1, Ordering::SeqCst);
+        Some(ConnectionLease {
+            _permit: permit,
+            #[cfg(test)]
+            budget: self.clone(),
+        })
+    }
+
+    fn try_request(self: &Arc<Self>) -> Option<RequestLease> {
+        let permit = self.requests.clone().try_acquire_owned().ok()?;
+        self.reserved
+            .fetch_add(RESPONSE_RESERVATION_BYTES, Ordering::SeqCst);
+        Some(RequestLease {
+            _inner: Arc::new(RequestLeaseInner {
+                budget: self.clone(),
+                _permit: permit,
+            }),
+        })
+    }
+
+    #[cfg(test)]
+    fn reserved_bytes(&self) -> usize {
+        self.reserved.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn active_connections(&self) -> usize {
+        self.active_connections.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn dispatched(&self) -> usize {
+        self.dispatched.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn available_connections(&self) -> usize {
+        self.connections.available_permits()
+    }
+
+    #[cfg(test)]
+    fn available_requests(&self) -> usize {
+        self.requests.available_permits()
+    }
+}
+
+struct ConnectionLease {
+    _permit: OwnedSemaphorePermit,
+    #[cfg(test)]
+    budget: Arc<FontBudget>,
+}
+
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        self.budget
+            .active_connections
+            .fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone)]
+struct RequestLease {
+    _inner: Arc<RequestLeaseInner>,
+}
+
+struct RequestLeaseInner {
+    budget: Arc<FontBudget>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for RequestLeaseInner {
+    fn drop(&mut self) {
+        self.budget
+            .reserved
+            .fetch_sub(RESPONSE_RESERVATION_BYTES, Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone, Default)]
+struct FontHooks {
+    #[cfg(test)]
+    probe: Option<Arc<dyn Fn(UnixStream) -> FontStream + Send + Sync>>,
+}
+
+impl FontHooks {
+    fn wrap(&self, stream: UnixStream) -> FontStream {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            return probe(stream);
+        }
+        FontStream::Plain(stream)
     }
 }
 
@@ -123,7 +266,7 @@ pub struct FontService {
     #[cfg(test)]
     pending: Arc<AtomicUsize>,
     #[cfg(test)]
-    permits: Arc<Semaphore>,
+    budget: Arc<FontBudget>,
 }
 
 impl FontService {
@@ -138,6 +281,15 @@ impl FontService {
         run_dir: &Path,
         factory: Box<dyn FnOnce() -> Box<dyn FontBackend> + Send>,
         limits: FontLimits,
+    ) -> HostResult<Self> {
+        Self::start_with_hooks(run_dir, factory, limits, FontHooks::default()).await
+    }
+
+    async fn start_with_hooks(
+        run_dir: &Path,
+        factory: Box<dyn FnOnce() -> Box<dyn FontBackend> + Send>,
+        limits: FontLimits,
+        hooks: FontHooks,
     ) -> HostResult<Self> {
         let path = run_dir.join("fonts.sock");
         let (commands, receiver) = mpsc::channel(limits.queue.max(1));
@@ -168,14 +320,14 @@ impl FontService {
         let (shutdown, shutdown_rx) = watch::channel(false);
         let connections = Arc::new(ConnectionTasks::new());
         let pending = Arc::new(AtomicUsize::new(0));
-        let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
+        let budget = FontBudget::new();
         let handler = Arc::new(FontHandler {
             commands: commands.clone(),
             limits,
             pending: pending.clone(),
-            permits: permits.clone(),
+            budget: budget.clone(),
         });
-        let task = spawn_listener(listener, shutdown_rx, handler, connections.clone());
+        let task = spawn_font_listener(listener, shutdown_rx, handler, connections.clone(), hooks);
         Ok(Self {
             path,
             commands: Some(commands),
@@ -186,7 +338,7 @@ impl FontService {
             #[cfg(test)]
             pending,
             #[cfg(test)]
-            permits,
+            budget,
         })
     }
 
@@ -237,6 +389,188 @@ impl Drop for FontService {
     }
 }
 
+fn spawn_font_listener(
+    listener: UnixListener,
+    mut shutdown: watch::Receiver<bool>,
+    handler: Arc<FontHandler>,
+    connections: Arc<ConnectionTasks>,
+    hooks: FontHooks,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+              changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                  break;
+                }
+              }
+              accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                  // 连接额度在 spawn 与 HTTP 解析之前取得；无额度直接关闭，不排队等待。
+                  let Some(lease) = handler.budget.try_connection() else {
+                    drop(stream);
+                    continue;
+                  };
+                  let stream = hooks.wrap(stream);
+                  let handler = handler.clone();
+                  let task = tokio::spawn(async move {
+                    run_font_connection(stream, handler, lease).await;
+                  });
+                  connections.track(task);
+                }
+                Err(_) => break,
+              }
+            }
+        }
+    })
+}
+
+async fn run_font_connection(
+    stream: FontStream,
+    handler: Arc<FontHandler>,
+    lease: ConnectionLease,
+) {
+    // 先声明连接 lease：future 被 abort 时也最后释放，Hyper 与 IO 先销毁。
+    let connection_lease = lease;
+    let connection_state = Arc::new(FontConnection::new());
+    let (write_started, write_started_rx) = oneshot::channel();
+    let write_started = Arc::new(Mutex::new(Some(write_started)));
+    let service = service_fn({
+        let handler = handler.clone();
+        let connection_state = connection_state.clone();
+        let write_started = write_started.clone();
+        move |request| {
+            let handler = handler.clone();
+            let connection_state = connection_state.clone();
+            let write_started = write_started.clone();
+            async move {
+                let response = handler.handle(request, &connection_state).await;
+                if let Ok(mut slot) = write_started.lock() {
+                    if let Some(sender) = slot.take() {
+                        let _ = sender.send(());
+                    }
+                }
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        }
+    });
+    let limits = handler.limits;
+    let http = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(limits.headers)
+        .keep_alive(false)
+        .pipeline_flush(false)
+        .writev(true)
+        .max_headers(MAX_HTTP_HEADERS)
+        .max_buf_size(MAX_HTTP_BUFFER_BYTES)
+        .serve_connection(TokioIo::new(stream), service);
+    let mut http = Box::pin(http);
+    let writer_deadline = async move {
+        if write_started_rx.await.is_ok() {
+            tokio::time::sleep(limits.writer).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    let mut writer_deadline = Box::pin(writer_deadline);
+    let mut total_deadline = Box::pin(tokio::time::sleep(limits.connection));
+    tokio::select! {
+        _ = &mut http => {}
+        _ = &mut writer_deadline => {}
+        _ = &mut total_deadline => {}
+    }
+    // 写出超时或总超时都直接关闭，不向已开始的响应追加错误 JSON。
+    drop(http);
+    drop(connection_state);
+    drop(connection_lease);
+}
+
+struct FontConnection {
+    dispatched: AtomicBool,
+    lease: Mutex<Option<RequestLease>>,
+}
+
+impl FontConnection {
+    fn new() -> Self {
+        Self {
+            dispatched: AtomicBool::new(false),
+            lease: Mutex::new(None),
+        }
+    }
+
+    fn hold(&self, lease: &RequestLease) {
+        if let Ok(mut slot) = self.lease.lock() {
+            *slot = Some(lease.clone());
+        }
+    }
+}
+
+enum FontStream {
+    Plain(UnixStream),
+    #[cfg(test)]
+    Probe(probe::ProbeStream),
+}
+
+impl AsyncRead for FontStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            FontStream::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            #[cfg(test)]
+            FontStream::Probe(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for FontStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            FontStream::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            #[cfg(test)]
+            FontStream::Probe(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            FontStream::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            #[cfg(test)]
+            FontStream::Probe(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            FontStream::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            #[cfg(test)]
+            FontStream::Probe(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            FontStream::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            #[cfg(test)]
+            FontStream::Probe(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
 fn run_worker(
     factory: Box<dyn FnOnce() -> Box<dyn FontBackend> + Send>,
     mut commands: mpsc::Receiver<FontCommand>,
@@ -252,13 +586,17 @@ fn run_worker(
     }
     while let Some(command) = commands.blocking_recv() {
         match command {
-            FontCommand::Match { request, reply } => {
+            FontCommand::Match {
+                request,
+                reply,
+                _lease,
+            } => {
                 let _ = reply.send(backend.match_faces(&request));
             }
-            FontCommand::Face { id, reply } => {
+            FontCommand::Face { id, reply, _lease } => {
                 let _ = reply.send(backend.face_bytes(&id));
             }
-            FontCommand::Stats { reply } => {
+            FontCommand::Stats { reply, _lease } => {
                 let _ = reply.send(backend.stats());
             }
             FontCommand::Stop => break,
@@ -293,7 +631,7 @@ struct FontHandler {
     commands: mpsc::Sender<FontCommand>,
     limits: FontLimits,
     pending: Arc<AtomicUsize>,
-    permits: Arc<Semaphore>,
+    budget: Arc<FontBudget>,
 }
 
 // Bazel 为 native 和 font-host 各建一套 crate 仓库，serde trait 不能跨这两套实例；
@@ -447,26 +785,35 @@ struct FaceRequest {
 }
 
 impl FontHandler {
-    async fn serve(&self, request: Request<Incoming>) -> Response<Full<Bytes>> {
-        let Ok(_permit) = self.permits.clone().try_acquire_owned() else {
+    async fn handle(
+        &self,
+        request: Request<Incoming>,
+        connection: &FontConnection,
+    ) -> Response<Full<Bytes>> {
+        if connection.dispatched.swap(true, Ordering::SeqCst) {
+            return status_response(StatusCode::TOO_MANY_REQUESTS);
+        }
+        // 请求 lease 在读取 body、创建命令或分配响应之前取得。
+        let Some(lease) = self.budget.try_request() else {
             return status_response(StatusCode::TOO_MANY_REQUESTS);
         };
+        connection.hold(&lease);
         if request.method() != Method::POST {
-            return empty_response(StatusCode::METHOD_NOT_ALLOWED);
+            return leased_empty(StatusCode::METHOD_NOT_ALLOWED, lease);
         }
         let path = request.uri().path().to_string();
         if declared_length(&request).is_some_and(|length| length > MAX_REQUEST_BYTES as u64) {
-            return invalid_request();
+            return invalid_request(lease);
         }
         let body = match self.read_body(request.into_body()).await {
             Ok(body) => body,
-            Err(status) => return json_response(status, r#"{"error":"invalid request"}"#),
+            Err(status) => return leased_json(status, br#"{"error":"invalid request"}"#, lease),
         };
         match path.as_str() {
-            "/match" => self.match_response(&body).await,
-            "/face" => self.face_response(&body).await,
-            "/stats" => self.stats_response().await,
-            _ => empty_response(StatusCode::NOT_FOUND),
+            "/match" => self.match_response(&body, lease).await,
+            "/face" => self.face_response(&body, lease).await,
+            "/stats" => self.stats_response(lease).await,
+            _ => leased_empty(StatusCode::NOT_FOUND, lease),
         }
     }
 
@@ -482,6 +829,8 @@ impl FontHandler {
         match self.commands.try_send(command) {
             Ok(()) => {
                 self.pending.fetch_add(1, Ordering::SeqCst);
+                #[cfg(test)]
+                self.budget.dispatched.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
             Err(TrySendError::Full(_)) => Err(StatusCode::TOO_MANY_REQUESTS),
@@ -489,92 +838,101 @@ impl FontHandler {
         }
     }
 
-    async fn match_response(&self, body: &[u8]) -> Response<Full<Bytes>> {
+    async fn match_response(&self, body: &[u8], lease: RequestLease) -> Response<Full<Bytes>> {
         let Ok(input) = serde_json::from_slice::<MatchRequestInput>(body) else {
-            return invalid_request();
+            return invalid_request(lease);
         };
         if !valid_match_input(&input) {
-            return invalid_request();
+            return invalid_request(lease);
         }
         let request: MatchRequest = input.into();
         let (reply, receiver) = oneshot::channel();
-        if let Err(status) = self.enqueue(FontCommand::Match { request, reply }) {
-            return status_response(status);
+        let command = FontCommand::Match {
+            request,
+            reply,
+            _lease: lease.clone(),
+        };
+        if let Err(status) = self.enqueue(command) {
+            return leased_status(status, lease);
         }
         let _pending = PendingGuard(self.pending.clone());
         match tokio::time::timeout(self.limits.request, receiver).await {
-            Err(_) => json_response(StatusCode::BAD_GATEWAY, r#"{"error":"timeout"}"#),
-            Ok(Err(_)) => unavailable(),
-            Ok(Ok(Err(error))) => font_error_response(error),
+            Err(_) => leased_json(StatusCode::BAD_GATEWAY, br#"{"error":"timeout"}"#, lease),
+            Ok(Err(_)) => unavailable(lease),
+            Ok(Ok(Err(error))) => font_error_response(error, lease),
             Ok(Ok(Ok(response))) => {
                 let output = MatchOutput::from(&response);
-                match serde_json::to_vec(&output) {
-                    Ok(bytes) if bytes.len() <= MAX_MATCH_RESPONSE_BYTES => {
-                        json_response(StatusCode::OK, bytes)
-                    }
-                    _ => unavailable(),
+                match bounded_json(&output, MAX_MATCH_RESPONSE_BYTES) {
+                    Some(bytes) => leased_json(StatusCode::OK, &bytes, lease),
+                    None => unavailable(lease),
                 }
             }
         }
     }
 
-    async fn face_response(&self, body: &[u8]) -> Response<Full<Bytes>> {
+    async fn face_response(&self, body: &[u8], lease: RequestLease) -> Response<Full<Bytes>> {
         let Ok(request) = serde_json::from_slice::<FaceRequest>(body) else {
-            return invalid_request();
+            return invalid_request(lease);
         };
         if !valid_id(&request.id) {
-            return invalid_request();
+            return invalid_request(lease);
         }
         let (reply, receiver) = oneshot::channel();
-        if let Err(status) = self.enqueue(FontCommand::Face {
+        let command = FontCommand::Face {
             id: request.id,
             reply,
-        }) {
-            return status_response(status);
+            _lease: lease.clone(),
+        };
+        if let Err(status) = self.enqueue(command) {
+            return leased_status(status, lease);
         }
         let _pending = PendingGuard(self.pending.clone());
         match tokio::time::timeout(self.limits.request, receiver).await {
-            Err(_) => json_response(StatusCode::BAD_GATEWAY, r#"{"error":"timeout"}"#),
-            Ok(Err(_)) => unavailable(),
-            Ok(Ok(Err(error))) => font_error_response(error),
-            Ok(Ok(Ok(bytes))) if bytes.is_empty() || bytes.len() > MAX_FACE_BYTES => unavailable(),
-            Ok(Ok(Ok(bytes))) => Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "font/otf")
-                .header("content-length", bytes.len().to_string())
-                .header("cache-control", "no-store")
-                .body(Full::new(Bytes::from(bytes.as_ref().clone())))
-                .expect("font response"),
-        }
-    }
-
-    async fn stats_response(&self) -> Response<Full<Bytes>> {
-        let (reply, receiver) = oneshot::channel();
-        if let Err(status) = self.enqueue(FontCommand::Stats { reply }) {
-            return status_response(status);
-        }
-        let _pending = PendingGuard(self.pending.clone());
-        match tokio::time::timeout(self.limits.request, receiver).await {
-            Err(_) => json_response(StatusCode::BAD_GATEWAY, r#"{"error":"timeout"}"#),
-            Ok(Err(_)) => unavailable(),
-            Ok(Ok(stats)) => {
-                let output = StatsOutput::from(&stats);
-                match serde_json::to_vec(&output) {
-                    Ok(bytes) => json_response(StatusCode::OK, bytes),
-                    Err(_) => unavailable(),
-                }
+            Err(_) => leased_json(StatusCode::BAD_GATEWAY, br#"{"error":"timeout"}"#, lease),
+            Ok(Err(_)) => unavailable(lease),
+            Ok(Ok(Err(error))) => font_error_response(error, lease),
+            Ok(Ok(Ok(bytes))) if bytes.is_empty() || bytes.len() > MAX_FACE_BYTES => {
+                unavailable(lease)
+            }
+            Ok(Ok(Ok(bytes))) => {
+                let length = bytes.len();
+                // 只共享 Arc，不复制整个 face；lease 随 Bytes owner 留到 writer 结束。
+                let body = Bytes::from_owner(FaceBody {
+                    bytes,
+                    _lease: lease,
+                });
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "font/otf")
+                    .header("content-length", length.to_string())
+                    .header("cache-control", "no-store")
+                    .body(Full::new(body))
+                    .expect("font response")
             }
         }
     }
-}
 
-impl ConnectionHandler for FontHandler {
-    fn handle(
-        &self,
-        request: Request<Incoming>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response<Full<Bytes>>> + Send + '_>>
-    {
-        Box::pin(async move { self.serve(request).await })
+    async fn stats_response(&self, lease: RequestLease) -> Response<Full<Bytes>> {
+        let (reply, receiver) = oneshot::channel();
+        let command = FontCommand::Stats {
+            reply,
+            _lease: lease.clone(),
+        };
+        if let Err(status) = self.enqueue(command) {
+            return leased_status(status, lease);
+        }
+        let _pending = PendingGuard(self.pending.clone());
+        match tokio::time::timeout(self.limits.request, receiver).await {
+            Err(_) => leased_json(StatusCode::BAD_GATEWAY, br#"{"error":"timeout"}"#, lease),
+            Ok(Err(_)) => unavailable(lease),
+            Ok(Ok(stats)) => {
+                let output = StatsOutput::from(&stats);
+                match bounded_json(&output, MAX_STATS_RESPONSE_BYTES) {
+                    Some(bytes) => leased_json(StatusCode::OK, &bytes, lease),
+                    None => unavailable(lease),
+                }
+            }
+        }
     }
 }
 
@@ -586,6 +944,97 @@ impl Drop for PendingGuard {
     }
 }
 
+struct LeasedBody {
+    bytes: Vec<u8>,
+    _lease: RequestLease,
+}
+
+impl AsRef<[u8]> for LeasedBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+struct FaceBody {
+    bytes: Arc<Vec<u8>>,
+    _lease: RequestLease,
+}
+
+impl AsRef<[u8]> for FaceBody {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
+struct BoundedJsonWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(buf.len()) > self.limit {
+            return Err(std::io::Error::other("response too large"));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_json<T: Serialize>(value: &T, limit: usize) -> Option<Vec<u8>> {
+    let mut writer = BoundedJsonWriter {
+        bytes: Vec::new(),
+        limit,
+    };
+    serde_json::to_writer(&mut writer, value).ok()?;
+    Some(writer.bytes)
+}
+
+fn leased_response(
+    status: StatusCode,
+    content_type: Option<&'static str>,
+    bytes: Vec<u8>,
+    lease: RequestLease,
+) -> Response<Full<Bytes>> {
+    let length = bytes.len();
+    let body = Bytes::from_owner(LeasedBody {
+        bytes,
+        _lease: lease,
+    });
+    let mut builder = Response::builder()
+        .status(status)
+        .header("content-length", length.to_string())
+        .header("cache-control", "no-store");
+    if let Some(content_type) = content_type {
+        builder = builder.header("content-type", content_type);
+    }
+    builder.body(Full::new(body)).expect("leased response")
+}
+
+fn leased_json(status: StatusCode, body: &[u8], lease: RequestLease) -> Response<Full<Bytes>> {
+    leased_response(status, Some("application/json"), body.to_vec(), lease)
+}
+
+fn leased_empty(status: StatusCode, lease: RequestLease) -> Response<Full<Bytes>> {
+    leased_response(status, None, Vec::new(), lease)
+}
+
+fn leased_status(status: StatusCode, lease: RequestLease) -> Response<Full<Bytes>> {
+    let error = match status {
+        StatusCode::TOO_MANY_REQUESTS => "busy",
+        _ => "unavailable",
+    };
+    leased_json(
+        status,
+        json!({ "error": error }).to_string().as_bytes(),
+        lease,
+    )
+}
+
 fn status_response(status: StatusCode) -> Response<Full<Bytes>> {
     let error = match status {
         StatusCode::TOO_MANY_REQUESTS => "busy",
@@ -594,25 +1043,31 @@ fn status_response(status: StatusCode) -> Response<Full<Bytes>> {
     json_response(status, json!({ "error": error }).to_string())
 }
 
-fn invalid_request() -> Response<Full<Bytes>> {
-    json_response(StatusCode::BAD_REQUEST, r#"{"error":"invalid request"}"#)
+fn invalid_request(lease: RequestLease) -> Response<Full<Bytes>> {
+    leased_json(
+        StatusCode::BAD_REQUEST,
+        br#"{"error":"invalid request"}"#,
+        lease,
+    )
 }
 
-fn unavailable() -> Response<Full<Bytes>> {
-    json_response(StatusCode::BAD_GATEWAY, r#"{"error":"unavailable"}"#)
+fn unavailable(lease: RequestLease) -> Response<Full<Bytes>> {
+    leased_json(
+        StatusCode::BAD_GATEWAY,
+        br#"{"error":"unavailable"}"#,
+        lease,
+    )
 }
 
-fn font_error_response(error: HostError) -> Response<Full<Bytes>> {
+fn font_error_response(error: HostError, lease: RequestLease) -> Response<Full<Bytes>> {
     let status = match error.code {
         ErrorCode::BadRequest | ErrorCode::UnknownId | ErrorCode::ExpiredId => {
             StatusCode::NOT_FOUND
         }
         _ => StatusCode::BAD_GATEWAY,
     };
-    json_response(
-        status,
-        json!({ "error": error.code.as_str(), "message": error.message }).to_string(),
-    )
+    let body = json!({ "error": error.code.as_str(), "message": error.message }).to_string();
+    leased_json(status, body.as_bytes(), lease)
 }
 
 fn declared_length(request: &Request<Incoming>) -> Option<u64> {
@@ -645,24 +1100,124 @@ fn valid_id(id: &str) -> bool {
 }
 
 #[cfg(test)]
+mod probe {
+    use super::*;
+    use tokio::sync::Notify;
+
+    pub(super) struct ProbeStream {
+        inner: UnixStream,
+        signal: Arc<ProbeSignal>,
+    }
+
+    impl ProbeStream {
+        pub(super) fn new(inner: UnixStream, signal: Arc<ProbeSignal>) -> Self {
+            Self { inner, signal }
+        }
+    }
+
+    pub(super) struct ProbeSignal {
+        blocked: AtomicBool,
+        notify: Notify,
+    }
+
+    impl ProbeSignal {
+        pub(super) fn new() -> Self {
+            Self {
+                blocked: AtomicBool::new(false),
+                notify: Notify::new(),
+            }
+        }
+
+        pub(super) async fn wait_blocked(&self) {
+            loop {
+                let notified = self.notify.notified();
+                if self.blocked.load(Ordering::SeqCst) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn mark_blocked(&self) {
+            self.blocked.store(true, Ordering::SeqCst);
+            self.notify.notify_waiters();
+        }
+    }
+
+    impl AsyncRead for ProbeStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for ProbeStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            let result = Pin::new(&mut this.inner).poll_write(cx, buf);
+            if result.is_pending() {
+                this.signal.mark_blocked();
+            }
+            result
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[std::io::IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            let result = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+            if result.is_pending() {
+                this.signal.mark_blocked();
+            }
+            result
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicBool;
-    use std::sync::Condvar;
+    use std::sync::{Condvar, Weak};
 
-    use hyper_util::rt::TokioIo;
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::UnixStream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Notify;
 
     const FACE_ID: &str = "0123456789abcdef0123456789abcdef";
     const FACE_BYTES: [u8; 8] = [0, 1, 0, 0, 0, 0, 0, 0];
+    const LARGE_FACE_BYTES: usize = 8 * 1024 * 1024;
+    type FaceProbe = Arc<Mutex<Option<Weak<Vec<u8>>>>>;
 
     fn limits(queue: usize, request: Duration) -> FontLimits {
         FontLimits {
             queue,
             request,
             body: Duration::from_secs(2),
+            headers: Duration::from_secs(10),
+            writer: Duration::from_secs(10),
+            connection: Duration::from_secs(30),
             startup: Duration::from_secs(2),
         }
     }
@@ -810,6 +1365,59 @@ mod tests {
         }
     }
 
+    struct ResourceBackend {
+        face_len: usize,
+        face: FaceProbe,
+        match_started: Arc<Notify>,
+        match_armed: Arc<AtomicBool>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl ResourceBackend {
+        fn new(face_len: usize) -> (Self, FaceProbe) {
+            let face = Arc::new(Mutex::new(None));
+            let backend = Self {
+                face_len,
+                face: face.clone(),
+                match_started: Arc::new(Notify::new()),
+                match_armed: Arc::new(AtomicBool::new(false)),
+                gate: Arc::new((Mutex::new(false), Condvar::new())),
+            };
+            (backend, face)
+        }
+    }
+
+    impl FontBackend for ResourceBackend {
+        fn match_faces(&mut self, _request: &MatchRequest) -> Result<MatchResponse, HostError> {
+            if self.match_armed.load(Ordering::SeqCst) {
+                self.match_started.notify_one();
+                let (lock, cvar) = &*self.gate;
+                let mut open = lock.lock().expect("gate");
+                while !*open {
+                    open = cvar.wait(open).expect("gate wait");
+                }
+            }
+            Ok(MatchResponse {
+                faces: vec![FaceSummary {
+                    bytes: self.face_len,
+                    ..face()
+                }],
+                covered: true,
+                missing: 0,
+                reason: None,
+            })
+        }
+
+        fn face_bytes(&mut self, _id: &str) -> Result<Arc<Vec<u8>>, HostError> {
+            let bytes = Arc::new(vec![0x5a; self.face_len]);
+            *self.face.lock().expect("face probe") = Some(Arc::downgrade(&bytes));
+            Ok(bytes)
+        }
+
+        fn stats(&mut self) -> StatsResponse {
+            empty_stats()
+        }
+    }
     struct PanicBackend {
         armed: Arc<AtomicBool>,
     }
@@ -857,6 +1465,103 @@ mod tests {
         .await
     }
 
+    async fn start_hooked(
+        factory: Box<dyn FnOnce() -> Box<dyn FontBackend> + Send>,
+        limits: FontLimits,
+        hooks: FontHooks,
+    ) -> (FontService, PathBuf, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let service = FontService::start_with_hooks(directory.path(), factory, limits, hooks)
+            .await
+            .expect("font service starts");
+        let path = directory.path().join("fonts.sock");
+        (service, path, directory)
+    }
+
+    fn probe_hooks(signal: Arc<probe::ProbeSignal>) -> FontHooks {
+        FontHooks {
+            probe: Some(Arc::new(move |stream| {
+                FontStream::Probe(probe::ProbeStream::new(stream, signal.clone()))
+            })),
+        }
+    }
+
+    fn request_bytes(target: &str, body: &[u8]) -> Vec<u8> {
+        let mut bytes = format!(
+            "POST {target} HTTP/1.1\r\nhost: fonts\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    async fn raw_request(path: &Path, target: &str, body: &[u8]) -> UnixStream {
+        let mut stream = UnixStream::connect(path).await.expect("raw connect");
+        stream
+            .write_all(&request_bytes(target, body))
+            .await
+            .expect("write request");
+        stream.flush().await.expect("flush request");
+        stream
+    }
+
+    async fn wait_for(mut condition: impl FnMut() -> bool, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(tokio::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    struct LargeSetup {
+        service: FontService,
+        path: PathBuf,
+        _directory: tempfile::TempDir,
+        face: FaceProbe,
+        signal: Arc<probe::ProbeSignal>,
+        match_armed: Arc<AtomicBool>,
+        match_started: Arc<Notify>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    async fn start_large(limits: FontLimits) -> LargeSetup {
+        let (backend, face) = ResourceBackend::new(LARGE_FACE_BYTES);
+        let signal = Arc::new(probe::ProbeSignal::new());
+        let match_armed = backend.match_armed.clone();
+        let match_started = backend.match_started.clone();
+        let gate = backend.gate.clone();
+        let (service, path, directory) = start_hooked(
+            Box::new(move || -> Box<dyn FontBackend> { Box::new(backend) }),
+            limits,
+            probe_hooks(signal.clone()),
+        )
+        .await;
+        // 启动校验也读一次 face；测试只关心实际 /face 请求留下的 Arc。
+        *face.lock().expect("face probe") = None;
+        LargeSetup {
+            service,
+            path,
+            _directory: directory,
+            face,
+            signal,
+            match_armed,
+            match_started,
+            gate,
+        }
+    }
+
+    fn face_request_body() -> Vec<u8> {
+        format!(r#"{{"id":"{FACE_ID}"}}"#).into_bytes()
+    }
+
+    fn assert_baseline(budget: &FontBudget) {
+        assert_eq!(budget.reserved_bytes(), 0);
+        assert_eq!(budget.active_connections(), 0);
+        assert_eq!(budget.available_requests(), MAX_CONCURRENT_REQUESTS);
+        assert_eq!(budget.available_connections(), MAX_CONNECTIONS);
+    }
+
     async fn request(path: &Path, method: &str, target: &str, body: &[u8]) -> (u16, Bytes) {
         let stream = UnixStream::connect(path)
             .await
@@ -864,7 +1569,7 @@ mod tests {
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .expect("http handshake");
-        tokio::spawn(async move {
+        let driver = tokio::spawn(async move {
             let _ = connection.await;
         });
         let request = Request::builder()
@@ -881,6 +1586,11 @@ mod tests {
             .await
             .expect("response body")
             .to_bytes();
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .expect("client connection settles")
+            .expect("client driver");
         (status, bytes)
     }
 
@@ -1018,14 +1728,15 @@ mod tests {
             stream.flush().await.expect("flush");
             stalled.push(stream);
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while service.permits.available_permits() > 0 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "stalled bodies did not occupy every request permit"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_for(
+            || service.budget.available_requests() == 0,
+            "stalled bodies did not occupy every request permit",
+        )
+        .await;
+        assert_eq!(
+            service.budget.reserved_bytes(),
+            MAX_CONCURRENT_REQUESTS * RESPONSE_RESERVATION_BYTES
+        );
         assert_eq!(
             request(&path, "POST", "/match", br#"{"family":"sans-serif"}"#)
                 .await
@@ -1036,6 +1747,9 @@ mod tests {
             let _ = stream.shutdown().await;
         }
         assert!(service.shutdown().await);
+        assert_eq!(service.budget.reserved_bytes(), 0);
+        assert_eq!(service.budget.available_requests(), MAX_CONCURRENT_REQUESTS);
+        assert_eq!(service.budget.active_connections(), 0);
     }
 
     #[tokio::test]
@@ -1048,7 +1762,7 @@ mod tests {
             started: started.clone(),
             gate: gate.clone(),
         };
-        let limits = limits(2, Duration::from_secs(5));
+        let limits = limits(4, Duration::from_secs(5));
         let (mut service, path, _directory) = start(
             Box::new(move || -> Box<dyn FontBackend> { Box::new(backend) }),
             limits,
@@ -1060,24 +1774,36 @@ mod tests {
             request(&first_path, "POST", "/match", br#"{"family":"sans-serif"}"#).await
         });
         started.notified().await;
-        let path_a = path.clone();
-        let queued_a = tokio::spawn(async move {
-            request(&path_a, "POST", "/match", br#"{"family":"sans-serif"}"#).await
-        });
-        let path_b = path.clone();
-        let queued_b = tokio::spawn(async move {
-            request(&path_b, "POST", "/match", br#"{"family":"sans-serif"}"#).await
-        });
-        wait_pending(&service, 3).await;
+        let mut queued = Vec::new();
+        for _ in 0..DEFAULT_QUEUE {
+            let queued_path = path.clone();
+            queued.push(tokio::spawn(async move {
+                request(
+                    &queued_path,
+                    "POST",
+                    "/match",
+                    br#"{"family":"sans-serif"}"#,
+                )
+                .await
+            }));
+        }
+        wait_pending(&service, 1 + DEFAULT_QUEUE).await;
+        assert_eq!(
+            service.budget.reserved_bytes(),
+            (1 + DEFAULT_QUEUE) * RESPONSE_RESERVATION_BYTES
+        );
         let extra = request(&path, "POST", "/match", br#"{"family":"sans-serif"}"#).await;
         assert_eq!(extra.0, 429);
         let (lock, cvar) = &*gate;
         *lock.lock().expect("gate") = true;
         cvar.notify_all();
         assert_eq!(first.await.expect("first task").0, 200);
-        assert_eq!(queued_a.await.expect("queued task").0, 200);
-        assert_eq!(queued_b.await.expect("queued task").0, 200);
+        for task in queued {
+            assert_eq!(task.await.expect("queued task").0, 200);
+        }
         assert!(service.shutdown().await);
+        assert_eq!(service.budget.reserved_bytes(), 0);
+        assert_eq!(service.budget.active_connections(), 0);
     }
 
     #[tokio::test]
@@ -1099,10 +1825,18 @@ mod tests {
         let (status, body) = request(&path, "POST", "/match", br#"{"family":"sans-serif"}"#).await;
         assert_eq!(status, 502);
         assert_eq!(body.as_ref(), br#"{"error":"timeout"}"#.as_slice());
+        // HTTP 已结束，但 backend 仍阻塞；命令继续持有 lease，预算不释放。
+        assert_eq!(service.budget.reserved_bytes(), RESPONSE_RESERVATION_BYTES);
         let (lock, cvar) = &*gate;
         *lock.lock().expect("gate") = true;
         cvar.notify_all();
+        wait_for(
+            || service.budget.reserved_bytes() == 0,
+            "timed out command did not release its lease",
+        )
+        .await;
         assert!(service.shutdown().await);
+        assert_eq!(service.budget.active_connections(), 0);
     }
 
     #[tokio::test]
@@ -1135,7 +1869,11 @@ mod tests {
         let (lock, cvar) = &*gate;
         *lock.lock().expect("gate") = true;
         cvar.notify_all();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_for(
+            || service.budget.reserved_bytes() == 0,
+            "disconnected request did not release its lease",
+        )
+        .await;
         assert_eq!(request(&path, "POST", "/match", body).await.0, 200);
         assert!(service.shutdown().await);
     }
@@ -1200,5 +1938,246 @@ mod tests {
         assert_eq!(mode, 0o600);
         assert!(service.shutdown().await);
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn blocked_writer_holds_connection_and_response_lease() {
+        let mut setup = start_large(limits(4, Duration::from_secs(5))).await;
+        let client = raw_request(&setup.path, "/face", &face_request_body()).await;
+        tokio::time::timeout(Duration::from_secs(5), setup.signal.wait_blocked())
+            .await
+            .expect("server writer never blocked");
+        // handler 已返回且 body 已交给 writer；连接与 response 预算仍然占用。
+        assert_eq!(setup.service.budget.active_connections(), 1);
+        assert_eq!(
+            setup.service.budget.available_connections(),
+            MAX_CONNECTIONS - 1
+        );
+        assert_eq!(
+            setup.service.budget.reserved_bytes(),
+            RESPONSE_RESERVATION_BYTES
+        );
+        assert_eq!(
+            setup.service.budget.available_requests(),
+            MAX_CONCURRENT_REQUESTS - 1
+        );
+        let weak = setup
+            .face
+            .lock()
+            .expect("face probe")
+            .clone()
+            .expect("face weak");
+        assert!(
+            weak.upgrade().is_some(),
+            "face bytes were copied before the writer finished"
+        );
+        assert_eq!(weak.strong_count(), 1);
+        drop(client);
+        wait_for(
+            || {
+                setup.service.budget.active_connections() == 0
+                    && setup.service.budget.reserved_bytes() == 0
+            },
+            "connection did not settle after the writer was dropped",
+        )
+        .await;
+        assert_baseline(&setup.service.budget);
+        assert!(weak.upgrade().is_none(), "writer kept the face owner alive");
+        assert!(setup.service.shutdown().await);
+    }
+
+    #[tokio::test]
+    async fn disconnect_releases_writer_leases_to_strict_baseline() {
+        let mut setup = start_large(limits(4, Duration::from_secs(5))).await;
+        let client = raw_request(&setup.path, "/face", &face_request_body()).await;
+        tokio::time::timeout(Duration::from_secs(5), setup.signal.wait_blocked())
+            .await
+            .expect("server writer never blocked");
+        drop(client);
+        wait_for(
+            || {
+                setup.service.budget.active_connections() == 0
+                    && setup.service.budget.reserved_bytes() == 0
+            },
+            "disconnect did not release the writer leases",
+        )
+        .await;
+        assert_baseline(&setup.service.budget);
+        assert!(setup.service.shutdown().await);
+    }
+
+    #[tokio::test]
+    async fn writer_deadline_closes_without_appending_json() {
+        let mut limits = limits(4, Duration::from_secs(5));
+        limits.writer = Duration::from_millis(200);
+        limits.connection = Duration::from_secs(10);
+        let mut setup = start_large(limits).await;
+        let mut client = raw_request(&setup.path, "/face", &face_request_body()).await;
+        tokio::time::timeout(Duration::from_secs(5), setup.signal.wait_blocked())
+            .await
+            .expect("server writer never blocked");
+        let started = tokio::time::Instant::now();
+        wait_for(
+            || setup.service.budget.active_connections() == 0,
+            "writer deadline did not close the connection",
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "connection was closed by the total deadline, not the writer deadline"
+        );
+        let mut data = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut data))
+            .await
+            .expect("client did not observe the closed writer")
+            .expect("read face response");
+        assert!(
+            !data.windows(9).any(|window| window == b"{\"error\":"),
+            "a started response must not append an error JSON document"
+        );
+        wait_for(
+            || setup.service.budget.reserved_bytes() == 0,
+            "writer deadline did not release the response budget",
+        )
+        .await;
+        assert_baseline(&setup.service.budget);
+        assert!(setup.service.shutdown().await);
+    }
+
+    #[tokio::test]
+    async fn extra_connection_is_closed_before_a_handler_starts() {
+        let (mut service, path, _directory) = start_static(limits(4, Duration::from_secs(2))).await;
+        let mut idle = Vec::new();
+        for _ in 0..16 {
+            idle.push(UnixStream::connect(&path).await.expect("idle connect"));
+        }
+        let mut extra = UnixStream::connect(&path).await.expect("extra connect");
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(
+            Duration::from_secs(2),
+            AsyncReadExt::read(&mut extra, &mut byte),
+        )
+        .await
+        .expect("extra connection was not closed");
+        assert_eq!(read.expect("extra read"), 0);
+        drop(idle);
+        assert!(service.shutdown().await);
+    }
+
+    #[tokio::test]
+    async fn connection_limit_rejects_the_seventeenth_and_recovers() {
+        let (mut service, path, _directory) = start_static(limits(4, Duration::from_secs(5))).await;
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            idle.push(UnixStream::connect(&path).await.expect("idle connect"));
+        }
+        wait_for(
+            || service.budget.active_connections() == MAX_CONNECTIONS,
+            "listener did not accept every connection",
+        )
+        .await;
+        assert_eq!(service.budget.available_connections(), 0);
+        let mut rejected = UnixStream::connect(&path).await.expect("rejected connect");
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), rejected.read(&mut byte))
+            .await
+            .expect("seventeenth connection was not closed");
+        assert_eq!(read.expect("rejected read"), 0);
+        assert_eq!(service.budget.active_connections(), MAX_CONNECTIONS);
+        assert_eq!(service.budget.dispatched(), 0);
+        drop(idle.pop().expect("one idle connection"));
+        wait_for(
+            || service.budget.active_connections() == MAX_CONNECTIONS - 1,
+            "released connection slot did not return",
+        )
+        .await;
+        let (status, _) = request(&path, "POST", "/stats", b"").await;
+        assert_eq!(status, 200);
+        for stream in idle {
+            drop(stream);
+        }
+        assert!(service.shutdown().await);
+        assert_baseline(&service.budget);
+    }
+
+    #[tokio::test]
+    async fn pipelined_requests_dispatch_one_backend_and_close() {
+        let (mut service, path, _directory) = start_static(limits(4, Duration::from_secs(5))).await;
+        let mut pipeline = request_bytes("/match", br#"{"family":"sans-serif"}"#);
+        pipeline.extend_from_slice(&request_bytes("/stats", b""));
+        let mut stream = UnixStream::connect(&path).await.expect("pipeline connect");
+        stream.write_all(&pipeline).await.expect("write pipeline");
+        stream.flush().await.expect("flush pipeline");
+        let mut data = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut data))
+            .await
+            .expect("pipelined connection did not close")
+            .expect("read pipelined response");
+        assert!(data.starts_with(b"HTTP/1.1 200"));
+        assert_eq!(service.budget.dispatched(), 1);
+        assert!(service.shutdown().await);
+        assert_baseline(&service.budget);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_connections_and_a_blocked_backend() {
+        let mut limits = limits(4, Duration::from_secs(5));
+        limits.writer = Duration::from_secs(10);
+        let setup = start_large(limits).await;
+        let writer_client = raw_request(&setup.path, "/face", &face_request_body()).await;
+        tokio::time::timeout(Duration::from_secs(5), setup.signal.wait_blocked())
+            .await
+            .expect("server writer never blocked");
+        setup.match_armed.store(true, Ordering::SeqCst);
+        let match_client = raw_request(&setup.path, "/match", br#"{"family":"sans-serif"}"#).await;
+        tokio::time::timeout(Duration::from_secs(5), setup.match_started.notified())
+            .await
+            .expect("font backend did not start");
+        let mut slow_body = UnixStream::connect(&setup.path)
+            .await
+            .expect("slow body connect");
+        slow_body
+            .write_all(
+                b"POST /match HTTP/1.1\r\nhost: fonts\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n",
+            )
+            .await
+            .expect("write slow body head");
+        slow_body.flush().await.expect("flush slow body head");
+        wait_for(
+            || setup.service.budget.available_requests() == MAX_CONCURRENT_REQUESTS - 3,
+            "slow body, blocked match and blocked writer did not all hold leases",
+        )
+        .await;
+        assert_eq!(
+            setup.service.budget.reserved_bytes(),
+            3 * RESPONSE_RESERVATION_BYTES
+        );
+        assert_eq!(setup.service.budget.active_connections(), 3);
+        let budget = setup.service.budget.clone();
+        let socket = setup.path.clone();
+        let service = setup.service;
+        let mut shutdown = tokio::spawn(async move {
+            let mut service = service;
+            service.shutdown().await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown finished while the font thread was still blocked"
+        );
+        let (lock, cvar) = &*setup.gate;
+        *lock.lock().expect("gate") = true;
+        cvar.notify_all();
+        let joined = tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("shutdown did not settle")
+            .expect("shutdown task");
+        assert!(joined);
+        assert_baseline(&budget);
+        assert!(!socket.exists());
+        drop(writer_client);
+        drop(match_client);
+        drop(slow_body);
     }
 }
