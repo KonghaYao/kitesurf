@@ -4159,12 +4159,7 @@ impl Broker {
         if !active.replied || self.control_queue.is_empty() {
             return;
         }
-        if self
-            .retirements
-            .iter()
-            .any(|retire| retire.awaiting.is_some())
-            || self.unknown_blocks_control()
-        {
+        if self.cleanup_blocks_control() {
             self.reply_control_queue(
                 "Control cleanup could not be confirmed; retry after the old session settles",
             );
@@ -4271,6 +4266,14 @@ impl Broker {
 
     fn unknown_blocks_control(&self) -> bool {
         self.outcome_unknown()
+    }
+
+    /// 待发送、已发送或等待迟到结果的清理都未决；仅确认失败允许显式重试。
+    fn cleanup_blocks_control(&self) -> bool {
+        self.retirements
+            .iter()
+            .any(|retire| retire.pending.is_some() || retire.awaiting.is_some() || !retire.failed)
+            || self.unknown_blocks_control()
     }
 
     fn outcome_unknown(&self) -> bool {

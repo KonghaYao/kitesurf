@@ -4518,6 +4518,75 @@ async fn retirement_late_error_keeps_the_attachment_until_an_explicit_retry() {
     assert!(!broker.wait_terminal().await);
 }
 
+#[tokio::test]
+async fn control_retry_is_rejected_while_the_old_detach_is_in_flight() {
+    let mut engine = fake_engine().await;
+    let broker =
+        broker_with_deadlines(&engine, Duration::from_secs(120), Duration::from_secs(30)).await;
+    let mut alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+    send(
+        &alice,
+        &broker,
+        r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"target-1","flatten":true}}"#,
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({ "sessionId": "session-1" }));
+    assert_eq!(next_frame(&mut alice).await["id"], 1);
+    let mut first = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.control("bob".to_string(), true).await })
+    };
+    let detach = next_request(&mut engine).await;
+    assert_eq!(detach["method"], "Target.detachFromTarget");
+    assert_eq!(detach["params"]["sessionId"], "session-1");
+    let first = timeout(Duration::from_secs(15), &mut first)
+        .await
+        .expect("the control deadline must answer the first takeover")
+        .expect("control task");
+    assert_eq!(
+        first.expect_err("first takeover must fail").message(),
+        "Control cleanup could not be confirmed; retry after the old session settles"
+    );
+    assert_eq!(broker.session().await.expect("session").control_epoch, 2);
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 1));
+
+    let mut retry = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.control("bob".to_string(), true).await })
+    };
+    let blocked = timeout(WAIT, &mut retry)
+        .await
+        .expect("a blocked control must not wait for the internal deadline")
+        .expect("control task");
+    assert_eq!(
+        blocked.expect_err("blocked control must fail").message(),
+        "Control cleanup could not be confirmed; retry after the old session settles"
+    );
+    // actor 快照确认 detach 仍为 pending、尚未转 unknown，且未新增上游请求或 epoch。
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 1));
+    assert_eq!(broker.session().await.expect("session").control_epoch, 2);
+    expect_no_request(&mut engine).await;
+
+    engine.reply(request_id(&detach), json!({}));
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await != (0, 0, 0, 0) {}
+    })
+    .await
+    .expect("the detach reply must settle before the next control");
+    let takeover = timeout(WAIT, async {
+        broker.control("bob".to_string(), true).await
+    })
+    .await
+    .expect("control after the matching late success must not hang")
+    .ok()
+    .expect("control after the detach settles");
+    assert_eq!(takeover, ("bob".to_string(), 3));
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
 async fn enable_auto_attach(
     engine: &mut FakeEngine,
     broker: &BrokerHandle,
