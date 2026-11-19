@@ -21,7 +21,7 @@ use crate::broker::{
 };
 use crate::observe::Observer;
 use crate::services::{MemoryProfile, ProfileService};
-use crate::transport::{Upstream, UpstreamAddress};
+use crate::transport::{Upstream, UpstreamAddress, INTERNAL_BYTES, MAX_FRAME_BYTES, ORDINARY_BYTES};
 
 // 保留迁移前 Request 的解析策略作为 oracle；仅测试允许构造 metadata Value。
 fn old_request(text: &str) -> Option<Value> {
@@ -2937,6 +2937,138 @@ async fn close_orders_queued_management_after_active_attach() {
     assert!(*closed.borrow());
 }
 
+#[tokio::test]
+async fn cutoffs_keep_backfill_attach_on_the_original_logical_slot() {
+    for closing in [false, true] {
+        let mut engine = fake_engine().await;
+        let broker = broker(&engine).await;
+        let mut alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+        let mut closed = broker.closed_watch();
+        send(
+            &alice,
+            &broker,
+            r#"{"id":1,"method":"Target.setAutoAttach","params":{"autoAttach":true,"flatten":true}}"#,
+        )
+        .await;
+        let auto = next_request(&mut engine).await;
+        assert_eq!(auto["method"], "Target.setAutoAttach");
+        assert_eq!(broker.budget_snapshot().await.0, 1);
+        engine.reply(request_id(&auto), json!({}));
+        let targets = next_request(&mut engine).await;
+        assert_eq!(targets["method"], "Target.getTargets");
+        let runner = broker.clone();
+        let mut barrier = Box::pin(async move {
+            if closing {
+                runner.close(CloseKind::Http, None, None, None).await
+            } else {
+                runner.flush().await.map(|_| ())
+            }
+        });
+        assert!(barrier.as_mut().now_or_never().is_none());
+        assert!(broker.session().await.expect("actor session").alive);
+        send(&alice, &broker, r#"{"id":2,"method":"Browser.getVersion"}"#).await;
+        let rejected = next_frame(&mut alice).await;
+        assert_eq!(rejected["id"], 2);
+        assert_eq!(
+            message(&rejected),
+            if closing {
+                "Browser is closing"
+            } else {
+                "Browser is flushing"
+            }
+        );
+        expect_no_request(&mut engine).await;
+        engine.reply(
+            request_id(&targets),
+            json!({ "targetInfos": [{ "targetId": "backfill-page", "type": "page" }] }),
+        );
+        let attach = next_request(&mut engine).await;
+        assert_eq!(attach["method"], "Target.attachToTarget");
+        assert_eq!(attach["params"]["targetId"], "backfill-page");
+        // 派生 attach 继承原 setAutoAttach 的唯一逻辑槽，cutoff 后不重新准入。
+        assert_eq!(broker.budget_snapshot().await.0, 1);
+        engine.reply(
+            request_id(&attach),
+            json!({ "sessionId": "backfill-session" }),
+        );
+        assert_eq!(next_frame(&mut alice).await["id"], 1);
+        let flush = next_request(&mut engine).await;
+        assert_eq!(flush["method"], "Kitesurf.flushProfile");
+        engine.reply(request_id(&flush), json!({ "saved": true }));
+        if closing {
+            let browser = next_request(&mut engine).await;
+            assert_eq!(browser["method"], "Browser.close");
+            // 逻辑槽已归还；仅 Browser.close 自身持内部槽，close 完成后 actor 结束。
+            assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 1));
+            engine.reply(request_id(&browser), json!({}));
+        }
+        timeout(WAIT, barrier)
+            .await
+            .expect("barrier completes")
+            .expect("barrier ok");
+        if closing {
+            assert_eq!(
+                next_close(&mut alice).await,
+                (1000, "Browser closed".to_string())
+            );
+            broker.writer_gone(alice.id);
+            timeout(WAIT, closed.changed())
+                .await
+                .expect("closed watch")
+                .expect("closed sender");
+        } else {
+            assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+        }
+        engine.kill();
+        // close 成功是 clean terminal；仅 flush 路径在 engine 断开后不是。
+        assert_eq!(broker.wait_terminal().await, closing);
+    }
+}
+
+#[tokio::test]
+async fn written_ack_and_real_targets_round_trip_restore_strict_payload_baseline() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let _viewer = connect(&broker, Endpoint::Browser, Role::Viewer, "viewer").await;
+    let budget = broker.payload_budget();
+    let baseline = budget.used();
+    let runner = broker.clone();
+    let discovery = tokio::spawn(async move { runner.targets().await });
+    let request = next_request(&mut engine).await;
+    assert_eq!(request["method"], "Target.getTargets");
+    engine.reply(
+        request_id(&request),
+        json!({ "targetInfos": [{ "type": "page", "targetId": "baseline-page" }] }),
+    );
+    let targets = timeout(WAIT, discovery)
+        .await
+        .expect("targets reply")
+        .expect("targets task")
+        .expect("targets ok");
+    assert!(targets.raw.as_str().contains("baseline-page"));
+    drop(targets);
+    // Drain 等待 upstream_bytes 归零，即真实写出的 getTargets 已收到 Written 结算。
+    let mut flushing = Box::pin(broker.flush());
+    assert!(flushing.as_mut().now_or_never().is_none());
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    timeout(WAIT, flushing)
+        .await
+        .expect("flush completes")
+        .expect("flush ok");
+    // 严格相等，不放宽为 <= 或加容差；暂时保留的迟到 drop 只允许有界等待。
+    timeout(WAIT, async {
+        while budget.used() != baseline {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("payload baseline restored");
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
 async fn overflow_quarantine(
     engine: &mut FakeEngine,
     broker: &BrokerHandle,
@@ -3044,6 +3176,289 @@ async fn explicit_flush_retries_confirmed_quarantine_failure_once() {
         .await
         .expect("flush completes")
         .expect("flush ok");
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn early_detached_keeps_upstream_identity_until_late_reply() {
+    for failed in [false, true] {
+        let mut engine = fake_engine().await;
+        let broker = broker(&engine).await;
+        let (_owner, detach) = overflow_quarantine(&mut engine, &broker).await;
+        engine.event(json!({
+          "method": "Target.detachedFromTarget",
+          "params": { "sessionId": "overflow-a" }
+        }));
+        // 权威事件先清除 session，但未结算的上游 detach 身份不得放行。
+        expect_no_request(&mut engine).await;
+        assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 1));
+        let mut flushing = Box::pin(broker.flush());
+        assert!(flushing.as_mut().now_or_never().is_none());
+        assert!(broker.session().await.expect("actor session").alive);
+        expect_no_request(&mut engine).await;
+        if failed {
+            engine.push(json!({
+              "id": request_id(&detach),
+              "error": { "code": -32000, "message": "already detached" }
+            }));
+        } else {
+            engine.reply(request_id(&detach), json!({}));
+        }
+        // 迟到结果只结算原写身份；session 已消失，不产生重试或新的清理身份。
+        let flush = next_request(&mut engine).await;
+        assert_eq!(flush["method"], "Kitesurf.flushProfile");
+        engine.reply(request_id(&flush), json!({ "saved": true }));
+        timeout(WAIT, flushing)
+            .await
+            .expect("flush completes")
+            .expect("flush ok");
+        assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+        engine.kill();
+        assert!(!broker.wait_terminal().await);
+    }
+}
+
+#[tokio::test]
+async fn quarantine_identities_settle_in_reverse_without_extra_detach() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut owner = connect(&broker, Endpoint::Browser, Role::Viewer, "owner").await;
+    fill_attachments(&mut engine, &broker, &mut owner, "six", 256).await;
+    let mut detaches = Vec::new();
+    for name in ["overflow-a", "overflow-b"] {
+        engine.event(json!({
+          "sessionId": "six-session-0",
+          "method": "Target.attachedToTarget",
+          "params": { "sessionId": name, "targetInfo": { "targetId": format!("{name}-page") } }
+        }));
+        let detach = next_request(&mut engine).await;
+        assert_eq!(detach["method"], "Target.detachFromTarget");
+        assert_eq!(detach["params"]["sessionId"], name);
+        detaches.push(detach);
+    }
+    engine.reply(request_id(&detaches[1]), json!({}));
+    engine.raw(format!(
+        r#"{{"id":{},"result":{{}}}}"#,
+        request_id(&detaches[1])
+    ));
+    engine.raw(r#"{"id":999999,"result":{}}"#.to_string());
+    engine.reply(request_id(&detaches[0]), json!({}));
+    let mut flushing = Box::pin(broker.flush());
+    assert!(flushing.as_mut().now_or_never().is_none());
+    assert!(broker.session().await.expect("actor session").alive);
+    // 两条记录都已按 upstream id 精确结算；重复/未知 id 不得清另一条。
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    timeout(WAIT, flushing)
+        .await
+        .expect("flush completes")
+        .expect("flush ok");
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    expect_no_request(&mut engine).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn awaiting_late_detach_error_retries_only_on_explicit_barrier() {
+    let mut engine = fake_engine().await;
+    let broker =
+        broker_with_deadlines(&engine, Duration::from_secs(30), Duration::from_millis(200)).await;
+    let (_owner, detach) = overflow_quarantine(&mut engine, &broker).await;
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.2 != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detach outcome becomes unknown");
+    engine.push(json!({
+      "id": request_id(&detach),
+      "error": { "code": -32000, "message": "detach failed late" }
+    }));
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.2 != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late error settles");
+    // tick 与迟到结果都不得自动重试；只有新的显式 barrier 可以单次重试。
+    expect_no_request(&mut engine).await;
+    let mut flushing = Box::pin(broker.flush());
+    assert!(flushing.as_mut().now_or_never().is_none());
+    assert!(broker.session().await.expect("actor session").alive);
+    let retry = next_request(&mut engine).await;
+    assert_eq!(retry["method"], "Target.detachFromTarget");
+    assert_eq!(retry["params"]["sessionId"], "overflow-a");
+    engine.reply(request_id(&retry), json!({}));
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    timeout(WAIT, flushing)
+        .await
+        .expect("flush completes")
+        .expect("flush ok");
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn quarantine_ready_waits_for_internal_slot_and_progresses_on_release() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut owner = connect(&broker, Endpoint::Browser, Role::Viewer, "owner").await;
+    fill_attachments(&mut engine, &broker, &mut owner, "six", 256).await;
+    let mut held = Vec::new();
+    for _ in 0..crate::broker::MAX_INTERNAL_PENDING {
+        let broker = broker.clone();
+        held.push(tokio::spawn(async move { broker.targets().await }));
+    }
+    let mut target_requests = Vec::new();
+    for _ in 0..crate::broker::MAX_INTERNAL_PENDING {
+        let request = next_request(&mut engine).await;
+        assert_eq!(request["method"], "Target.getTargets");
+        target_requests.push(request);
+    }
+    engine.event(json!({
+      "sessionId": "six-session-0",
+      "method": "Target.attachedToTarget",
+      "params": { "sessionId": "ready-a", "targetInfo": { "targetId": "ready-page-a" } }
+    }));
+    // internal slot 真实耗尽时只保留 Ready，不发送也不伪造 unknown。
+    expect_no_request(&mut engine).await;
+    assert_eq!(
+        broker.budget_snapshot().await,
+        (0, 0, 0, crate::broker::MAX_INTERNAL_PENDING)
+    );
+    let mut flushing = Box::pin(broker.flush());
+    assert!(flushing.as_mut().now_or_never().is_none());
+    assert!(broker.session().await.expect("actor session").alive);
+    expect_no_request(&mut engine).await;
+    engine.reply(
+        request_id(&target_requests[0]),
+        json!({ "targetInfos": [] }),
+    );
+    timeout(WAIT, held.remove(0))
+        .await
+        .expect("target reply")
+        .expect("target task")
+        .expect("target result");
+    // 容量释放后同一 actor 周期自动派发清理，仍然不是 unknown。
+    let detach = next_request(&mut engine).await;
+    assert_eq!(detach["method"], "Target.detachFromTarget");
+    assert_eq!(detach["params"]["sessionId"], "ready-a");
+    assert_eq!(
+        broker.budget_snapshot().await,
+        (0, 0, 0, crate::broker::MAX_INTERNAL_PENDING)
+    );
+    engine.reply(request_id(&detach), json!({}));
+    for request in &target_requests[1..] {
+        engine.reply(request_id(request), json!({ "targetInfos": [] }));
+    }
+    for task in held {
+        timeout(WAIT, task)
+            .await
+            .expect("target reply")
+            .expect("target task")
+            .expect("target result");
+    }
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    timeout(WAIT, flushing)
+        .await
+        .expect("flush completes")
+        .expect("flush ok");
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn quarantine_capacity_limit_fails_closed_lost() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut owner = connect(&broker, Endpoint::Browser, Role::Viewer, "owner").await;
+    fill_attachments(&mut engine, &broker, &mut owner, "six", 256).await;
+    for index in 0..crate::attachments::MAX_QUARANTINE {
+        engine.event(json!({
+          "sessionId": "six-session-0",
+          "method": "Target.attachedToTarget",
+          "params": {
+            "sessionId": format!("overflow-{index}"),
+            "targetInfo": { "targetId": format!("overflow-page-{index}") }
+          }
+        }));
+        let detach = next_request(&mut engine).await;
+        assert_eq!(detach["method"], "Target.detachFromTarget");
+        assert_eq!(detach["params"]["sessionId"], format!("overflow-{index}"));
+    }
+    engine.event(json!({
+      "sessionId": "six-session-0",
+      "method": "Target.attachedToTarget",
+      "params": { "sessionId": "overflow-33", "targetInfo": { "targetId": "overflow-page-33" } }
+    }));
+    expect_no_request(&mut engine).await;
+    timeout(WAIT, async {
+        while broker.session().await.is_some_and(|session| session.alive) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("quarantine capacity fails closed");
+    assert_eq!(
+        broker.lost_watch().borrow().as_deref(),
+        Some("attachment quarantine capacity exhausted")
+    );
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn quarantine_metadata_budget_exhaustion_fails_closed_lost() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut owner = connect(&broker, Endpoint::Browser, Role::Viewer, "owner").await;
+    fill_attachments(&mut engine, &broker, &mut owner, "six", 256).await;
+    let budget = broker.payload_budget();
+    let ordinary = budget
+        .try_acquire(ORDINARY_BYTES - budget.used().0, false)
+        .expect("ordinary budget holder");
+    let internal_capacity = INTERNAL_BYTES - MAX_FRAME_BYTES;
+    // 事件 scratch 与上游 raw metadata 都在 quarantine 尝试前持有。
+    let event_charge = 64 * 1024 + 256;
+    let hold = internal_capacity - budget.used().1 - event_charge;
+    let internal = budget
+        .try_acquire(hold, true)
+        .expect("internal budget holder");
+    assert_eq!(budget.used().1, internal_capacity - event_charge);
+    drop(
+        budget
+            .try_acquire(event_charge, true)
+            .expect("event reserve available"),
+    );
+    engine.event(json!({
+      "sessionId": "six-session-0",
+      "method": "Target.attachedToTarget",
+      "params": { "sessionId": "budget-a", "targetInfo": { "targetId": "budget-page" } }
+    }));
+    timeout(WAIT, async {
+        while broker.session().await.is_some_and(|session| session.alive) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("metadata budget exhaustion fails closed");
+    assert_eq!(
+        broker.lost_watch().borrow().as_deref(),
+        Some("attachment metadata budget exhausted")
+    );
+    drop(internal);
+    drop(ordinary);
     engine.kill();
     assert!(!broker.wait_terminal().await);
 }
