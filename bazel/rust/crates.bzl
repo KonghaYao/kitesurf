@@ -43,6 +43,14 @@ def _cargo_workspace_impl(rctx):
     patched = {name: rctx.path(label).dirname for name, label in rctx.attr.patched.items()}
     stamp = []
     spec = {}
+    local_path_deps = {}
+    for relative, label in rctx.attr.local_path_deps.items():
+        source = rctx.path(label).dirname
+        destination = "local/" + source.basename
+        _manifest_stub(rctx, source, destination)
+        _drop_workspace_table(rctx, source, destination)
+        stamp.append(rctx.read(source.get_child("Cargo.toml")))
+        local_path_deps[relative] = destination
     for name in sorted(patched):
         stamp.append(rctx.read(patched[name].get_child("Cargo.toml")))
         key = rctx.attr.keys[name]
@@ -74,6 +82,11 @@ def _cargo_workspace_impl(rctx):
             name = stripped.partition("=")[0].strip()
             path = stripped.partition('path = "')[2].partition('"')[0]
             rctx.symlink(patched.pop(name), path)
+        elif section == "[dependencies]":
+            for relative, destination in local_path_deps.items():
+                prefix = 'path = "%s"' % relative
+                if prefix in line:
+                    line = line.replace(prefix, 'path = "%s"' % destination)
         lines.append(line)
     if patched:
         fail(
@@ -112,6 +125,7 @@ _cargo_workspace = repository_rule(
         "root_package": attr.bool(default = False),
         "series": attr.string_list_dict(),
         "keys": attr.string_dict(mandatory = True),
+        "local_path_deps": attr.string_keyed_label_dict(default = {}),
         "lockfile": attr.label(mandatory = True, allow_single_file = True),
         "manifest": attr.label(mandatory = True, allow_single_file = True),
         "members": attr.string_keyed_label_dict(mandatory = True),
@@ -142,6 +156,13 @@ def _registry_packages(lock):
     if package:
         packages.append(package)
     return [item for item in packages if item.get("source", "").startswith("registry+")]
+
+def _drop_workspace_table(rctx, source, destination):
+    # The stub sits inside the generated workspace root, so the source package's
+    # [workspace] table would create a second root; the real manifest keeps it.
+    text = rctx.read(source.get_child("Cargo.toml"))
+    lines = [line for line in text.splitlines() if line.strip() != "[workspace]"]
+    rctx.file(destination + "/Cargo.toml", "\n".join(lines) + "\n", executable = False)
 
 def _manifest_stub(rctx, source, destination):
     rctx.file(
@@ -303,6 +324,13 @@ def _cargo_workspaces_impl(mctx):
                 native_keys[crate["name"]] = key
                 native_sha256[key] = crate["sha256"]
                 native_series[key] = crate["series"]
+            local_path_deps = {}
+            if ws.name == "cargo_ws_native":
+                # Source manifests keep sibling paths; the generated repo maps the one local
+                # dependency to a stub copied from its explicit Bazel label.
+                local_path_deps = {
+                    "../font-host": Label("//packages/local-browser/font-host:Cargo.toml"),
+                }
             _cargo_workspace(
                 name = ws.name,
                 manifest = ws.manifest,
@@ -314,6 +342,7 @@ def _cargo_workspaces_impl(mctx):
                 patches_marker = ws.patches_marker,
                 sha256 = native_sha256,
                 series = native_series,
+                local_path_deps = local_path_deps,
             )
         for ws in mod.tags.standalone:
             _standalone_workspace(name = ws.name, lockfile = ws.lockfile, members = ws.members)
