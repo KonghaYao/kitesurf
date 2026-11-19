@@ -3287,10 +3287,8 @@ impl Broker {
                 );
                 return;
             };
-            let epoch = self
-                .clients
-                .get(&client)
-                .map_or(active.work.epoch, |state| state.epoch);
+            // 已发出的 attach 按发起时的 client/epoch 登记，不借用当前 controller 身份。
+            let epoch = active.work.epoch;
             let parent = active.work.explicit_session.clone();
             let outcome =
                 self.attachments
@@ -3353,15 +3351,27 @@ impl Broker {
                 return;
             };
             active.response = Some(saved);
-            if self.start_backfill(&mut active).is_ok() {
-                self.management_active = Some(active);
-                return;
+            match self.start_backfill(&mut active) {
+                Ok(()) => {
+                    self.management_active = Some(active);
+                    return;
+                }
+                // 权限拒绝必须终结原请求，不能被普通发送失败的 fallback 当成成功回复。
+                Err(Some(message)) => {
+                    self.finish_managed(active.work, Err((-32000, message.into())));
+                    return;
+                }
+                Err(None) => {}
             }
         }
         self.finish_managed_reply(active.work, value);
     }
 
-    fn start_backfill(&mut self, active: &mut ActiveManaged) -> Result<(), ()> {
+    /// 发送 getTargets 前重验原工作；授权拒绝与普通发送失败分别返回。
+    fn start_backfill(&mut self, active: &mut ActiveManaged) -> Result<(), Option<&'static str>> {
+        if let Err(message) = self.check_managed_dispatch(&active.work) {
+            return Err(Some(message));
+        }
         let work = &active.work;
         let spec = PendingSpec {
             client: Some(work.client),
@@ -3377,7 +3387,7 @@ impl Broker {
         let request = active.work.request.lease.clone();
         let id = self
             .send_raw_request("Target.getTargets", None, None, spec, request)
-            .map_err(|_| ())?;
+            .map_err(|_| None)?;
         active.stage = ManagedStage::BackfillTargets { id };
         Ok(())
     }
@@ -3487,6 +3497,10 @@ impl Broker {
     }
 
     fn dispatch_next_backfill(&mut self, active: &mut ActiveManaged) -> BackfillStep {
+        // 重验先于解析候选、推进 index、预约 intent 与发送，空列表也不能算成功。
+        if let Err(message) = self.check_managed_dispatch(&active.work) {
+            return BackfillStep::Failed(message.into());
+        }
         let client = active.work.client;
         let epoch = active.work.epoch;
         let explicit_session = active.work.explicit_session.clone();
@@ -3575,8 +3589,13 @@ impl Broker {
     fn backfill_attach_response(&mut self, active: ActiveManaged, target: &str, value: &Received) {
         let client = active.work.client;
         if value.has_error() {
+            // 先清匹配 intent，再按原身份决定回复；不创建 attachment，也不发 detach。
             self.attachments.clear_intent(target, client);
-            self.finish_managed_reply(active.work, value);
+            if let Err(message) = self.check_managed_dispatch(&active.work) {
+                self.finish_managed(active.work, Err((-32000, message.into())));
+            } else {
+                self.finish_managed_reply(active.work, value);
+            }
             return;
         }
         let Some(session) = attach_session(value) else {
@@ -3587,10 +3606,8 @@ impl Broker {
             );
             return;
         };
-        let epoch = self
-            .clients
-            .get(&client)
-            .map_or(active.work.epoch, |state| state.epoch);
+        // 已发出的 attach 始终按原 client/epoch 登记，不读取当前 controller 身份。
+        let epoch = active.work.epoch;
         let outcome = self
             .attachments
             .register(client, epoch, &session, target, None);
@@ -3754,29 +3771,16 @@ impl Broker {
     }
 
     fn dispatch_managed(&mut self, mut work: ManagedWork) -> bool {
-        if !self.client_can_act(work.client, work.epoch) {
-            let session = work.explicit_session.clone();
+        // 排队期间 control、session 与 lease 归属都可能变化；派发前统一重验原身份。
+        if let Err(message) = self.check_managed_dispatch(&work) {
             self.send_error(
                 work.client,
                 work.external_id,
                 -32000,
-                "Control has changed; reconnect and observe before acting",
-                session,
+                message,
+                work.explicit_session.clone(),
             );
             return false;
-        }
-        // 顶层 session 与 detach 参数 session 都必须属于本连接；排队期间归属可能已变化。
-        if let Some(session) = &work.explicit_session {
-            if self.attachments.owner(session) != Some(work.client) {
-                self.send_error(
-                    work.client,
-                    work.external_id,
-                    -32000,
-                    "CDP attachment expired or belongs to another connection; attach again",
-                    work.explicit_session.clone(),
-                );
-                return false;
-            }
         }
         let target = work.params.string("targetId").map(str::to_string);
         let session = work.explicit_session.clone();
@@ -3925,6 +3929,35 @@ impl Broker {
         } else if let Some(target) = work.params.string("targetId") {
             self.attachments.clear_intent(target, work.client);
         }
+    }
+
+    /// backfill 派生阶段不是新准入：只放行仍持有原 lease 且身份、session 未失效的工作。
+    fn check_managed_dispatch(&self, work: &ManagedWork) -> Result<(), &'static str> {
+        self.check_dispatch(work.client, &work.request, work.external_id, &work.method)?;
+        if !self.client_can_act(work.client, work.epoch) {
+            return Err("Control has changed; reconnect and observe before acting");
+        }
+        let client = self.clients.get(&work.client).ok_or("Client is closed")?;
+        let lease = work
+            .request
+            .lease
+            .as_ref()
+            .ok_or("CDP request is no longer in flight")?;
+        if lease.id != work.external_id
+            || !Arc::ptr_eq(&lease.ids, &client.ids)
+            || !lease.ids.lock().unwrap().contains(&work.external_id)
+        {
+            return Err("Duplicate in-flight request id");
+        }
+        if let Some(message) = self.managed_session_error(
+            work.client,
+            &work.method,
+            &work.request,
+            work.explicit_session.as_deref(),
+        ) {
+            return Err(message);
+        }
+        Ok(())
     }
 
     fn client_can_act(&self, client: ClientId, epoch: u64) -> bool {

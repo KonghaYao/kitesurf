@@ -1148,6 +1148,16 @@ async fn next_frame(client: &mut TestClient) -> Value {
     }
 }
 
+// 事件帧没有 id；只在已知会先收到事件的路径上等待指定回复。
+async fn next_reply(client: &mut TestClient, id: i64) -> Value {
+    loop {
+        let frame = next_frame(client).await;
+        if frame.get("id").and_then(Value::as_i64) == Some(id) {
+            return frame;
+        }
+    }
+}
+
 async fn next_request(engine: &mut FakeEngine) -> Value {
     timeout(WAIT, engine.receive.recv())
         .await
@@ -3021,6 +3031,631 @@ async fn cutoffs_keep_backfill_attach_on_the_original_logical_slot() {
         }
         engine.kill();
         // close 成功是 clean terminal；仅 flush 路径在 engine 断开后不是。
+        assert_eq!(broker.wait_terminal().await, closing);
+    }
+}
+
+#[tokio::test]
+async fn backfill_attach_is_rejected_after_control_takeover() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+    send(
+        &alice,
+        &broker,
+        r#"{"id":1,"method":"Target.setAutoAttach","params":{"autoAttach":true,"flatten":true}}"#,
+    )
+    .await;
+    let auto = next_request(&mut engine).await;
+    assert_eq!(auto["method"], "Target.setAutoAttach");
+    engine.reply(request_id(&auto), json!({}));
+    let targets = next_request(&mut engine).await;
+    assert_eq!(targets["method"], "Target.getTargets");
+    let mut control = Box::pin(broker.control("bob".to_string(), true));
+    assert!(control.as_mut().now_or_never().is_none());
+    // control 与 session 共用命令 FIFO；session 读到 bob/epoch 2 即证明 takeover 已受理。
+    let snapshot = broker.session().await.expect("actor session");
+    assert_eq!(snapshot.controller.as_deref(), Some("bob"));
+    assert_eq!(snapshot.control_epoch, 2);
+    engine.reply(
+        request_id(&targets),
+        json!({ "targetInfos": [{ "targetId": "backfill-page", "type": "page" }] }),
+    );
+    let next = next_request(&mut engine).await;
+    assert_eq!(
+        next["method"], "Target.setAutoAttach",
+        "backfill attach dispatched after control takeover: {next}"
+    );
+    assert_eq!(next["params"]["autoAttach"], false);
+    let rejected = next_frame(&mut alice).await;
+    assert_eq!(rejected["id"], 1);
+    assert_eq!(rejected["error"]["code"], -32000);
+    assert!(message(&rejected).contains("Control has changed"));
+    expect_silence(&mut alice).await;
+    engine.reply(request_id(&next), json!({}));
+    let takeover = timeout(WAIT, control)
+        .await
+        .expect("takeover completes")
+        .ok()
+        .expect("takeover ok");
+    assert_eq!(takeover, ("bob".to_string(), 2));
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn backfill_start_is_rejected_when_takeover_precedes_auto_success() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+    send(
+        &alice,
+        &broker,
+        r#"{"id":1,"method":"Target.setAutoAttach","params":{"autoAttach":true,"flatten":true}}"#,
+    )
+    .await;
+    let auto = next_request(&mut engine).await;
+    assert_eq!(auto["method"], "Target.setAutoAttach");
+    let mut control = Box::pin(broker.control("bob".to_string(), true));
+    assert!(control.as_mut().now_or_never().is_none());
+    let snapshot = broker.session().await.expect("actor session");
+    assert_eq!(snapshot.controller.as_deref(), Some("bob"));
+    assert_eq!(snapshot.control_epoch, 2);
+    engine.reply(request_id(&auto), json!({}));
+    // 成功回复后不得再发 backfill getTargets，也不得 fallback 成缓存成功。
+    let disable = next_request(&mut engine).await;
+    assert_eq!(disable["method"], "Target.setAutoAttach");
+    assert_eq!(disable["params"]["autoAttach"], false);
+    let rejected = next_frame(&mut alice).await;
+    assert_eq!(rejected["id"], 1);
+    assert_eq!(rejected["error"]["code"], -32000);
+    assert!(message(&rejected).contains("Control has changed"));
+    expect_silence(&mut alice).await;
+    engine.reply(request_id(&disable), json!({}));
+    let takeover = timeout(WAIT, control)
+        .await
+        .expect("takeover completes")
+        .ok()
+        .expect("takeover ok");
+    assert_eq!(takeover, ("bob".to_string(), 2));
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn backfill_does_not_attach_after_writer_failure() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut idle = Vec::new();
+    for index in 0..31 {
+        idle.push(
+            connect(
+                &broker,
+                Endpoint::Browser,
+                Role::Viewer,
+                &format!("idle-{index}"),
+            )
+            .await,
+        );
+    }
+    let mut alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+    send(
+        &alice,
+        &broker,
+        r#"{"id":1,"method":"Target.setAutoAttach","params":{"autoAttach":true,"flatten":true}}"#,
+    )
+    .await;
+    let auto = next_request(&mut engine).await;
+    assert_eq!(auto["method"], "Target.setAutoAttach");
+    engine.reply(request_id(&auto), json!({}));
+    let targets = next_request(&mut engine).await;
+    assert_eq!(targets["method"], "Target.getTargets");
+    // 关闭 Client receiver 后，真实 Pong 的 try_send 失败；后续 session 是命令 FIFO ack。
+    alice.frames.close();
+    let lease = broker
+        .payload_budget()
+        .try_acquire(1, false)
+        .expect("pong lease");
+    assert!(broker.pong(alice.id, vec![0], lease));
+    let snapshot = broker.session().await.expect("actor session");
+    assert!(snapshot.alive);
+    engine.reply(
+        request_id(&targets),
+        json!({ "targetInfos": [{ "targetId": "backfill-page", "type": "page" }] }),
+    );
+    let disable = next_request(&mut engine).await;
+    assert_eq!(
+        disable["method"], "Target.setAutoAttach",
+        "backfill attach dispatched after writer failure: {disable}"
+    );
+    assert_eq!(disable["params"]["autoAttach"], false);
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 1));
+    let settled = receive_ack(
+        &broker,
+        &format!(r#"{{"id":{},"result":{{}}}}"#, request_id(&disable)),
+    )
+    .await;
+    assert_eq!(settled, (true, 0));
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    let replacement = connect_when_reaped(&broker, "replacement").await;
+    drop(replacement);
+    drop(idle);
+    drop(alice);
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn backfill_attach_settles_without_a_second_attach_after_takeover() {
+    for failed in [false, true] {
+        let mut engine = fake_engine().await;
+        let broker = broker(&engine).await;
+        let mut alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+        let mut marker = connect(&broker, Endpoint::Browser, Role::Viewer, "marker").await;
+        send(
+            &alice,
+            &broker,
+            r#"{"id":1,"method":"Target.setAutoAttach","params":{"autoAttach":true,"flatten":true}}"#,
+        )
+        .await;
+        let auto = next_request(&mut engine).await;
+        assert_eq!(auto["method"], "Target.setAutoAttach");
+        engine.reply(request_id(&auto), json!({}));
+        let targets = next_request(&mut engine).await;
+        assert_eq!(targets["method"], "Target.getTargets");
+        engine.reply(
+            request_id(&targets),
+            json!({ "targetInfos": [
+                { "targetId": "first-page", "type": "page" },
+                { "targetId": "second-page", "type": "page" }
+            ] }),
+        );
+        let attach = next_request(&mut engine).await;
+        assert_eq!(attach["method"], "Target.attachToTarget");
+        assert_eq!(attach["params"]["targetId"], "first-page");
+        assert_eq!(broker.budget_snapshot().await.0, 1);
+        let mut control = Box::pin(broker.control("bob".to_string(), true));
+        assert!(control.as_mut().now_or_never().is_none());
+        let snapshot = broker.session().await.expect("actor session");
+        assert_eq!(snapshot.controller.as_deref(), Some("bob"));
+        assert_eq!(snapshot.control_epoch, 2);
+        if failed {
+            engine.push(json!({
+                "id": request_id(&attach),
+                "error": { "code": -32000, "message": "synthetic attach failure" }
+            }));
+        } else {
+            engine.reply(request_id(&attach), json!({ "sessionId": "first-session" }));
+        }
+        let disable = next_request(&mut engine).await;
+        assert_eq!(
+            disable["method"], "Target.setAutoAttach",
+            "a second backfill attach was dispatched: {disable}"
+        );
+        assert_eq!(disable["params"]["autoAttach"], false);
+        let rejected = next_frame(&mut alice).await;
+        assert_eq!(rejected["id"], 1);
+        assert_eq!(rejected["error"]["code"], -32000);
+        assert!(
+            message(&rejected).contains("Control has changed"),
+            "{rejected}"
+        );
+        expect_silence(&mut alice).await;
+        engine.reply(request_id(&disable), json!({}));
+        if failed {
+            // attach 明确失败：不 detach 不存在的 session，也不发第二个 attach。
+            let takeover = timeout(WAIT, control)
+                .await
+                .expect("takeover completes")
+                .ok()
+                .expect("takeover ok");
+            assert_eq!(takeover, ("bob".to_string(), 2));
+        } else {
+            // 成功回复先按旧 client/epoch 登记，再由退休清理；候选第二个必须保持未发送。
+            let detach = next_request(&mut engine).await;
+            assert_eq!(detach["method"], "Target.detachFromTarget");
+            assert_eq!(detach["params"]["sessionId"], "first-session");
+            engine.reply(request_id(&detach), json!({}));
+            let takeover = timeout(WAIT, control)
+                .await
+                .expect("takeover completes")
+                .ok()
+                .expect("takeover ok");
+            assert_eq!(takeover, ("bob".to_string(), 2));
+        }
+        send(
+            &marker,
+            &broker,
+            r#"{"id":1,"method":"DOM.getDocument","sessionId":"first-session","params":{"depth":1}}"#,
+        )
+        .await;
+        let foreign = next_frame(&mut marker).await;
+        assert!(
+            message(&foreign).contains("expired or belongs to another"),
+            "{foreign}"
+        );
+        send(
+            &marker,
+            &broker,
+            r#"{"id":2,"method":"Browser.getVersion"}"#,
+        )
+        .await;
+        let version = next_request(&mut engine).await;
+        assert_eq!(
+            version["method"], "Browser.getVersion",
+            "unexpected cleanup or replay after backfill settlement: {version}"
+        );
+        engine.reply(request_id(&version), json!({ "userAgent": "fake" }));
+        assert_eq!(next_frame(&mut marker).await["id"], 2);
+        assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+        drop(marker);
+        engine.kill();
+        assert!(!broker.wait_terminal().await);
+    }
+}
+
+#[tokio::test]
+async fn backfill_unknown_settles_after_takeover_without_replay() {
+    for failed in [false, true] {
+        let mut engine = fake_engine().await;
+        let broker = broker_with_deadlines(
+            &engine,
+            Duration::from_secs(120),
+            Duration::from_millis(400),
+        )
+        .await;
+        let mut owner = connect(&broker, Endpoint::Browser, Role::Controller, "owner").await;
+        let mut marker = connect(&broker, Endpoint::Browser, Role::Viewer, "marker").await;
+        let backfill =
+            start_held_backfill(&mut engine, &broker, &mut owner, 300, "late-target").await;
+        let expired = next_frame(&mut owner).await;
+        assert_eq!(expired["id"], 300);
+        assert!(
+            message(&expired).contains("outcome may be unknown"),
+            "{expired}"
+        );
+        assert_eq!(broker.budget_snapshot().await, (1, 0, 1, 0));
+        let mut control = Box::pin(broker.control("bob".to_string(), true));
+        assert!(control.as_mut().now_or_never().is_none());
+        let snapshot = broker.session().await.expect("actor session");
+        assert_eq!(snapshot.controller.as_deref(), Some("bob"));
+        assert_eq!(snapshot.control_epoch, 2);
+        drop(control);
+        let disable = next_request(&mut engine).await;
+        assert_eq!(disable["method"], "Target.setAutoAttach");
+        assert_eq!(disable["params"]["autoAttach"], false);
+        let disabled = receive_ack(
+            &broker,
+            &format!(r#"{{"id":{},"result":{{}}}}"#, request_id(&disable)),
+        )
+        .await;
+        assert_eq!(disabled, (true, 0));
+        // unknown 未结算前，原逻辑槽与内部身份都必须保留。
+        assert_eq!(broker.budget_snapshot().await, (1, 0, 1, 0));
+        if failed {
+            let outcome = receive_ack(
+                &broker,
+                &format!(
+                    r#"{{"id":{},"error":{{"code":-32000,"message":"synthetic late failure"}}}}"#,
+                    request_id(&backfill)
+                ),
+            )
+            .await;
+            assert_eq!(outcome, (true, 0));
+            assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+        } else {
+            let outcome = receive_ack(
+                &broker,
+                &format!(
+                    r#"{{"id":{},"result":{{"sessionId":"late-backfill"}}}}"#,
+                    request_id(&backfill)
+                ),
+            )
+            .await;
+            assert_eq!(outcome, (true, 1));
+            assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 1));
+            let detach = next_request(&mut engine).await;
+            assert_eq!(detach["method"], "Target.detachFromTarget");
+            assert_eq!(detach["params"]["sessionId"], "late-backfill");
+            let settled = receive_ack(
+                &broker,
+                &format!(r#"{{"id":{},"result":{{}}}}"#, request_id(&detach)),
+            )
+            .await;
+            assert_eq!(settled, (true, 0));
+            assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+        }
+        // 旧连接已超时，不补第二个回复；迟到结果也不得跨到新 controller。
+        expect_silence(&mut owner).await;
+        send(
+            &marker,
+            &broker,
+            r#"{"id":1,"method":"DOM.getDocument","sessionId":"late-backfill","params":{"depth":1}}"#,
+        )
+        .await;
+        let foreign = next_frame(&mut marker).await;
+        assert!(
+            message(&foreign).contains("expired or belongs to another"),
+            "{foreign}"
+        );
+        send(
+            &marker,
+            &broker,
+            r#"{"id":2,"method":"Browser.getVersion"}"#,
+        )
+        .await;
+        let version = next_request(&mut engine).await;
+        assert_eq!(
+            version["method"], "Browser.getVersion",
+            "late outcome was replayed or cleaned twice: {version}"
+        );
+        engine.reply(request_id(&version), json!({ "userAgent": "fake" }));
+        assert_eq!(next_frame(&mut marker).await["id"], 2);
+        assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+        drop(marker);
+        drop(owner);
+        engine.kill();
+        assert!(!broker.wait_terminal().await);
+    }
+}
+
+#[tokio::test]
+async fn queued_managed_session_expired_before_dispatch_is_rejected() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "tab".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let bootstrap = next_request(&mut engine).await;
+    assert_eq!(bootstrap["method"], "Target.attachToTarget");
+    assert_eq!(bootstrap["params"]["targetId"], "tab");
+    engine.reply(request_id(&bootstrap), json!({ "sessionId": "primary" }));
+    send(
+        &alice,
+        &broker,
+        r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"T2","flatten":true}}"#,
+    )
+    .await;
+    let first = next_request(&mut engine).await;
+    assert_eq!(first["method"], "Target.attachToTarget");
+    engine.reply(request_id(&first), json!({ "sessionId": "S2" }));
+    assert_eq!(next_reply(&mut alice, 1).await["result"]["sessionId"], "S2");
+    send(
+        &alice,
+        &broker,
+        r#"{"id":2,"method":"Target.attachToTarget","params":{"targetId":"T3","flatten":true}}"#,
+    )
+    .await;
+    let held = next_request(&mut engine).await;
+    assert_eq!(held["method"], "Target.attachToTarget");
+    assert_eq!(held["params"]["targetId"], "T3");
+    send(
+        &alice,
+        &broker,
+        r#"{"id":3,"method":"Target.setAutoAttach","sessionId":"S2","params":{"autoAttach":true,"flatten":true}}"#,
+    )
+    .await;
+    await_request_slots(&broker, 2).await;
+    assert_eq!(broker.budget_snapshot().await.1, 1);
+    // 权威 detached 通过命令 FIFO 结算；返回的 attachment 计数同时作为 ack。
+    let detached = receive_ack(
+        &broker,
+        r#"{"method":"Target.detachedFromTarget","params":{"sessionId":"S2"}}"#,
+    )
+    .await;
+    assert_eq!(detached, (true, 1));
+    engine.reply(request_id(&held), json!({ "sessionId": "S3" }));
+    assert_eq!(next_reply(&mut alice, 2).await["result"]["sessionId"], "S3");
+    let rejected = next_reply(&mut alice, 3).await;
+    assert_eq!(rejected["error"]["code"], -32000);
+    assert!(
+        message(&rejected).contains("attachment expired or belongs to another"),
+        "{rejected}"
+    );
+    send(
+        &alice,
+        &broker,
+        r#"{"id":4,"method":"DOM.getDocument","params":{"depth":1}}"#,
+    )
+    .await;
+    let primary = next_request(&mut engine).await;
+    assert_eq!(primary["method"], "DOM.getDocument");
+    assert_eq!(primary["sessionId"], "primary");
+    engine.reply(request_id(&primary), json!({ "root": { "nodeId": 1 } }));
+    assert_eq!(next_reply(&mut alice, 4).await["id"], 4);
+    send(
+        &alice,
+        &broker,
+        r#"{"id":5,"method":"DOM.getDocument","sessionId":"S2","params":{}}"#,
+    )
+    .await;
+    let expired = next_reply(&mut alice, 5).await;
+    assert!(
+        message(&expired).contains("expired or belongs to another"),
+        "{expired}"
+    );
+    send(&alice, &broker, r#"{"id":6,"method":"Browser.getVersion"}"#).await;
+    let version = next_request(&mut engine).await;
+    assert_eq!(
+        version["method"], "Browser.getVersion",
+        "expired session request reached upstream: {version}"
+    );
+    engine.reply(request_id(&version), json!({ "userAgent": "fake" }));
+    assert_eq!(next_reply(&mut alice, 6).await["id"], 6);
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn viewer_queued_attach_and_reads_survive_controller_takeover() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+    let mut bob = connect(&broker, Endpoint::Browser, Role::Viewer, "bob").await;
+    send(
+        &bob,
+        &broker,
+        r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"viewer-T1","flatten":true}}"#,
+    )
+    .await;
+    let first = next_request(&mut engine).await;
+    assert_eq!(first["method"], "Target.attachToTarget");
+    send(
+        &bob,
+        &broker,
+        r#"{"id":2,"method":"Target.attachToTarget","params":{"targetId":"viewer-T2","flatten":true}}"#,
+    )
+    .await;
+    await_request_slots(&broker, 2).await;
+    assert_eq!(broker.budget_snapshot().await.1, 1);
+    let mut control = Box::pin(broker.control("bob".to_string(), true));
+    assert!(control.as_mut().now_or_never().is_none());
+    let snapshot = broker.session().await.expect("actor session");
+    assert_eq!(snapshot.controller.as_deref(), Some("bob"));
+    assert_eq!(snapshot.control_epoch, 2);
+    engine.reply(request_id(&first), json!({ "sessionId": "v1" }));
+    assert_eq!(next_reply(&mut bob, 1).await["result"]["sessionId"], "v1");
+    // viewer 不要求 epoch 等于全局 controller epoch；排队 attach 在 takeover 后仍派发。
+    let second = next_request(&mut engine).await;
+    assert_eq!(second["method"], "Target.attachToTarget");
+    assert_eq!(second["params"]["targetId"], "viewer-T2");
+    engine.reply(request_id(&second), json!({ "sessionId": "v2" }));
+    assert_eq!(next_reply(&mut bob, 2).await["result"]["sessionId"], "v2");
+    let takeover = timeout(WAIT, control)
+        .await
+        .expect("takeover completes")
+        .ok()
+        .expect("takeover ok");
+    assert_eq!(takeover, ("bob".to_string(), 2));
+    send(
+        &bob,
+        &broker,
+        r#"{"id":3,"method":"DOM.getDocument","sessionId":"v1","params":{"depth":1}}"#,
+    )
+    .await;
+    let document = next_request(&mut engine).await;
+    assert_eq!(document["method"], "DOM.getDocument");
+    assert_eq!(document["sessionId"], "v1");
+    engine.reply(request_id(&document), json!({ "root": { "nodeId": 1 } }));
+    assert_eq!(next_reply(&mut bob, 3).await["id"], 3);
+    send(
+        &bob,
+        &broker,
+        r#"{"id":4,"method":"Target.setAutoAttach","params":{"autoAttach":true,"flatten":true}}"#,
+    )
+    .await;
+    let rejected = next_frame(&mut bob).await;
+    assert_eq!(rejected["id"], 4);
+    assert_eq!(
+        message(&rejected),
+        "Viewer connection cannot control the browser"
+    );
+    send(&bob, &broker, r#"{"id":5,"method":"Browser.getVersion"}"#).await;
+    let version = next_request(&mut engine).await;
+    assert_eq!(
+        version["method"], "Browser.getVersion",
+        "viewer control request reached upstream: {version}"
+    );
+    engine.reply(request_id(&version), json!({ "userAgent": "fake" }));
+    assert_eq!(next_reply(&mut bob, 5).await["id"], 5);
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    drop(bob);
+    drop(alice);
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn cutoffs_before_auto_reply_keep_backfill_on_the_original_logical_slot() {
+    for closing in [false, true] {
+        let mut engine = fake_engine().await;
+        let broker = broker(&engine).await;
+        let mut alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+        let mut closed = broker.closed_watch();
+        send(
+            &alice,
+            &broker,
+            r#"{"id":1,"method":"Target.setAutoAttach","params":{"autoAttach":true,"flatten":true}}"#,
+        )
+        .await;
+        let auto = next_request(&mut engine).await;
+        assert_eq!(auto["method"], "Target.setAutoAttach");
+        assert_eq!(broker.budget_snapshot().await.0, 1);
+        let runner = broker.clone();
+        let mut barrier = Box::pin(async move {
+            if closing {
+                runner.close(CloseKind::Http, None, None, None).await
+            } else {
+                runner.flush().await.map(|_| ())
+            }
+        });
+        assert!(barrier.as_mut().now_or_never().is_none());
+        assert!(broker.session().await.expect("actor session").alive);
+        send(&alice, &broker, r#"{"id":2,"method":"Browser.getVersion"}"#).await;
+        let rejected = next_frame(&mut alice).await;
+        assert_eq!(rejected["id"], 2);
+        assert_eq!(
+            message(&rejected),
+            if closing {
+                "Browser is closing"
+            } else {
+                "Browser is flushing"
+            }
+        );
+        // cutoff 早于 auto 成功回复：派生 getTargets 仍属 cutoff 内原工作。
+        engine.reply(request_id(&auto), json!({}));
+        let targets = next_request(&mut engine).await;
+        assert_eq!(targets["method"], "Target.getTargets");
+        assert_eq!(broker.budget_snapshot().await.0, 1);
+        engine.reply(
+            request_id(&targets),
+            json!({ "targetInfos": [{ "targetId": "backfill-page", "type": "page" }] }),
+        );
+        let attach = next_request(&mut engine).await;
+        assert_eq!(attach["method"], "Target.attachToTarget");
+        assert_eq!(attach["params"]["targetId"], "backfill-page");
+        assert_eq!(broker.budget_snapshot().await.0, 1);
+        engine.reply(
+            request_id(&attach),
+            json!({ "sessionId": "backfill-session" }),
+        );
+        assert_eq!(next_frame(&mut alice).await["id"], 1);
+        let flush = next_request(&mut engine).await;
+        assert_eq!(flush["method"], "Kitesurf.flushProfile");
+        engine.reply(request_id(&flush), json!({ "saved": true }));
+        if closing {
+            let browser = next_request(&mut engine).await;
+            assert_eq!(browser["method"], "Browser.close");
+            assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 1));
+            engine.reply(request_id(&browser), json!({}));
+        }
+        timeout(WAIT, barrier)
+            .await
+            .expect("barrier completes")
+            .expect("barrier ok");
+        if closing {
+            assert_eq!(
+                next_close(&mut alice).await,
+                (1000, "Browser closed".to_string())
+            );
+            broker.writer_gone(alice.id);
+            timeout(WAIT, closed.changed())
+                .await
+                .expect("closed watch")
+                .expect("closed sender");
+        } else {
+            assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+        }
+        engine.kill();
         assert_eq!(broker.wait_terminal().await, closing);
     }
 }
