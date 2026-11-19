@@ -290,6 +290,43 @@ node_test(
     },
 )
 
+# control 管理命令的 hermetic 合同：本进程 HTTP fixture，不启动 workerd、不打开 profile。
+node_test(
+    name = "native_cli_control_test",
+    size = "small",
+    args = ["test/native-cli.test.mjs"],
+    data = [
+        "//packages/local-browser/native:kitesurf-native",
+    ] + glob(["test/*.mjs"]),
+    env = {
+        "KITESURF_CLI_SCENARIO": "hermetic",
+        "KITESURF_NATIVE_HOST": "$(rootpath //packages/local-browser/native:kitesurf-native)",
+    },
+)
+
+# control 命令的真实全链：正式 Rust 二进制、pinned workerd、生成的配置与测试 profile。
+node_test(
+    name = "native_cli_control_engine_test",
+    size = "large",
+    timeout = "long",
+    args = ["test/native-cli.test.mjs"],
+    data = [
+        ":node_modules/ws",
+        ":runtime",
+        "//packages/local-browser/native:generated_config",
+        "//packages/local-browser/native:kitesurf-native",
+        "//packages/local-browser/native:native_assets",
+        "//packages/local-browser/native:workerd_bin",
+    ] + glob(["test/*.mjs"]),
+    env = {
+        "KITESURF_CLI_SCENARIO": "engine",
+        "KITESURF_CONFIG_DIR": "$(rootpath //packages/local-browser/native:generated_config)",
+        "KITESURF_ENGINE_ASSETS": "$(rootpath //packages/local-browser/native:native_assets)",
+        "KITESURF_NATIVE_HOST": "$(rootpath //packages/local-browser/native:kitesurf-native)",
+        "KITESURF_WORKERD": "$(rootpath //packages/local-browser/native:workerd_bin)",
+    },
+)
+
 copy_file(
     name = "font_host_bin",
     src = "//packages/local-browser/font-host:kitesurf-font-host",

@@ -15,6 +15,15 @@ use std::time::Duration;
 
 use serde_json::json;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::time::timeout;
+
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Body;
+use hyper::header::{CONTENT_TYPE, HOST};
+use hyper::{Request, StatusCode};
+use hyper_util::rt::TokioIo;
+use tokio::net::TcpStream;
 
 use kitesurf_local_host::broker::{BrokerHandle, CloseKind};
 use kitesurf_local_host::fonts::FontService;
@@ -32,6 +41,9 @@ use kitesurf_local_host::{describe_error, HostResult};
 
 const VERSION: &str = "0.5.0";
 
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
+const CONTROL_MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
 const HELP: &str = "\
 Kitesurf native local host 0.5.0
 
@@ -42,6 +54,7 @@ kitesurf-native serve --test-memory-profile [--profile-origin URL] ...
 kitesurf-native profile create FILE
 kitesurf-native profile status FILE
 kitesurf-native profile backup FILE --output FILE
+kitesurf-native control --owner NAME [--takeover] [--port 8787]
 kitesurf-native --help | --version
 
 The generated config carries the public/private network choice. This process owns the
@@ -268,6 +281,123 @@ fn print_json(value: serde_json::Value) -> HostResult<()> {
     Ok(())
 }
 
+struct ControlArgs {
+    owner: String,
+    takeover: bool,
+    port: u16,
+}
+
+fn parse_control_args(args: &[OsString]) -> HostResult<ControlArgs> {
+    let mut owner = None;
+    let mut takeover = false;
+    let mut port = 8787;
+    let mut rest = args.iter();
+    while let Some(argument) = rest.next() {
+        let argument = argument.to_string_lossy().to_string();
+        if argument == "--help" || argument == "-h" {
+            print!("{HELP}");
+            std::process::exit(0);
+        }
+        if argument == "--version" {
+            println!("kitesurf {VERSION}");
+            std::process::exit(0);
+        }
+        let mut take = |flag: &str| -> HostResult<String> {
+            rest.next()
+                .map(|value| value.to_string_lossy().to_string())
+                .ok_or_else(|| format!("{flag} requires a value").into())
+        };
+        match argument.as_str() {
+            "--owner" => owner = Some(take("--owner")?),
+            "--takeover" => takeover = true,
+            "--port" => {
+                port = take("--port")?
+                    .parse::<u16>()
+                    .map_err(|_| "--port must be an integer from 0 to 65535".to_string())?;
+            }
+            other => return Err(format!("unknown or incomplete argument: {other}").into()),
+        }
+    }
+    let owner = owner.ok_or("control requires --owner NAME")?;
+    Ok(ControlArgs {
+        owner,
+        takeover,
+        port,
+    })
+}
+
+// control 只在启动宿主前分派：向已有 loopback 端点发送一次请求，不打开 profile、不启动
+// workerd 或子进程；超时或断连不得被解释为服务端已回滚。
+async fn run_control_command(args: &[OsString]) -> HostResult<()> {
+    let ControlArgs {
+        owner,
+        takeover,
+        port,
+    } = parse_control_args(args)?;
+    let request = json!({ "owner": owner, "takeover": takeover }).to_string();
+    let (status, body) = timeout(CONTROL_TIMEOUT, control_exchange(port, request))
+        .await
+        .map_err(|_| format!("control request to 127.0.0.1:{port} timed out"))??;
+    let text = String::from_utf8_lossy(&body);
+    if !status.is_success() {
+        let message = text.trim_end_matches(['\r', '\n']);
+        if message.is_empty() {
+            return Err(format!("control request failed with status {}", status.as_u16()).into());
+        }
+        return Err(message.to_string().into());
+    }
+    println!("{text}");
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
+async fn control_exchange(port: u16, body: String) -> HostResult<(StatusCode, Vec<u8>)> {
+    let stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .map_err(|error| format!("cannot connect to 127.0.0.1:{port}: {error}"))?;
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .map_err(|error| format!("control HTTP handshake failed: {error}"))?;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/control")
+        .header(CONTENT_TYPE, "application/json")
+        .header(HOST, format!("127.0.0.1:{port}"))
+        .body(Full::new(Bytes::from(body)))
+        .map_err(|error| format!("control request is invalid: {error}"))?;
+    let exchange = async move {
+        let response = sender.send_request(request).await?;
+        let status = response.status();
+        let body = read_control_body(response.into_body()).await?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((status, body))
+    };
+    let (result, _) = tokio::join!(exchange, connection);
+    result
+}
+
+async fn read_control_body(mut body: hyper::body::Incoming) -> HostResult<Vec<u8>> {
+    let limit = CONTROL_MAX_RESPONSE_BYTES;
+    if body
+        .size_hint()
+        .upper()
+        .is_some_and(|upper| upper > limit as u64)
+    {
+        return Err(format!("control response exceeds {limit} bytes").into());
+    }
+    let mut data = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        let Ok(chunk) = frame.into_data() else {
+            continue;
+        };
+        if data.len().saturating_add(chunk.len()) > limit {
+            return Err(format!("control response exceeds {limit} bytes").into());
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok(data)
+}
+
 #[tokio::main]
 async fn main() {
     let code = match run().await {
@@ -288,6 +418,13 @@ async fn run() -> HostResult<bool> {
         .is_some_and(|argument| argument.to_string_lossy() == "profile")
     {
         run_profile_command(&argv[1..])?;
+        return Ok(true);
+    }
+    if argv
+        .first()
+        .is_some_and(|argument| argument.to_string_lossy() == "control")
+    {
+        run_control_command(&argv[1..]).await?;
         return Ok(true);
     }
     let args = Args::parse(argv)?;
