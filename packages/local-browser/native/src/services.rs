@@ -564,18 +564,18 @@ impl ProfileBackend for FaultProfile {
     }
 }
 
-struct ConnectionTasks {
+pub(crate) struct ConnectionTasks {
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl ConnectionTasks {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             tasks: Mutex::new(Vec::new()),
         }
     }
 
-    fn track(&self, handle: JoinHandle<()>) {
+    pub(crate) fn track(&self, handle: JoinHandle<()>) {
         let Ok(mut tasks) = self.tasks.lock() else {
             handle.abort();
             return;
@@ -584,7 +584,15 @@ impl ConnectionTasks {
         tasks.push(handle);
     }
 
-    async fn close(&self) {
+    pub(crate) fn abort(&self) {
+        if let Ok(mut tasks) = self.tasks.lock() {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
+        }
+    }
+
+    pub(crate) async fn close(&self) {
         let handles = self
             .tasks
             .lock()
@@ -691,14 +699,14 @@ impl Drop for PrivateServices {
     }
 }
 
-fn remove_socket(path: &Path) {
+pub(crate) fn remove_socket(path: &Path) {
     if path.exists() {
         let _ = std::fs::remove_file(path);
     }
 }
 
 /// socket 只允许当前用户读写；父目录仍由 main 的 0700 run dir 保护。
-fn bind_private_socket(path: &Path) -> HostResult<UnixListener> {
+pub(crate) fn bind_private_socket(path: &Path) -> HostResult<UnixListener> {
     let listener = UnixListener::bind(path)?;
     if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
         drop(listener);
@@ -708,7 +716,7 @@ fn bind_private_socket(path: &Path) -> HostResult<UnixListener> {
     Ok(listener)
 }
 
-fn spawn_listener(
+pub(crate) fn spawn_listener(
     listener: UnixListener,
     shutdown: watch::Receiver<bool>,
     handler: Arc<dyn ConnectionHandler>,
@@ -744,21 +752,21 @@ fn spawn_listener(
     })
 }
 
-trait ConnectionHandler: Send + Sync {
+pub(crate) trait ConnectionHandler: Send + Sync {
     fn handle(
         &self,
         request: Request<Incoming>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response<Full<Bytes>>> + Send + '_>>;
 }
 
-fn empty_response(status: StatusCode) -> Response<Full<Bytes>> {
+pub(crate) fn empty_response(status: StatusCode) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
         .body(Full::new(Bytes::new()))
         .expect("static response")
 }
 
-fn json_response(status: StatusCode, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
+pub(crate) fn json_response(status: StatusCode, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
         .header("content-type", "application/json")

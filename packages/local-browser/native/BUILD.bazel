@@ -57,7 +57,9 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2021",
     rustc_env_files = [":cargo_env"],
-    deps = all_crate_deps(package_name = "", normal = True),
+    deps = [
+        "//packages/local-browser/font-host:kitesurf_font_host",
+    ] + all_crate_deps(package_name = "", normal = True),
 )
 
 rust_binary(
@@ -81,7 +83,9 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2021",
     rustc_env_files = [":cargo_env"],
-    deps = all_crate_deps(package_name = "", normal = True),
+    deps = [
+        "//packages/local-browser/font-host:kitesurf_font_host",
+    ] + all_crate_deps(package_name = "", normal = True),
 )
 
 rust_binary(
@@ -263,6 +267,7 @@ copy_to_directory(
         "packages/engine/public",
         "packages/local-browser/native",
     ],
+    exclude_srcs_patterns = ["fonts/**"],
     visibility = ["//visibility:public"],
 )
 
@@ -310,11 +315,13 @@ node_test(
     args = ["config/config-compile.test.mjs"],
     data = [
         ":generated_config",
+        ":native_assets",
         ":workerd_bin",
         "config/config-compile.test.mjs",
     ],
     env = {
         "KITESURF_CONFIG_DIR": "$(rootpath :generated_config)",
+        "KITESURF_ENGINE_ASSETS": "$(rootpath :native_assets)",
         "KITESURF_WORKERD": "$(rootpath :workerd_bin)",
     },
 )

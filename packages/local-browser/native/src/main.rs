@@ -17,6 +17,7 @@ use serde_json::json;
 use tokio::signal::unix::{signal, SignalKind};
 
 use kitesurf_local_host::broker::{BrokerHandle, CloseKind};
+use kitesurf_local_host::fonts::FontService;
 use kitesurf_local_host::observe::Observer;
 use kitesurf_local_host::profile::ProfileStore;
 use kitesurf_local_host::relay::{HostServer, SessionInfo};
@@ -314,17 +315,42 @@ async fn run() -> HostResult<bool> {
         _ => backend,
     };
     let profile_service = Arc::new(ProfileService::new(backend));
-    let services = PrivateServices::bind(
+    let mut fonts = match FontService::start(run_dir.path()).await {
+        Ok(fonts) => fonts,
+        Err(error) => {
+            let dir_path = run_dir.path().to_path_buf();
+            drop(run_dir);
+            observer.with(
+                "shutdown",
+                json!({ "clean": false, "exit": "font-startup", "dirRemoved": !dir_path.exists() }),
+            );
+            return Err(error);
+        }
+    };
+    let services = match PrivateServices::bind(
         run_dir.path(),
         &args.assets_root,
         &args.assets_manifest,
         profile_service.clone(),
         observer.clone(),
-    )?;
+    ) {
+        Ok(services) => services,
+        Err(error) => {
+            let fonts_clean = fonts.shutdown().await;
+            let dir_path = run_dir.path().to_path_buf();
+            drop(run_dir);
+            observer.with(
+                "shutdown",
+                json!({ "clean": false, "exit": "service-startup", "fonts": fonts_clean, "dirRemoved": !dir_path.exists() }),
+            );
+            return Err(error);
+        }
+    };
     let socket = EngineSocket::Unix(run_dir.path().join("engine.sock"));
     let externals = vec![
         ("profile".to_string(), services.paths().profile.clone()),
         ("assets".to_string(), services.paths().assets.clone()),
+        ("fonts".to_string(), fonts.path().to_path_buf()),
     ];
     let spec = EngineSpec::workerd(
         &args.workerd,
@@ -334,7 +360,22 @@ async fn run() -> HostResult<bool> {
         Duration::from_millis(args.startup_timeout_ms),
         observer.clone(),
     );
-    let mut engine = supervisor::spawn(spec).await?;
+    let mut engine = match supervisor::spawn(spec).await {
+        Ok(engine) => engine,
+        Err(error) => {
+            services.shutdown().await;
+            let fonts_clean = fonts.shutdown().await;
+            drop(services);
+            drop(profile_service);
+            let dir_path = run_dir.path().to_path_buf();
+            drop(run_dir);
+            observer.with(
+                "shutdown",
+                json!({ "clean": false, "exit": "engine-spawn", "fonts": fonts_clean, "dirRemoved": !dir_path.exists() }),
+            );
+            return Err(error);
+        }
+    };
     let started = async {
         engine.wait_ready().await?;
         let mut upstream = Upstream::connect(&engine.endpoint(), observer.clone()).await?;
@@ -375,11 +416,12 @@ async fn run() -> HostResult<bool> {
         Err(error) => {
             let exit = engine.shutdown().await;
             services.shutdown().await;
+            let fonts_clean = fonts.shutdown().await;
             drop(services);
             drop(profile_service);
             let dir_path = run_dir.path().to_path_buf();
             drop(run_dir);
-            observer.with("shutdown", json!({ "clean": false, "exit": exit.to_string(), "dirRemoved": !dir_path.exists() }));
+            observer.with("shutdown", json!({ "clean": false, "exit": exit.to_string(), "fonts": fonts_clean, "dirRemoved": !dir_path.exists() }));
             return Err(error);
         }
     };
@@ -445,12 +487,17 @@ async fn run() -> HostResult<bool> {
     }
     services.shutdown().await;
     drop(services);
+    let fonts_clean = fonts.shutdown().await;
+    if !fonts_clean {
+        eprintln!("kitesurf: system font worker did not shut down cleanly");
+    }
+    let clean = clean && fonts_clean;
     drop(profile_service);
     let dir_path = run_dir.path().to_path_buf();
     drop(run_dir);
     observer.with(
     "shutdown",
-    json!({ "kind": "shutdown", "clean": clean, "exit": exit.to_string(), "dirRemoved": !dir_path.exists() }),
+    json!({ "kind": "shutdown", "clean": clean, "fonts": fonts_clean, "exit": exit.to_string(), "dirRemoved": !dir_path.exists() }),
   );
     if !clean {
         eprintln!(

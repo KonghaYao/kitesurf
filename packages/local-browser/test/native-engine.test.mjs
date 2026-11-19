@@ -376,42 +376,6 @@ test(
 );
 
 test(
-  "the renderer fetches the pinned font assets through the assets service",
-  { timeout: 120_000 },
-  async (t) => {
-    const host = await hostFor(t);
-    const cdp = await connect(host.port);
-    t.after(() => cdp.disconnect());
-    const page = await open(cdp);
-    await setContent(cdp, page.sessionId, "<p style='font:32px sans-serif'>Hello Kitesurf</p>");
-    const fonts = ["NotoSans.shaping.otf", "NotoSans-Italic.shaping.otf"];
-    let expected = 0;
-    for (const name of fonts) {
-      const size = statSync(join(engineAssets, "fonts", name)).size;
-      assert.ok(size > 0, name);
-      expected += size;
-    }
-    assert.ok(expected > 700_000, `the bundled font fixtures are real bytes: ${expected}`);
-    const fetched = await waitFor(() => {
-      const assetEvents = events(host, "asset").filter(
-        (event) => event.status === 200 && event.path.startsWith("/fonts/"),
-      );
-      return fonts.every((name) => assetEvents.some((event) => event.path === `/fonts/${name}`))
-        ? assetEvents
-        : null;
-    }, "the UA font assets");
-    for (const name of fonts) {
-      const event = fetched.find((candidate) => candidate.path === `/fonts/${name}`);
-      assert.ok(event, `${name} was served`);
-      assert.equal(event.bytes, statSync(join(engineAssets, "fonts", name)).size);
-    }
-    const registered = host.stderrText().match(/registered 3 Latin UA fonts \((\d+) bytes\)/);
-    assert.ok(registered, "the engine registered the UA fonts");
-    assert.equal(Number(registered[1]), expected);
-  },
-);
-
-test(
   "retired isolates are collected through the real gc, at most once a second",
   { timeout: 180_000 },
   async (t) => {
@@ -482,12 +446,14 @@ test(
     assert.match(command, /--socket-addr engine=unix:(\S+)\/engine\.sock/);
     assert.match(command, /--external-addr profile=unix:\S+\/profile\.sock/);
     assert.match(command, /--external-addr assets=unix:\S+\/assets\.sock/);
+    assert.match(command, /--external-addr fonts=unix:\S+\/fonts\.sock/);
     assert.match(command, /--control-fd 3/);
     assert.doesNotMatch(command, /--socket-fd/);
     const socket = command.match(/--socket-addr engine=unix:(\S+)/)[1];
     assert.ok(statSync(socket).isSocket());
     assert.ok(statSync(join(host.runDir(), "profile.sock")).isSocket());
     assert.ok(statSync(join(host.runDir(), "assets.sock")).isSocket());
+    assert.ok(statSync(join(host.runDir(), "fonts.sock")).isSocket());
     assert.ok(socket.length < 104, `the Darwin socket path fits: ${socket.length}`);
     const runDir = events(host, "run-dir").at(-1);
     assert.equal(runDir.mode, 0o700);
@@ -640,14 +606,15 @@ test(
     assert.equal(fixture.body.length, statSync(join(engineAssets, "fixtures/pixel.png")).size);
     assert.equal((await unixRequest(assets, { path: "/etc/passwd" })).status, 404);
     assert.equal((await unixRequest(assets, { path: "/fonts/../fixtures/pixel.png" })).status, 404);
-    const font = await unixRequest(assets, {
-      path: "/fonts/NotoSans.ttf",
+    assert.equal((await unixRequest(assets, { path: "/fonts/NotoSans.ttf" })).status, 404);
+    const ranged = await unixRequest(assets, {
+      path: "/rbi/scene_host.json",
       headers: { range: "bytes=0-3" },
     });
-    const fontBytes = statSync(join(engineAssets, "fonts", "NotoSans.ttf")).size;
-    assert.equal(font.status, 206);
-    assert.equal(font.headers["content-range"], `bytes 0-3/${fontBytes}`);
-    assert.equal(font.body.length, 4);
+    const rangedBytes = statSync(join(engineAssets, "rbi", "scene_host.json")).size;
+    assert.equal(ranged.status, 206);
+    assert.equal(ranged.headers["content-range"], `bytes 0-3/${rangedBytes}`);
+    assert.equal(ranged.body.length, 4);
     assert.equal(
       (await unixRequest(profile, { method: "POST", path: "/load", body: { owner: "probe" } }))
         .status,

@@ -149,6 +149,7 @@ export function emitConfig(options) {
     loaderBinding,
     profileBinding,
     assetsBinding,
+    fontsBinding = "LOCAL_FONTS",
   } = options;
   const network = privateNetwork ? '["public", "private", "local"]' : '["public"]';
   const bindings = [
@@ -158,6 +159,7 @@ export function emitConfig(options) {
     `      (name = "${loaderBinding}", workerLoader = ()),`,
     `      (name = "${profileBinding}", service = "profile"),`,
     `      (name = "${assetsBinding}", service = "assets"),`,
+    `      (name = "${fontsBinding}", service = "fonts"),`,
   ];
   if (privateNetwork) bindings.push(`      (name = "KITESURF_ALLOW_PRIVATE_NETWORK", text = "1"),`);
   const flags = compatibilityFlags.map((flag) => capnpString(flag)).join(", ");
@@ -178,6 +180,7 @@ export function emitConfig(options) {
     "    )),",
     '    (name = "profile", external = (http = ())),',
     '    (name = "assets", external = (http = ())),',
+    '    (name = "fonts", external = (http = ())),',
     `    (name = "internet", network = (allow = ${network})),`,
     "  ],",
     '  sockets = [(name = "engine", http = (), service = "main")],',
@@ -200,6 +203,8 @@ function readOptions(dist) {
     if (typeof value !== "string") throw new Error(`binding ${name} is not a text var`);
     vars[name] = value;
   }
+  // 原生宿主只运行在系统字体模式；打包字体不会进入 native 资源树。
+  vars.KITESURF_SYSTEM_FONTS = "1";
   const loaders = Object.keys(options.workerLoaders ?? {});
   if (loaders.length !== 1) throw new Error("expected exactly one workerLoader binding");
   const assetsBinding = options.assets?.binding;
@@ -211,6 +216,7 @@ function readOptions(dist) {
     loaderBinding: loaders[0],
     profileBinding: "LOCAL_PROFILE",
     assetsBinding,
+    fontsBinding: "LOCAL_FONTS",
   };
 }
 

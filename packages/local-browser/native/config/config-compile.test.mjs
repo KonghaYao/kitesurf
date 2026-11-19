@@ -7,7 +7,14 @@
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { test } from "node:test";
@@ -22,8 +29,10 @@ function located(value) {
 
 const workerd = located(process.env.KITESURF_WORKERD);
 const configDir = located(process.env.KITESURF_CONFIG_DIR);
+const engineAssets = located(process.env.KITESURF_ENGINE_ASSETS);
 assert.ok(workerd, "KITESURF_WORKERD must point at the pinned workerd");
 assert.ok(configDir, "KITESURF_CONFIG_DIR must point at the generated config");
+assert.ok(engineAssets, "KITESURF_ENGINE_ASSETS must point at the native asset tree");
 const CONFIGS = ["local-public.capnp", "local-private.capnp", "local-gc.capnp"];
 
 function compile(t, name) {
@@ -59,6 +68,8 @@ async function serve(t, root, binary) {
       `profile=unix:${join(root, "profile.sock")}`,
       "--external-addr",
       `assets=unix:${join(root, "assets.sock")}`,
+      "--external-addr",
+      `fonts=unix:${join(root, "fonts.sock")}`,
     ],
     { stdio: ["ignore", "pipe", "pipe"] },
   );
@@ -98,3 +109,32 @@ for (const name of CONFIGS) {
     },
   );
 }
+
+test("the native asset tree and manifest carry no bundled fonts", () => {
+  const files = [];
+  const walk = (directory, prefix) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const name = `${prefix}${entry.name}`;
+      if (entry.isDirectory()) {
+        walk(join(directory, entry.name), `${name}/`);
+      } else if (entry.isFile()) {
+        files.push(name);
+      }
+    }
+  };
+  walk(engineAssets, "");
+  files.sort();
+  const bundled = files.filter(
+    (name) => name.startsWith("fonts/") || /\.(ttf|otf|woff2?)$/i.test(name),
+  );
+  assert.deepEqual(bundled, []);
+  for (const name of ["rbi/scene_host.json", "rbi/scene_host.wasm", "fixtures/pixel.png"]) {
+    assert.ok(files.includes(name), `${name} stays in the native asset tree`);
+  }
+  const manifest = JSON.parse(readFileSync(join(configDir, "assets-manifest.json"), "utf8"));
+  assert.deepEqual(
+    manifest.files.map((entry) => entry.path.slice(1)).sort(),
+    files,
+    "the manifest lists exactly the native asset tree",
+  );
+});

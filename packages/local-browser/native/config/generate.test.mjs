@@ -140,6 +140,8 @@ test("emitConfig selects the public or private network and keeps bindings explic
   assert.ok(publicConfig.includes('(name = "LOADER", workerLoader = ())'));
   assert.ok(publicConfig.includes('(name = "LOCAL_PROFILE", service = "profile")'));
   assert.ok(publicConfig.includes('(name = "FONT_ASSETS", service = "assets")'));
+  assert.ok(publicConfig.includes('(name = "LOCAL_FONTS", service = "fonts")'));
+  assert.ok(publicConfig.includes('(name = "fonts", external = (http = ()))'));
   assert.ok(publicConfig.includes('v8Flags = ["--expose-gc"]'));
   const privateConfig = emitConfig({
     ...options,
@@ -172,7 +174,7 @@ test("generate writes modules, manifests and three configs, replacing stale outp
     "core_bg.wasm": "wasm",
     "index.js.map": "{}",
   });
-  writeTree(assets, { "fonts/NotoSans.ttf": "font-bytes", "rbi/scene_host.json": "{}" });
+  writeTree(assets, { "fixtures/pixel.png": "png", "rbi/scene_host.json": "{}" });
   mkdirSync(out, { recursive: true });
   writeFileSync(join(out, "stale.txt"), "stale");
   const result = generate({ dist, assets, out });
@@ -188,7 +190,7 @@ test("generate writes modules, manifests and three configs, replacing stale outp
   assert.equal(assetManifest.version, 1);
   assert.deepEqual(
     assetManifest.files.map((entry) => entry.path),
-    ["/fonts/NotoSans.ttf", "/rbi/scene_host.json"],
+    ["/fixtures/pixel.png", "/rbi/scene_host.json"],
   );
   for (const name of [
     "modules.capnp",
@@ -207,6 +209,12 @@ test("generate writes modules, manifests and three configs, replacing stale outp
   );
   assert.match(readFileSync(join(out, "local-private.capnp"), "utf8"), /"private", "local"/);
   assert.match(readFileSync(join(out, "local-gc.capnp"), "utf8"), /"private", "local"/);
+  for (const name of ["local-public.capnp", "local-private.capnp", "local-gc.capnp"]) {
+    const config = readFileSync(join(out, name), "utf8");
+    assert.match(config, /KITESURF_SYSTEM_FONTS", text = "1"/, `${name} selects system fonts`);
+    assert.match(config, /\(name = "LOCAL_FONTS", service = "fonts"\)/, name);
+    assert.match(config, /\(name = "fonts", external = \(http = \(\)\)\)/, name);
+  }
 });
 
 test("generate rejects an engine manifest without the expected bindings", (t) => {

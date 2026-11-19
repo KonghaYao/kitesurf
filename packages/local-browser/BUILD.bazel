@@ -103,6 +103,29 @@ node_test(
     ]
 ]
 
+# T5 原生系统字体：进程内字体服务、无打包字体、作者 @font-face 仍按页面来源加载。
+node_test(
+    name = "native_system_fonts_test",
+    size = "large",
+    timeout = "long",
+    args = ["test/native-system-fonts.test.mjs"],
+    data = [
+        ":node_modules/ws",
+        "//:node_modules/pngjs",
+        "//packages/local-browser/native:generated_config",
+        "//packages/local-browser/native:kitesurf-native",
+        "//packages/local-browser/native:native_assets",
+        "//packages/local-browser/native:workerd_bin",
+        "test/fixtures/author-mono.woff2",
+    ] + glob(["test/*.mjs"]),
+    env = {
+        "KITESURF_CONFIG_DIR": "$(rootpath //packages/local-browser/native:generated_config)",
+        "KITESURF_ENGINE_ASSETS": "$(rootpath //packages/local-browser/native:native_assets)",
+        "KITESURF_NATIVE_HOST": "$(rootpath //packages/local-browser/native:kitesurf-native)",
+        "KITESURF_WORKERD": "$(rootpath //packages/local-browser/native:workerd_bin)",
+    },
+)
+
 # T4 公共 broker 契约：同一套断言分别跑 native（默认）和 Node oracle；Rust 内部时序由
 # native:broker_test 证明。
 [
