@@ -2607,6 +2607,30 @@ impl Broker {
         }
     }
 
+    /// 权威 detached 移除记录后，未结算的 cleanup detach 仍按同一 sessionId 寻址。
+    /// 只扫描现有有界 pending/unknown；不删 unknown、不重放，也不保留 tombstone。
+    fn cleanup_detach_unsettled(&self, session: &str) -> bool {
+        let pending = self.pending.values().any(|pending| match &pending.kind {
+            PendingKind::RetirementDetach {
+                session: current, ..
+            }
+            | PendingKind::QuarantineDetach {
+                session: current, ..
+            } => current == session,
+            _ => false,
+        });
+        pending
+            || self.unknown.values().any(|unknown| match &unknown.kind {
+                UnknownKind::RetirementDetach {
+                    session: current, ..
+                }
+                | UnknownKind::QuarantineDetach {
+                    session: current, ..
+                } => current == session,
+                _ => false,
+            })
+    }
+
     // span 已在 parse 中验证类型、4096-byte 上限和 Unicode；后续只借用同一不可变 owner。
     fn attached_event(&mut self, value: Received) {
         let Some(session_span) = value.session else {
@@ -2646,6 +2670,12 @@ impl Broker {
         let (Some(session), Some(target)) = (session, target) else {
             return;
         };
+        // 未结算 cleanup detach 仍按同一 sessionId 在线寻址；窗口内同 ID attached 不是
+        // 新 attachment，也不派第二次 detach。存活 attachment 仍走 register 原分支。
+        if self.attachments.attachment(session).is_none() && self.cleanup_detach_unsettled(session)
+        {
+            return;
+        }
         let Some(owner) = self.attachments.resolve_owner(outer, target) else {
             return;
         };

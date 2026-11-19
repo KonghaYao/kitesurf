@@ -1253,6 +1253,21 @@ fn message(value: &Value) -> &str {
         .expect("error message")
 }
 
+fn attached_event(parent: &str, session: &str, target: &str) -> Value {
+    json!({
+      "sessionId": parent,
+      "method": "Target.attachedToTarget",
+      "params": { "sessionId": session, "targetInfo": { "targetId": target } }
+    })
+}
+
+fn detached_event(session: &str) -> Value {
+    json!({
+      "method": "Target.detachedFromTarget",
+      "params": { "sessionId": session }
+    })
+}
+
 #[test]
 fn production_request_and_output_limits_stay_fixed() {
     assert_eq!(super::MAX_PENDING_PER_CLIENT, 64);
@@ -3744,6 +3759,581 @@ async fn flush_waits_for_inflight_quarantine_detach() {
 }
 
 #[tokio::test]
+async fn attached_event_with_unsettled_quarantine_detach_is_ignored() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut owner = connect(&broker, Endpoint::Browser, Role::Viewer, "owner").await;
+    fill_attachments(&mut engine, &broker, &mut owner, "six", 256).await;
+    let budget = broker.payload_budget();
+    let baseline = budget.used();
+    engine.event(attached_event(
+        "six-session-0",
+        "overflow-a",
+        "overflow-page-a",
+    ));
+    let detach = next_request(&mut engine).await;
+    assert_eq!(detach["method"], "Target.detachFromTarget");
+    assert_eq!(detach["params"]["sessionId"], "overflow-a");
+    // 权威 detached 移除 quarantine 记录，但在途 detach 仍按同 ID 寻址。
+    assert_eq!(
+        receive_ack(&broker, &detached_event("overflow-a").to_string()).await,
+        (true, 256)
+    );
+    let repeat = attached_event("six-session-0", "overflow-a", "overflow-page-a").to_string();
+    assert_eq!(receive_ack(&broker, &repeat).await, (true, 256));
+    assert_eq!(receive_ack(&broker, &repeat).await, (true, 256));
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 1));
+    // 冲突事件不得派发第二个 detach；后续 client 请求是明确 FIFO 标记。
+    send(
+        &owner,
+        &broker,
+        r#"{"id":300,"method":"Browser.getVersion"}"#,
+    )
+    .await;
+    let marker = next_request(&mut engine).await;
+    assert_eq!(marker["method"], "Browser.getVersion");
+    engine.reply(request_id(&marker), json!({ "userAgent": "fake" }));
+    assert_eq!(next_frame(&mut owner).await["id"], 300);
+    // 未重新接纳，旧会话没有获得授权。
+    send(
+        &owner,
+        &broker,
+        r#"{"id":301,"method":"DOM.getDocument","sessionId":"overflow-a"}"#,
+    )
+    .await;
+    assert!(
+        message(&next_frame(&mut owner).await).contains("expired or belongs to another"),
+        "overflow session must stay unavailable"
+    );
+    // flush 只等原 detach 精确结算，期间不重放也不确认新身份。
+    let mut flushing = Box::pin(broker.flush());
+    let _ = broker.session().await;
+    send(
+        &owner,
+        &broker,
+        r#"{"id":302,"method":"Browser.getVersion"}"#,
+    )
+    .await;
+    let marker = next_request(&mut engine).await;
+    assert_eq!(marker["method"], "Browser.getVersion");
+    engine.reply(request_id(&marker), json!({ "userAgent": "fake" }));
+    assert_eq!(next_frame(&mut owner).await["id"], 302);
+    assert!(flushing.as_mut().now_or_never().is_none());
+    engine.reply(request_id(&detach), json!({}));
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    let status = timeout(WAIT, flushing)
+        .await
+        .expect("flush completes")
+        .expect("flush ok");
+    drop(status);
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    // 原身份结算后不保留永久守卫：同 ID 回到现有有界 quarantine 处理。
+    assert_eq!(receive_ack(&broker, &repeat).await, (true, 256));
+    let again = next_request(&mut engine).await;
+    assert_eq!(again["method"], "Target.detachFromTarget");
+    assert_eq!(again["params"]["sessionId"], "overflow-a");
+    assert_eq!(
+        receive_ack(&broker, &detached_event("overflow-a").to_string()).await,
+        (true, 256)
+    );
+    engine.reply(request_id(&again), json!({}));
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.3 != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("final detach settles");
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    let (controller, epoch) = broker
+        .control("bob".to_string(), true)
+        .await
+        .ok()
+        .expect("control after cleanup");
+    assert_eq!((controller.as_str(), epoch), ("bob", 2));
+    assert_eq!(budget.used(), baseline);
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn attached_event_with_unknown_cleanup_detach_is_ignored() {
+    let mut engine = fake_engine().await;
+    let broker = broker_with_deadlines(
+        &engine,
+        Duration::from_secs(120),
+        Duration::from_millis(400),
+    )
+    .await;
+    let mut owner = connect(&broker, Endpoint::Browser, Role::Viewer, "owner").await;
+    fill_attachments(&mut engine, &broker, &mut owner, "unknown", 256).await;
+    let budget = broker.payload_budget();
+    let baseline = budget.used();
+    for (session, target) in [
+        ("unknown-a", "unknown-page-a"),
+        ("unknown-b", "unknown-page-b"),
+    ] {
+        engine.event(attached_event("unknown-session-0", session, target));
+    }
+    let first = next_request(&mut engine).await;
+    let second = next_request(&mut engine).await;
+    assert_eq!(first["params"]["sessionId"], "unknown-a");
+    assert_eq!(second["params"]["sessionId"], "unknown-b");
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.2 != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both cleanup detaches must become unknown");
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 2, 2));
+    for (session, target) in [
+        ("unknown-a", "unknown-page-a"),
+        ("unknown-b", "unknown-page-b"),
+    ] {
+        assert_eq!(
+            receive_ack(&broker, &detached_event(session).to_string()).await,
+            (true, 256)
+        );
+        let repeat = attached_event("unknown-session-0", session, target).to_string();
+        assert_eq!(receive_ack(&broker, &repeat).await, (true, 256));
+        assert_eq!(receive_ack(&broker, &repeat).await, (true, 256));
+    }
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 2, 2));
+    let error = broker.flush().await.err().expect("unknown blocks flush");
+    assert_eq!(error, "previous request outcome is unknown");
+    send(
+        &owner,
+        &broker,
+        r#"{"id":310,"method":"Browser.getVersion"}"#,
+    )
+    .await;
+    let marker = next_request(&mut engine).await;
+    assert_eq!(marker["method"], "Browser.getVersion");
+    engine.reply(request_id(&marker), json!({ "userAgent": "fake" }));
+    assert_eq!(next_frame(&mut owner).await["id"], 310);
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 2, 2));
+    // 迟到 success 与 error 只结算各自的原 identity，不删除另一条 unknown。
+    engine.reply(request_id(&first), json!({}));
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.2 != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late success settles one identity");
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 1, 1));
+    engine.push(json!({
+      "id": request_id(&second),
+      "error": { "code": -32000, "message": "late detach failed" }
+    }));
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.2 != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late error settles the other identity");
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    // 原身份结算后守卫解除；fresh session 仍按有界 quarantine 清理。
+    let fresh = attached_event("unknown-session-0", "unknown-fresh", "unknown-page-fresh");
+    assert_eq!(receive_ack(&broker, &fresh.to_string()).await, (true, 256));
+    let fresh_detach = next_request(&mut engine).await;
+    assert_eq!(fresh_detach["method"], "Target.detachFromTarget");
+    assert_eq!(fresh_detach["params"]["sessionId"], "unknown-fresh");
+    assert_eq!(
+        receive_ack(&broker, &detached_event("unknown-fresh").to_string()).await,
+        (true, 256)
+    );
+    engine.reply(request_id(&fresh_detach), json!({}));
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.3 != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fresh detach settles");
+    let (controller, epoch) = broker
+        .control("bob".to_string(), true)
+        .await
+        .ok()
+        .expect("control after unknown cleanup");
+    assert_eq!((controller.as_str(), epoch), ("bob", 2));
+    let mut flushing = Box::pin(broker.flush());
+    assert!(flushing.as_mut().now_or_never().is_none());
+    let _ = broker.session().await;
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    let status = timeout(WAIT, flushing)
+        .await
+        .expect("flush completes")
+        .expect("flush ok");
+    drop(status);
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    assert_eq!(budget.used(), baseline);
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn attached_event_ignores_same_session_after_capacity_or_owner_changes() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut owner = connect(&broker, Endpoint::Browser, Role::Viewer, "owner").await;
+    fill_attachments(&mut engine, &broker, &mut owner, "cap", 256).await;
+    let budget = broker.payload_budget();
+    let baseline = budget.used();
+    engine.event(attached_event("cap-session-0", "cap-overflow", "cap-page"));
+    let detach = next_request(&mut engine).await;
+    assert_eq!(detach["method"], "Target.detachFromTarget");
+    assert_eq!(detach["params"]["sessionId"], "cap-overflow");
+    assert_eq!(
+        receive_ack(&broker, &detached_event("cap-overflow").to_string()).await,
+        (true, 256)
+    );
+    // 释放一个容量槽，原父会话仍存活。
+    assert_eq!(
+        receive_ack(&broker, &detached_event("cap-session-1").to_string()).await,
+        (true, 255)
+    );
+    assert_eq!(
+        next_frame(&mut owner).await["method"],
+        "Target.detachedFromTarget"
+    );
+    let repeat = attached_event("cap-session-0", "cap-overflow", "cap-page").to_string();
+    assert_eq!(receive_ack(&broker, &repeat).await, (true, 255));
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 1));
+    // owner/epoch 变化：takeover 后由新 viewer 用自己的父会话解析同一 ID。
+    let (controller, epoch) = broker
+        .control("bob".to_string(), true)
+        .await
+        .ok()
+        .expect("control takeover");
+    assert_eq!((controller.as_str(), epoch), ("bob", 2));
+    let mut newcomer = connect(&broker, Endpoint::Browser, Role::Viewer, "newcomer").await;
+    send(
+        &newcomer,
+        &broker,
+        r#"{"id":400,"method":"Target.attachToTarget","params":{"targetId":"cap-parent-target","flatten":true}}"#,
+    )
+    .await;
+    let parent = next_request(&mut engine).await;
+    assert_eq!(parent["method"], "Target.attachToTarget");
+    engine.reply(request_id(&parent), json!({ "sessionId": "cap-parent" }));
+    assert_eq!(next_frame(&mut newcomer).await["id"], 400);
+    let repeat = attached_event("cap-parent", "cap-overflow", "cap-other-page").to_string();
+    assert_eq!(receive_ack(&broker, &repeat).await, (true, 256));
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 1));
+    send(
+        &newcomer,
+        &broker,
+        r#"{"id":401,"method":"DOM.getDocument","sessionId":"cap-overflow"}"#,
+    )
+    .await;
+    assert!(
+        message(&next_frame(&mut newcomer).await).contains("expired or belongs to another"),
+        "same ID must not be authorized to the new owner"
+    );
+    // 同 target 的合法不同 ID 仍按正常 attach 准入。
+    send(
+        &newcomer,
+        &broker,
+        r#"{"id":402,"method":"Target.attachToTarget","params":{"targetId":"cap-page","flatten":true}}"#,
+    )
+    .await;
+    let replacement = next_request(&mut engine).await;
+    assert_eq!(replacement["method"], "Target.attachToTarget");
+    engine.reply(
+        request_id(&replacement),
+        json!({ "sessionId": "cap-replacement" }),
+    );
+    assert_eq!(
+        next_frame(&mut newcomer).await["result"]["sessionId"],
+        "cap-replacement"
+    );
+    assert_eq!(
+        receive_ack(&broker, &detached_event("cap-parent").to_string()).await,
+        (true, 256)
+    );
+    assert_eq!(
+        next_frame(&mut newcomer).await["method"],
+        "Target.detachedFromTarget"
+    );
+    assert_eq!(
+        receive_ack(&broker, &detached_event("cap-replacement").to_string()).await,
+        (true, 255)
+    );
+    assert_eq!(
+        next_frame(&mut newcomer).await["method"],
+        "Target.detachedFromTarget"
+    );
+    engine.reply(request_id(&detach), json!({}));
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.3 != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cleanup detach settles");
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    let mut flushing = Box::pin(broker.flush());
+    assert!(flushing.as_mut().now_or_never().is_none());
+    let _ = broker.session().await;
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    let status = timeout(WAIT, flushing)
+        .await
+        .expect("flush completes")
+        .expect("flush ok");
+    drop(status);
+    // 补回与 cap-session-1 等长的 attachment，使结尾资源与 baseline 同态。
+    send(
+        &owner,
+        &broker,
+        r#"{"id":403,"method":"Target.attachToTarget","params":{"targetId":"cap-target-x","flatten":true}}"#,
+    )
+    .await;
+    let restore = next_request(&mut engine).await;
+    assert_eq!(restore["method"], "Target.attachToTarget");
+    engine.reply(
+        request_id(&restore),
+        json!({ "sessionId": "cap-session-x" }),
+    );
+    assert_eq!(next_frame(&mut owner).await["id"], 403);
+    assert_eq!(budget.used(), baseline);
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn attached_event_with_pending_retirement_detach_is_ignored() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut retiring = connect(&broker, Endpoint::Browser, Role::Viewer, "retiring").await;
+    send(
+        &retiring,
+        &broker,
+        r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"retire-target","flatten":true}}"#,
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(
+        request_id(&attach),
+        json!({ "sessionId": "retire-session" }),
+    );
+    assert_eq!(next_frame(&mut retiring).await["id"], 1);
+    let mut newcomer = connect(&broker, Endpoint::Browser, Role::Viewer, "newcomer").await;
+    send(
+        &newcomer,
+        &broker,
+        r#"{"id":2,"method":"Target.attachToTarget","params":{"targetId":"retire-parent-target","flatten":true}}"#,
+    )
+    .await;
+    let parent = next_request(&mut engine).await;
+    engine.reply(request_id(&parent), json!({ "sessionId": "retire-parent" }));
+    assert_eq!(next_frame(&mut newcomer).await["id"], 2);
+    let budget = broker.payload_budget();
+    broker.closed(retiring.id);
+    let detach = next_request(&mut engine).await;
+    assert_eq!(detach["method"], "Target.detachFromTarget");
+    assert_eq!(detach["params"]["sessionId"], "retire-session");
+    assert_eq!(
+        receive_ack(&broker, &detached_event("retire-session").to_string()).await,
+        (true, 1)
+    );
+    let repeat = attached_event("retire-parent", "retire-session", "retire-target").to_string();
+    assert_eq!(receive_ack(&broker, &repeat).await, (true, 1));
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 1));
+    send(
+        &newcomer,
+        &broker,
+        r#"{"id":10,"method":"DOM.getDocument","sessionId":"retire-session"}"#,
+    )
+    .await;
+    assert!(
+        message(&next_frame(&mut newcomer).await).contains("expired or belongs to another"),
+        "retirement window must not authorize a new owner"
+    );
+    send(
+        &newcomer,
+        &broker,
+        r#"{"id":11,"method":"Browser.getVersion"}"#,
+    )
+    .await;
+    let marker = next_request(&mut engine).await;
+    assert_eq!(marker["method"], "Browser.getVersion");
+    engine.reply(request_id(&marker), json!({ "userAgent": "fake" }));
+    assert_eq!(next_frame(&mut newcomer).await["id"], 11);
+    engine.reply(request_id(&detach), json!({}));
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.3 != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retirement detach settles");
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    let baseline = budget.used();
+    let (controller, epoch) = broker
+        .control("bob".to_string(), true)
+        .await
+        .ok()
+        .expect("control after retirement cleanup");
+    assert_eq!((controller.as_str(), epoch), ("bob", 2));
+    let mut flushing = Box::pin(broker.flush());
+    assert!(flushing.as_mut().now_or_never().is_none());
+    let _ = broker.session().await;
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    let status = timeout(WAIT, flushing)
+        .await
+        .expect("flush completes")
+        .expect("flush ok");
+    drop(status);
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    assert_eq!(budget.used(), baseline);
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn attached_event_with_unknown_retirement_detach_is_ignored() {
+    let mut engine = fake_engine().await;
+    let broker = broker_with_deadlines(
+        &engine,
+        Duration::from_secs(120),
+        Duration::from_millis(400),
+    )
+    .await;
+    let mut retiring = connect(&broker, Endpoint::Browser, Role::Viewer, "retiring").await;
+    send(
+        &retiring,
+        &broker,
+        r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"retire-target","flatten":true}}"#,
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(
+        request_id(&attach),
+        json!({ "sessionId": "retire-session" }),
+    );
+    assert_eq!(next_frame(&mut retiring).await["id"], 1);
+    let mut newcomer = connect(&broker, Endpoint::Browser, Role::Viewer, "newcomer").await;
+    send(
+        &newcomer,
+        &broker,
+        r#"{"id":2,"method":"Target.attachToTarget","params":{"targetId":"retire-parent-target","flatten":true}}"#,
+    )
+    .await;
+    let parent = next_request(&mut engine).await;
+    engine.reply(request_id(&parent), json!({ "sessionId": "retire-parent" }));
+    assert_eq!(next_frame(&mut newcomer).await["id"], 2);
+    let budget = broker.payload_budget();
+    broker.closed(retiring.id);
+    let detach = next_request(&mut engine).await;
+    assert_eq!(detach["method"], "Target.detachFromTarget");
+    assert_eq!(detach["params"]["sessionId"], "retire-session");
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.2 != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retirement detach becomes unknown");
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 1, 1));
+    assert_eq!(
+        receive_ack(&broker, &detached_event("retire-session").to_string()).await,
+        (true, 1)
+    );
+    let repeat = attached_event("retire-parent", "retire-session", "retire-target").to_string();
+    assert_eq!(receive_ack(&broker, &repeat).await, (true, 1));
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 1, 1));
+    let error = broker
+        .flush()
+        .await
+        .err()
+        .expect("unknown retirement blocks flush");
+    assert_eq!(error, "previous request outcome is unknown");
+    send(
+        &newcomer,
+        &broker,
+        r#"{"id":20,"method":"Browser.getVersion"}"#,
+    )
+    .await;
+    let marker = next_request(&mut engine).await;
+    assert_eq!(marker["method"], "Browser.getVersion");
+    engine.reply(request_id(&marker), json!({ "userAgent": "fake" }));
+    assert_eq!(next_frame(&mut newcomer).await["id"], 20);
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 1, 1));
+    send(
+        &newcomer,
+        &broker,
+        r#"{"id":21,"method":"DOM.getDocument","sessionId":"retire-session"}"#,
+    )
+    .await;
+    assert!(
+        message(&next_frame(&mut newcomer).await).contains("expired or belongs to another"),
+        "unknown retirement must not authorize a new owner"
+    );
+    // 迟到 error 只结算原 retirement 身份；显式 control 才允许重试。
+    engine.push(json!({
+      "id": request_id(&detach),
+      "error": { "code": -32000, "message": "late detach failed" }
+    }));
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.2 != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late retirement error settles");
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    assert_eq!(
+        receive_ack(&broker, r#"{"method":"Unknown.opaque"}"#)
+            .await
+            .1,
+        1
+    );
+    let (controller, epoch) = broker
+        .control("bob".to_string(), true)
+        .await
+        .ok()
+        .expect("control retries the confirmed failure");
+    assert_eq!((controller.as_str(), epoch), ("bob", 2));
+    send(
+        &newcomer,
+        &broker,
+        r#"{"id":22,"method":"Browser.getVersion"}"#,
+    )
+    .await;
+    let marker = next_request(&mut engine).await;
+    assert_eq!(marker["method"], "Browser.getVersion");
+    engine.reply(request_id(&marker), json!({ "userAgent": "fake" }));
+    assert_eq!(next_frame(&mut newcomer).await["id"], 22);
+    let baseline = budget.used();
+    let mut flushing = Box::pin(broker.flush());
+    assert!(flushing.as_mut().now_or_never().is_none());
+    let _ = broker.session().await;
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    let status = timeout(WAIT, flushing)
+        .await
+        .expect("flush completes")
+        .expect("flush ok");
+    drop(status);
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    assert_eq!(budget.used(), baseline);
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
 async fn quarantine_timeout_blocks_flush_until_late_success() {
     let mut engine = fake_engine().await;
     let broker =
@@ -5733,14 +6323,25 @@ async fn quarantined_overflow_survives_cleanup_timeout_and_detached_event() {
     let second = next_request(&mut engine).await;
     assert_eq!(second["method"], "Target.detachFromTarget");
     assert_eq!(second["params"]["sessionId"], "overflow-a");
-    engine.event(json!({
-      "method": "Target.detachedFromTarget",
-      "params": { "sessionId": "overflow-a" }
-    }));
-    engine.event(overflow.clone());
-    let third = next_request(&mut engine).await;
-    assert_eq!(third["method"], "Target.detachFromTarget");
-    assert_eq!(third["params"]["sessionId"], "overflow-a");
+    // 权威 detached 已移除 quarantine，但 second detach 仍按同 ID 在途；不派第三个。
+    assert_eq!(
+        receive_ack(&broker, &detached_event("overflow-a").to_string()).await,
+        (true, 256)
+    );
+    assert_eq!(
+        receive_ack(&broker, &overflow.to_string()).await,
+        (true, 256)
+    );
+    send(
+        &other,
+        &broker,
+        r#"{"id":10,"method":"Browser.getVersion"}"#,
+    )
+    .await;
+    let marker = next_request(&mut engine).await;
+    assert_eq!(marker["method"], "Browser.getVersion");
+    engine.reply(request_id(&marker), json!({ "userAgent": "fake" }));
+    assert_eq!(next_frame(&mut other).await["id"], 10);
     send(&other, &broker, r#"{"id":1,"method":"Browser.getVersion"}"#).await;
     let version = next_request(&mut engine).await;
     assert_eq!(version["method"], "Browser.getVersion");
@@ -5759,7 +6360,15 @@ async fn quarantined_overflow_survives_cleanup_timeout_and_detached_event() {
         message(&rejected)
     );
     expect_no_request(&mut engine).await;
-    engine.reply(request_id(&third), json!({}));
+    engine.reply(request_id(&second), json!({}));
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.3 != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("second detach settles");
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
     engine.kill();
     assert!(!broker.wait_terminal().await);
 }
