@@ -288,20 +288,27 @@ struct ControlArgs {
 }
 
 fn parse_control_args(args: &[OsString]) -> HostResult<ControlArgs> {
+    // 旧 CLI 在解析前全局扫描：--version 优先于 --help/-h，值位置的同名 token 也生效。
+    // 数值消费和未知参数错误必须先让位于这一预扫描。
+    if args
+        .iter()
+        .any(|argument| argument.to_string_lossy() == "--version")
+    {
+        println!("kitesurf {VERSION}");
+        std::process::exit(0);
+    }
+    if args.iter().any(|argument| {
+        argument.to_string_lossy() == "--help" || argument.to_string_lossy() == "-h"
+    }) {
+        print!("{HELP}");
+        std::process::exit(0);
+    }
     let mut owner = None;
     let mut takeover = false;
     let mut port = 8787;
     let mut rest = args.iter();
     while let Some(argument) = rest.next() {
         let argument = argument.to_string_lossy().to_string();
-        if argument == "--help" || argument == "-h" {
-            print!("{HELP}");
-            std::process::exit(0);
-        }
-        if argument == "--version" {
-            println!("kitesurf {VERSION}");
-            std::process::exit(0);
-        }
         let mut take = |flag: &str| -> HostResult<String> {
             rest.next()
                 .map(|value| value.to_string_lossy().to_string())

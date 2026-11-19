@@ -170,6 +170,43 @@ function hermeticTests() {
     assert.equal(controlVersion.stderr, "");
   });
 
+  test(
+    "help and version are recognized before any control value",
+    { timeout: 30_000 },
+    async (t) => {
+      const fixture = await listen(t, (record) => {
+        record.response.writeHead(200, { "content-type": "application/json" });
+        record.response.end(JSON.stringify({ controller: "fixture", controlEpoch: 2 }));
+      });
+      const port = String(fixture.port);
+      const topLevelHelp = await runCli(["--help"]);
+      assert.equal(topLevelHelp.code, 0);
+      const help = topLevelHelp.stdout;
+      assert.match(help, /^Kitesurf native local host 0\.5\.0\n/);
+      assert.match(help, /kitesurf-native control --owner NAME \[--takeover\] \[--port 8787\]\n/);
+      const version = "kitesurf 0.5.0\n";
+      const cases = [
+        ["--owner", "--help", "--port", port],
+        ["--owner", "--version", "--port", port],
+        ["--port", "--help"],
+        ["--bogus", "--help"],
+        ["-h"],
+        ["--help", "--version"],
+        ["--owner", "alice", "--version", "--help"],
+      ];
+      for (const args of cases) {
+        const expected = args.includes("--version") ? version : help;
+        const result = await runCli(["control", ...args]);
+        const observed = fixture.seen.map(({ method, url, body }) => ({ method, url, body }));
+        assert.equal(result.killed, false);
+        assert.equal(result.code, 0, `${args.join(" ")}: ${result.stderr}`);
+        assert.equal(result.stderr, "");
+        assert.equal(result.stdout, expected, `${args.join(" ")} sent ${JSON.stringify(observed)}`);
+      }
+      assert.equal(fixture.seen.length, 0, "help/version must not reach the host");
+    },
+  );
+
   test("control sends one POST with takeover false by default", { timeout: 30_000 }, async (t) => {
     const response = { controller: "alice", controlEpoch: 2 };
     const fixture = await listen(t, (record) => {
@@ -552,6 +589,12 @@ function engineTests() {
       assert.equal(engineExit.fatal, false);
       assert.equal(engineExit.uncaught, 0);
       assert.equal(engineExit.internalErrors, 0);
+      const shutdown = events.find((event) => event.kind === "shutdown");
+      assert.ok(shutdown, "the host shutdown event was not recorded");
+      assert.equal(shutdown.clean, true);
+      assert.equal(shutdown.fonts, true);
+      assert.equal(shutdown.dirRemoved, true);
+      assert.equal(shutdown.exit, "code 0");
 
       assert.equal(existsSync(runDir), false, "the host run directory survived shutdown");
       assert.equal(processExists(engineStart.pid), false, "workerd was not reaped");
