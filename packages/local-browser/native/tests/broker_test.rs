@@ -2986,6 +2986,124 @@ async fn drain_deadline_releases_barrier_without_losing_inflight_work() {
 }
 
 #[tokio::test]
+async fn viewer_unknown_blocks_flush_until_the_late_reply() {
+    let mut engine = fake_engine().await;
+    let broker =
+        broker_with_deadlines(&engine, Duration::from_millis(150), Duration::from_secs(30)).await;
+    let mut viewer = connect(&broker, Endpoint::Browser, Role::Viewer, "viewer").await;
+    send(
+        &viewer,
+        &broker,
+        r#"{"id":1,"method":"Browser.getVersion"}"#,
+    )
+    .await;
+    let version = next_request(&mut engine).await;
+    assert_eq!(version["method"], "Browser.getVersion");
+    let expired = next_frame(&mut viewer).await;
+    assert!(
+        message(&expired).contains("outcome may be unknown"),
+        "{expired}"
+    );
+    // 只读请求超时同样保留 unknown 与逻辑槽；actor 快照是准入证据。
+    assert_eq!(broker.budget_snapshot().await, (1, 0, 1, 0));
+    let mut flushing = Box::pin(broker.flush());
+    assert!(flushing.as_mut().now_or_never().is_none());
+    // 未确认结果固定失败，快照不得发往上游。
+    expect_no_request(&mut engine).await;
+    let error = timeout(WAIT, flushing)
+        .await
+        .expect("flush must fail without waiting for the viewer reply")
+        .err()
+        .expect("viewer unknown blocks flush");
+    assert_eq!(error, "previous request outcome is unknown");
+    assert_eq!(broker.budget_snapshot().await, (1, 0, 1, 0));
+    // 迟到回复按 upstream id 结算，新 flush 不重放旧的只读请求。
+    engine.reply(request_id(&version), json!({ "product": "late" }));
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await != (0, 0, 0, 0) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("viewer unknown settles on the late reply");
+    let mut flushing = Box::pin(broker.flush());
+    assert!(flushing.as_mut().now_or_never().is_none());
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    timeout(WAIT, flushing)
+        .await
+        .expect("flush completes")
+        .expect("flush ok");
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn viewer_unknown_restricts_close_within_the_client_deadline() {
+    let mut engine = fake_engine().await;
+    // 沿用既有契约：unknown 在 client deadline 受限，Drain 仍用 internal deadline。
+    let broker = broker_with_deadlines(
+        &engine,
+        Duration::from_millis(150),
+        Duration::from_millis(300),
+    )
+    .await;
+    let mut viewer = connect(&broker, Endpoint::Browser, Role::Viewer, "viewer").await;
+    let mut closed = broker.closed_watch();
+    send(
+        &viewer,
+        &broker,
+        r#"{"id":1,"method":"Browser.getVersion"}"#,
+    )
+    .await;
+    let version = next_request(&mut engine).await;
+    assert_eq!(version["method"], "Browser.getVersion");
+    let expired = next_frame(&mut viewer).await;
+    assert!(
+        message(&expired).contains("outcome may be unknown"),
+        "{expired}"
+    );
+    assert_eq!(broker.budget_snapshot().await, (1, 0, 1, 0));
+    let mut closing = Box::pin(broker.close(CloseKind::Http, None, None, None));
+    assert!(closing.as_mut().now_or_never().is_none());
+    // 有界返回固定受限结果，而不是等迟到回复才推进。
+    let error = timeout(WAIT, closing)
+        .await
+        .expect("close must settle within the client deadline")
+        .expect_err("unknown outcome restricts close");
+    assert_eq!(error, "Browser close outcome unknown");
+    // 受限期间 unknown 与槽保留，新 control 不能越过。
+    assert_eq!(broker.budget_snapshot().await, (1, 0, 1, 0));
+    let blocked = broker
+        .control("bob".to_string(), true)
+        .await
+        .expect_err("closing must reject new control");
+    assert_eq!(blocked.message(), "Browser is closing");
+    expect_no_request(&mut engine).await;
+    // 迟到回复结算后才按原契约继续，且不重放旧的只读请求。
+    engine.reply(request_id(&version), json!({ "product": "late" }));
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    let browser = next_request(&mut engine).await;
+    assert_eq!(browser["method"], "Browser.close");
+    engine.reply(request_id(&browser), json!({}));
+    assert_eq!(
+        next_close(&mut viewer).await,
+        (1000, "Browser closed".to_string())
+    );
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    broker.writer_gone(viewer.id);
+    timeout(WAIT, closed.changed())
+        .await
+        .expect("closed watch")
+        .expect("closed sender");
+    assert!(*closed.borrow());
+}
+
+#[tokio::test]
 async fn flush_drains_writes_and_reports_profile_status() {
     let mut engine = fake_engine().await;
     let broker = broker(&engine).await;

@@ -1045,7 +1045,6 @@ struct Unknown {
     _internal: Option<Arc<InternalRequestLease>>,
     _request: Option<Arc<RequestLease>>,
     client: Option<ClientId>,
-    role: Option<Role>,
     epoch: u64,
     seq: Option<u64>,
     method: String,
@@ -2784,7 +2783,6 @@ impl Broker {
         self.release_pending(&pending);
         let message = format!("CDP timeout: {}; outcome may be unknown", pending.method);
         let client = pending.client;
-        let role = pending.role;
         let external_id = pending.external_id;
         let explicit_session = pending.explicit_session.clone();
         let epoch = pending.epoch;
@@ -2801,7 +2799,6 @@ impl Broker {
                         _request: pending.request.clone(),
                         _internal: pending.internal.clone(),
                         client,
-                        role,
                         epoch,
                         seq: pending.seq,
                         method,
@@ -2828,7 +2825,6 @@ impl Broker {
                             _request: pending.request.clone(),
                             _internal: pending.internal.clone(),
                             client,
-                            role,
                             epoch,
                             seq: pending.seq,
                             method,
@@ -2842,7 +2838,6 @@ impl Broker {
                             _request: pending.request.clone(),
                             _internal: pending.internal.clone(),
                             client,
-                            role,
                             epoch,
                             seq: pending.seq,
                             method,
@@ -2861,7 +2856,6 @@ impl Broker {
                             _request: pending.request.clone(),
                             _internal: pending.internal.clone(),
                             client: Some(client),
-                            role,
                             epoch,
                             seq: pending.seq,
                             method,
@@ -2879,10 +2873,6 @@ impl Broker {
                     let managed_client = active.work.client;
                     let managed_external = active.work.external_id;
                     let managed_session = active.work.explicit_session.clone();
-                    let managed_role = self
-                        .clients
-                        .get(&managed_client)
-                        .map_or(role, |state| Some(state.role));
                     let target = match &active.stage {
                         // backfill 的 work 是 setAutoAttach，候选 target 只在 stage 里。
                         ManagedStage::BackfillAttach {
@@ -2907,7 +2897,6 @@ impl Broker {
                             _request: pending.request.clone(),
                             _internal: pending.internal.clone(),
                             client: Some(managed_client),
-                            role: managed_role,
                             epoch,
                             seq: pending.seq,
                             method,
@@ -2940,7 +2929,6 @@ impl Broker {
                             _request: pending.request.clone(),
                             _internal: pending.internal.clone(),
                             client: Some(retire_client),
-                            role: Some(Role::Controller),
                             epoch,
                             seq: pending.seq,
                             method,
@@ -2964,7 +2952,6 @@ impl Broker {
                             _request: pending.request.clone(),
                             _internal: pending.internal.clone(),
                             client: Some(retire_client),
-                            role: Some(Role::Controller),
                             epoch,
                             seq: pending.seq,
                             method,
@@ -2991,7 +2978,6 @@ impl Broker {
                         _request: pending.request.clone(),
                         _internal: pending.internal.clone(),
                         client: None,
-                        role: None,
                         epoch: detach_epoch,
                         seq: pending.seq,
                         method,
@@ -3020,7 +3006,6 @@ impl Broker {
                             _request: pending.request.clone(),
                             _internal: pending.internal.clone(),
                             client,
-                            role,
                             epoch,
                             seq: pending.seq,
                             method,
@@ -4569,10 +4554,9 @@ impl Broker {
             || self.unknown_blocks_control()
     }
 
+    /// 任何未结算的 upstream 结果都阻断屏障；只读 viewer 请求不是例外。
     fn outcome_unknown(&self) -> bool {
-        self.unknown
-            .values()
-            .any(|unknown| unknown.role != Some(Role::Viewer))
+        !self.unknown.is_empty()
     }
 
     fn start_flush(
@@ -4806,9 +4790,6 @@ impl Broker {
                 }
                 self.close_restricted("previous request outcome is unknown".to_string());
             }
-            return;
-        }
-        if !self.unknown.is_empty() {
             return;
         }
         let stage = match state.stage {
@@ -5110,10 +5091,12 @@ impl Broker {
         if self.attachments.quarantine_count() > 0 {
             return false;
         }
-        // 相关 unknown 与 pending 一样按 cutoff 保留，只读 viewer 结果不参与 drain。
-        if self.unknown.values().any(|unknown| {
-            unknown.role != Some(Role::Viewer) && unknown.seq.is_none_or(|seq| seq <= cutoff)
-        }) {
+        // 相关 unknown 与 pending 一样按 cutoff 保留；只读结果同样未结算，不能绕过。
+        if self
+            .unknown
+            .values()
+            .any(|unknown| unknown.seq.is_none_or(|seq| seq <= cutoff))
+        {
             return false;
         }
         if self.management_queue.iter().any(|work| {
