@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
@@ -1168,6 +1168,20 @@ async fn expect_no_request(engine: &mut FakeEngine) {
     if let Ok(Some(value)) = timeout(QUIET, engine.receive.recv()).await {
         panic!("unexpected upstream request: {value}");
     }
+}
+
+// frames 与 commands 是两个队列；只能以 slot 计数作为准入 ack，不能以 send 返回为证。
+async fn await_request_slots(broker: &BrokerHandle, expected: usize) {
+    timeout(WAIT, async {
+        loop {
+            if broker.budget_snapshot().await.0 == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("request admission ack");
 }
 
 async fn expect_silence(client: &mut TestClient) {
@@ -2555,6 +2569,420 @@ async fn control_conflict_and_same_owner_epoch_bump() {
     engine.reply(request_id(&request), json!({ "targetInfos": [] }));
     let reply = next_frame(&mut next).await;
     assert_eq!(reply["id"], 1);
+}
+
+#[tokio::test]
+async fn flush_drains_page_queue_admitted_before_cutoff() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut page = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page".into(),
+        },
+        Role::Viewer,
+        "viewer",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["method"], "Target.attachToTarget");
+    send(&page, &broker, r#"{"id":2,"method":"Page.enable"}"#).await;
+    await_request_slots(&broker, 1).await;
+    // 单次 poll 已把 Flush 送入 actor 命令队列；session 往返确认它先于后续帧被处理。
+    let mut flushing = Box::pin(broker.flush());
+    assert!(flushing.as_mut().now_or_never().is_none());
+    assert!(broker.session().await.expect("actor session").alive);
+    send(&page, &broker, r#"{"id":3,"method":"Page.disable"}"#).await;
+    let rejected = next_frame(&mut page).await;
+    assert_eq!(rejected["id"], 3);
+    assert_eq!(message(&rejected), "Browser is flushing");
+    expect_no_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({ "sessionId": "primary" }));
+    let queued = next_request(&mut engine).await;
+    assert_eq!(queued["method"], "Page.enable");
+    // 队列内页面命令未完成前不得发送 flush 快照。
+    expect_no_request(&mut engine).await;
+    engine.reply(request_id(&queued), json!({}));
+    assert_eq!(next_frame(&mut page).await["id"], 2);
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    timeout(WAIT, flushing)
+        .await
+        .expect("flush completes")
+        .expect("flush ok");
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn close_drains_page_queue_admitted_before_cutoff() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut page = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page".into(),
+        },
+        Role::Viewer,
+        "viewer",
+    )
+    .await;
+    let mut closed = broker.closed_watch();
+    let attach = next_request(&mut engine).await;
+    send(&page, &broker, r#"{"id":2,"method":"Page.enable"}"#).await;
+    await_request_slots(&broker, 1).await;
+    let mut closing = Box::pin(broker.close(CloseKind::Http, None, None, None));
+    assert!(closing.as_mut().now_or_never().is_none());
+    assert!(broker.session().await.expect("actor session").alive);
+    send(&page, &broker, r#"{"id":3,"method":"Page.disable"}"#).await;
+    let rejected = next_frame(&mut page).await;
+    assert_eq!(message(&rejected), "Browser is closing");
+    expect_no_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({ "sessionId": "primary" }));
+    let queued = next_request(&mut engine).await;
+    assert_eq!(queued["method"], "Page.enable");
+    expect_no_request(&mut engine).await;
+    engine.reply(request_id(&queued), json!({}));
+    assert_eq!(next_frame(&mut page).await["id"], 2);
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    let browser = next_method(&mut engine, "Browser.close").await;
+    engine.reply(request_id(&browser), json!({}));
+    timeout(WAIT, closing)
+        .await
+        .expect("close completes")
+        .expect("close ok");
+    assert_eq!(
+        next_close(&mut page).await,
+        (1000, "Browser closed".to_string())
+    );
+    // 成功应答与 Close frame 之后仍需 writer_gone 才能 finalize。
+    tokio::time::timeout(QUIET, closed.changed())
+        .await
+        .expect_err("finalize must wait for writer_gone");
+    assert!(!*closed.borrow());
+    broker.writer_gone(page.id);
+    timeout(WAIT, closed.changed())
+        .await
+        .expect("closed watch")
+        .expect("closed sender");
+    assert!(*closed.borrow());
+}
+
+#[tokio::test]
+async fn flush_dispatches_management_and_backfill_before_cutoff() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+    send(
+        &alice,
+        &broker,
+        r#"{"id":1,"method":"Target.setAutoAttach","params":{"autoAttach":true,"flatten":true}}"#,
+    )
+    .await;
+    let first = next_request(&mut engine).await;
+    assert_eq!(first["method"], "Target.setAutoAttach");
+    send(
+        &alice,
+        &broker,
+        r#"{"id":2,"method":"Target.setAutoAttach","params":{"autoAttach":false,"flatten":true}}"#,
+    )
+    .await;
+    await_request_slots(&broker, 2).await;
+    let mut flushing = Box::pin(broker.flush());
+    assert!(flushing.as_mut().now_or_never().is_none());
+    assert!(broker.session().await.expect("actor session").alive);
+    engine.reply(request_id(&first), json!({}));
+    let targets = next_request(&mut engine).await;
+    assert_eq!(targets["method"], "Target.getTargets");
+    engine.reply(request_id(&targets), json!({ "targetInfos": [] }));
+    assert_eq!(next_frame(&mut alice).await["id"], 1);
+    let second = next_request(&mut engine).await;
+    assert_eq!(second["method"], "Target.setAutoAttach");
+    assert_eq!(second["params"]["autoAttach"], false);
+    expect_no_request(&mut engine).await;
+    engine.reply(request_id(&second), json!({}));
+    assert_eq!(next_frame(&mut alice).await["id"], 2);
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    timeout(WAIT, flushing)
+        .await
+        .expect("flush completes")
+        .expect("flush ok");
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn flush_orders_queued_management_after_active_attach() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+    send(
+        &alice,
+        &broker,
+        r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"T1","flatten":true}}"#,
+    )
+    .await;
+    let first = next_request(&mut engine).await;
+    assert_eq!(first["method"], "Target.attachToTarget");
+    send(
+        &alice,
+        &broker,
+        r#"{"id":2,"method":"Target.attachToTarget","params":{"targetId":"T2","flatten":true}}"#,
+    )
+    .await;
+    // 两个 lease 都已占用，确认第二条 attach 在 flush 前完成准入并排队。
+    await_request_slots(&broker, 2).await;
+    let mut flushing = Box::pin(broker.flush());
+    assert!(flushing.as_mut().now_or_never().is_none());
+    assert!(broker.session().await.expect("actor session").alive);
+    send(
+        &alice,
+        &broker,
+        r#"{"id":3,"method":"Target.attachToTarget","params":{"targetId":"T3","flatten":true}}"#,
+    )
+    .await;
+    let rejected = next_frame(&mut alice).await;
+    assert_eq!(rejected["id"], 3);
+    assert_eq!(message(&rejected), "Browser is flushing");
+    expect_no_request(&mut engine).await;
+    // 严格顺序：A 完成后才派发 B，B 完成后才发送 flush 快照。
+    engine.reply(request_id(&first), json!({ "sessionId": "S1" }));
+    let second = next_request(&mut engine).await;
+    assert_eq!(second["method"], "Target.attachToTarget");
+    assert_eq!(second["params"]["targetId"], "T2");
+    expect_no_request(&mut engine).await;
+    engine.reply(request_id(&second), json!({ "sessionId": "S2" }));
+    assert_eq!(next_frame(&mut alice).await["id"], 1);
+    assert_eq!(next_frame(&mut alice).await["id"], 2);
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    timeout(WAIT, flushing)
+        .await
+        .expect("flush completes")
+        .expect("flush ok");
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn close_orders_queued_management_after_active_attach() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+    let mut closed = broker.closed_watch();
+    send(
+        &alice,
+        &broker,
+        r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"T1","flatten":true}}"#,
+    )
+    .await;
+    let first = next_request(&mut engine).await;
+    assert_eq!(first["method"], "Target.attachToTarget");
+    send(
+        &alice,
+        &broker,
+        r#"{"id":2,"method":"Target.attachToTarget","params":{"targetId":"T2","flatten":true}}"#,
+    )
+    .await;
+    await_request_slots(&broker, 2).await;
+    let mut closing = Box::pin(broker.close(CloseKind::Http, None, None, None));
+    assert!(closing.as_mut().now_or_never().is_none());
+    assert!(broker.session().await.expect("actor session").alive);
+    send(
+        &alice,
+        &broker,
+        r#"{"id":3,"method":"Target.attachToTarget","params":{"targetId":"T3","flatten":true}}"#,
+    )
+    .await;
+    let rejected = next_frame(&mut alice).await;
+    assert_eq!(rejected["id"], 3);
+    assert_eq!(message(&rejected), "Browser is closing");
+    expect_no_request(&mut engine).await;
+    engine.reply(request_id(&first), json!({ "sessionId": "S1" }));
+    let second = next_request(&mut engine).await;
+    assert_eq!(second["method"], "Target.attachToTarget");
+    assert_eq!(second["params"]["targetId"], "T2");
+    expect_no_request(&mut engine).await;
+    engine.reply(request_id(&second), json!({ "sessionId": "S2" }));
+    assert_eq!(next_frame(&mut alice).await["id"], 1);
+    assert_eq!(next_frame(&mut alice).await["id"], 2);
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    let browser = next_request(&mut engine).await;
+    assert_eq!(browser["method"], "Browser.close");
+    engine.reply(request_id(&browser), json!({}));
+    timeout(WAIT, closing)
+        .await
+        .expect("close completes")
+        .expect("close ok");
+    assert_eq!(
+        next_close(&mut alice).await,
+        (1000, "Browser closed".to_string())
+    );
+    broker.writer_gone(alice.id);
+    timeout(WAIT, closed.changed())
+        .await
+        .expect("closed watch")
+        .expect("closed sender");
+    assert!(*closed.borrow());
+}
+
+async fn overflow_quarantine(
+    engine: &mut FakeEngine,
+    broker: &BrokerHandle,
+) -> (TestClient, Value) {
+    let mut owner = connect(broker, Endpoint::Browser, Role::Viewer, "owner").await;
+    fill_attachments(engine, broker, &mut owner, "six", 256).await;
+    engine.event(json!({
+      "sessionId": "six-session-0",
+      "method": "Target.attachedToTarget",
+      "params": { "sessionId": "overflow-a", "targetInfo": { "targetId": "overflow-page-a" } }
+    }));
+    let detach = next_request(engine).await;
+    assert_eq!(detach["method"], "Target.detachFromTarget");
+    assert_eq!(detach["params"]["sessionId"], "overflow-a");
+    (owner, detach)
+}
+
+#[tokio::test]
+async fn flush_waits_for_inflight_quarantine_detach() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let (_owner, detach) = overflow_quarantine(&mut engine, &broker).await;
+    let mut flushing = Box::pin(broker.flush());
+    assert!(flushing.as_mut().now_or_never().is_none());
+    assert!(broker.session().await.expect("actor session").alive);
+    // 在途清理未确认前绝不发送 flush 快照。
+    expect_no_request(&mut engine).await;
+    engine.reply(request_id(&detach), json!({}));
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    timeout(WAIT, flushing)
+        .await
+        .expect("flush completes")
+        .expect("flush ok");
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn quarantine_timeout_blocks_flush_until_late_success() {
+    let mut engine = fake_engine().await;
+    let broker =
+        broker_with_deadlines(&engine, Duration::from_secs(30), Duration::from_millis(200)).await;
+    let (_owner, detach) = overflow_quarantine(&mut engine, &broker).await;
+    let error = broker
+        .flush()
+        .await
+        .err()
+        .expect("late cleanup blocks flush");
+    assert_eq!(error, "CDP cleanup could not be confirmed");
+    expect_no_request(&mut engine).await;
+    // 迟到成功仍按 upstream id 结算，随后新的显式 flush 可以成功。
+    engine.reply(request_id(&detach), json!({}));
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.2 != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("quarantine unknown settles");
+    let mut flushing = Box::pin(broker.flush());
+    assert!(flushing.as_mut().now_or_never().is_none());
+    assert!(broker.session().await.expect("actor session").alive);
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    timeout(WAIT, flushing)
+        .await
+        .expect("flush completes")
+        .expect("flush ok");
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn explicit_flush_retries_confirmed_quarantine_failure_once() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let (_owner, detach) = overflow_quarantine(&mut engine, &broker).await;
+    engine.raw(format!(
+        r#"{{"id":{},"error":{{"code":-32000,"message":"detach failed"}}}}"#,
+        request_id(&detach)
+    ));
+    // 内部 slot 归还即确认失败已结算；tick 不得自动重试。
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await.3 != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detach failure settles");
+    expect_no_request(&mut engine).await;
+    let mut flushing = Box::pin(broker.flush());
+    assert!(flushing.as_mut().now_or_never().is_none());
+    assert!(broker.session().await.expect("actor session").alive);
+    let retry = next_request(&mut engine).await;
+    assert_eq!(retry["method"], "Target.detachFromTarget");
+    assert_eq!(retry["params"]["sessionId"], "overflow-a");
+    engine.reply(request_id(&retry), json!({}));
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    timeout(WAIT, flushing)
+        .await
+        .expect("flush completes")
+        .expect("flush ok");
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn drain_deadline_releases_barrier_without_losing_inflight_work() {
+    let mut engine = fake_engine().await;
+    // 客户端请求持 client deadline；drain 只用更短的 internal deadline。
+    let broker =
+        broker_with_deadlines(&engine, Duration::from_secs(30), Duration::from_millis(200)).await;
+    let mut alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+    send(
+        &alice,
+        &broker,
+        r#"{"id":1,"method":"Page.navigate","params":{"url":"about:blank"}}"#,
+    )
+    .await;
+    let navigate = next_request(&mut engine).await;
+    assert_eq!(navigate["method"], "Page.navigate");
+    let error = broker.flush().await.err().expect("drain must time out");
+    assert_eq!(error, "Browser drain timed out");
+    // 固定失败不发送快照，也不清除原请求或重新准入。
+    expect_no_request(&mut engine).await;
+    assert!(broker.session().await.expect("actor session").alive);
+    engine.reply(request_id(&navigate), json!({ "loaderId": "late" }));
+    let reply = next_frame(&mut alice).await;
+    assert_eq!(reply["id"], 1);
+    assert_eq!(reply["result"]["loaderId"], "late");
+    expect_no_request(&mut engine).await;
+    // 屏障已释放；新的显式 flush 不再重放原工作。
+    let mut flushing = Box::pin(broker.flush());
+    assert!(flushing.as_mut().now_or_never().is_none());
+    assert!(broker.session().await.expect("actor session").alive);
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    timeout(WAIT, flushing)
+        .await
+        .expect("flush completes")
+        .expect("flush ok");
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
 }
 
 #[tokio::test]

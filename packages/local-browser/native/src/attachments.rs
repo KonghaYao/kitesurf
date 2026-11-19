@@ -32,13 +32,21 @@ struct Intent {
     _payload: PayloadLease,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuarantineState {
+    Ready,
+    InFlight,
+    AwaitingLate,
+    ConfirmedFailure,
+}
+
 pub struct Quarantine {
     pub session: String,
     pub target: String,
     pub client: ClientId,
     pub epoch: u64,
     pub pending: Option<u64>,
-    pub blocked: bool,
+    pub state: QuarantineState,
     _payload: PayloadLease,
 }
 
@@ -228,34 +236,130 @@ impl Attachments {
                 client,
                 epoch,
                 pending: None,
-                blocked: false,
+                state: QuarantineState::Ready,
             },
         );
         QuarantineResult::Recorded
     }
 
-    pub fn next_quarantine(&self) -> Option<(String, ClientId)> {
+    pub fn next_quarantine(&self) -> Option<(String, ClientId, u64)> {
         self.quarantine
             .values()
-            .find(|entry| entry.pending.is_none() && !entry.blocked)
-            .map(|entry| (entry.session.clone(), entry.client))
+            .find(|entry| entry.pending.is_none() && entry.state == QuarantineState::Ready)
+            .map(|entry| (entry.session.clone(), entry.client, entry.epoch))
     }
 
-    pub fn set_quarantine_pending(&mut self, session: &str, pending: Option<u64>) -> bool {
+    /// 发送成功后才进入 InFlight；身份不匹配时不改写记录。
+    pub fn mark_quarantine_sent(
+        &mut self,
+        session: &str,
+        upstream: u64,
+        client: ClientId,
+        epoch: u64,
+    ) -> bool {
         let Some(entry) = self.quarantine.get_mut(session) else {
             return false;
         };
-        entry.pending = pending;
+        if entry.client != client || entry.epoch != epoch || entry.state != QuarantineState::Ready {
+            return false;
+        }
+        entry.pending = Some(upstream);
+        entry.state = QuarantineState::InFlight;
         true
     }
 
-    pub fn block_quarantine(&mut self, session: &str) -> bool {
+    /// 超时只把精确匹配的 InFlight 转为等待迟到结果，保留 upstream 身份。
+    pub fn mark_quarantine_awaiting(
+        &mut self,
+        session: &str,
+        upstream: u64,
+        client: ClientId,
+        epoch: u64,
+    ) -> bool {
         let Some(entry) = self.quarantine.get_mut(session) else {
             return false;
         };
+        if entry.client != client
+            || entry.epoch != epoch
+            || entry.state != QuarantineState::InFlight
+            || entry.pending != Some(upstream)
+        {
+            return false;
+        }
+        entry.state = QuarantineState::AwaitingLate;
+        true
+    }
+
+    /// 成功只释放匹配 upstream/client/epoch 的记录，不碰其他 session。
+    pub fn finish_quarantine_success(
+        &mut self,
+        session: &str,
+        upstream: u64,
+        client: ClientId,
+        epoch: u64,
+    ) -> Option<Quarantine> {
+        let matches = self.quarantine.get(session).is_some_and(|entry| {
+            entry.client == client && entry.epoch == epoch && entry.pending == Some(upstream)
+        });
+        matches.then(|| self.quarantine.remove(session)).flatten()
+    }
+
+    /// 明确失败保留清理身份，等待新的显式 flush/close 单次重试。
+    pub fn finish_quarantine_failure(
+        &mut self,
+        session: &str,
+        upstream: u64,
+        client: ClientId,
+        epoch: u64,
+    ) -> bool {
+        let Some(entry) = self.quarantine.get_mut(session) else {
+            return false;
+        };
+        if entry.client != client || entry.epoch != epoch || entry.pending != Some(upstream) {
+            return false;
+        }
         entry.pending = None;
-        entry.blocked = true;
+        entry.state = QuarantineState::ConfirmedFailure;
         true
+    }
+
+    /// 只有新的显式屏障可以复活确认失败；tick 与在途回复不得自动重试。
+    pub fn retry_quarantine(&mut self, session: &str, client: ClientId, epoch: u64) -> bool {
+        let Some(entry) = self.quarantine.get_mut(session) else {
+            return false;
+        };
+        if entry.client != client || entry.epoch != epoch {
+            return false;
+        }
+        if entry.state != QuarantineState::ConfirmedFailure {
+            return false;
+        }
+        entry.state = QuarantineState::Ready;
+        true
+    }
+
+    pub fn confirmed_quarantine(&self) -> Vec<(String, ClientId, u64)> {
+        self.quarantine
+            .values()
+            .filter(|entry| entry.state == QuarantineState::ConfirmedFailure)
+            .map(|entry| (entry.session.clone(), entry.client, entry.epoch))
+            .collect()
+    }
+
+    pub fn quarantine_awaiting_late(&self) -> bool {
+        self.quarantine
+            .values()
+            .any(|entry| entry.state == QuarantineState::AwaitingLate)
+    }
+
+    pub fn quarantine_confirmed_failure(&self) -> bool {
+        self.quarantine
+            .values()
+            .any(|entry| entry.state == QuarantineState::ConfirmedFailure)
+    }
+
+    pub fn quarantine_count(&self) -> usize {
+        self.quarantine.len()
     }
 
     pub fn release_quarantine(&mut self, session: &str) -> Option<Quarantine> {

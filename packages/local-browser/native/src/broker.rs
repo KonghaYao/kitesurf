@@ -127,6 +127,8 @@ const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const CLIENT_DEADLINE: Duration = Duration::from_secs(120);
 const INTERNAL_DEADLINE: Duration = Duration::from_secs(30);
 const CONTROL_DEADLINE: Duration = Duration::from_secs(10);
+const DRAIN_TIMEOUT_MESSAGE: &str = "Browser drain timed out";
+const QUARANTINE_UNCONFIRMED_MESSAGE: &str = "CDP cleanup could not be confirmed";
 const FINALIZE_TIMEOUT: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(50);
 
@@ -496,6 +498,7 @@ impl BrokerHandle {
             control_epoch: 1,
             active_controller: None,
             control_queue: VecDeque::new(),
+            next_admission_seq: 1,
             control_active: None,
             management_queue: VecDeque::new(),
             management_active: None,
@@ -762,7 +765,7 @@ async fn wait_terminal(
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Lifecycle {
     Running,
     Flushing,
@@ -777,6 +780,7 @@ struct RequestLease {
     _global: OwnedSemaphorePermit,
     ids: Arc<Mutex<std::collections::HashSet<i64>>>,
     id: i64,
+    seq: u64,
     _metadata: PayloadLease,
 }
 
@@ -1008,6 +1012,7 @@ struct Pending {
     external_id: Option<i64>,
     explicit_session: Option<String>,
     epoch: u64,
+    seq: Option<u64>,
     method: String,
     kind: PendingKind,
     deadline: Instant,
@@ -1015,14 +1020,25 @@ struct Pending {
 
 enum PendingKind {
     Client,
-    PageAttach { target: String },
+    PageAttach {
+        target: String,
+    },
     Managed,
     Flush,
     Close,
     Targets(oneshot::Sender<Result<LeasedTargets, String>>),
-    RetirementAuto { id: u64 },
-    RetirementDetach { id: u64, session: String },
-    QuarantineDetach { session: String },
+    RetirementAuto {
+        id: u64,
+    },
+    RetirementDetach {
+        id: u64,
+        session: String,
+    },
+    QuarantineDetach {
+        session: String,
+        client: ClientId,
+        epoch: u64,
+    },
 }
 
 struct Unknown {
@@ -1031,6 +1047,7 @@ struct Unknown {
     client: Option<ClientId>,
     role: Option<Role>,
     epoch: u64,
+    seq: Option<u64>,
     method: String,
     kind: UnknownKind,
 }
@@ -1056,6 +1073,8 @@ enum UnknownKind {
     },
     QuarantineDetach {
         session: String,
+        client: ClientId,
+        epoch: u64,
     },
 }
 
@@ -1135,6 +1154,8 @@ struct ActiveControl {
 struct FlushState {
     reply: Option<oneshot::Sender<Result<crate::services::LeasedProfileStatus, String>>>,
     stage: FlushStage,
+    cutoff: u64,
+    drain_until: Instant,
 }
 
 enum FlushStage {
@@ -1151,6 +1172,8 @@ struct CloseState {
     explicit_session: Option<String>,
     reply: Option<oneshot::Sender<Result<(), String>>>,
     stage: CloseStage,
+    cutoff: u64,
+    drain_until: Instant,
     finalize_until: Option<Instant>,
     started: Instant,
     notified: bool,
@@ -1164,6 +1187,14 @@ enum CloseStage {
 }
 
 type ControlWaiter = oneshot::Sender<Result<(String, u64), ControlError>>;
+
+/// 已接受但尚未开始的 control；seq 仅保留准入次序，不进普通 drain。
+struct ControlEntry {
+    _seq: u64,
+    owner: String,
+    takeover: bool,
+    reply: ControlWaiter,
+}
 
 struct Broker {
     upstream: Upstream,
@@ -1191,7 +1222,8 @@ struct Broker {
     controller: Option<String>,
     control_epoch: u64,
     active_controller: Option<ClientId>,
-    control_queue: VecDeque<(String, bool, ControlWaiter)>,
+    control_queue: VecDeque<ControlEntry>,
+    next_admission_seq: u64,
     control_active: Option<ActiveControl>,
     management_queue: VecDeque<ManagedWork>,
     management_active: Option<ActiveManaged>,
@@ -1324,13 +1356,24 @@ impl Broker {
                 takeover,
                 reply,
             } => {
+                if self.lifecycle != Lifecycle::Running {
+                    let _ = reply.send(Err(ControlError::Other("Browser is closing".to_string())));
+                    return;
+                }
                 if self.control_queue.len() >= MAX_CONTROL_QUEUE {
                     let _ = reply.send(Err(ControlError::Other(
                         "control queue is full".to_string(),
                     )));
-                } else {
-                    self.control_queue.push_back((owner, takeover, reply));
+                } else if let Some(seq) = self.take_admission_seq() {
+                    self.control_queue.push_back(ControlEntry {
+                        _seq: seq,
+                        owner,
+                        takeover,
+                        reply,
+                    });
                     self.pump_control();
+                } else {
+                    let _ = reply.send(Err(ControlError::Other("Browser is busy".to_string())));
                 }
             }
             BrokerCommand::Flush { reply } => self.start_flush(reply),
@@ -1426,6 +1469,8 @@ impl Broker {
         if self.lifecycle != Lifecycle::Running || self.clients.len() >= MAX_CLIENTS {
             return false;
         }
+        let page = matches!(reservation.endpoint, Endpoint::Page { .. });
+        // 先验证 controller 身份，再取得准入序号；耗尽时不改变 owner/epoch。
         if reservation.role == Role::Controller {
             if self.control_active.is_some() || self.active_controller.is_some() {
                 return false;
@@ -1434,12 +1479,22 @@ impl Broker {
                 if controller != &reservation.owner {
                     return false;
                 }
-            } else {
+            }
+        }
+        let page_seq = if page {
+            match self.take_admission_seq() {
+                Some(seq) => Some(seq),
+                None => return false,
+            }
+        } else {
+            None
+        };
+        if reservation.role == Role::Controller {
+            if self.controller.is_none() {
                 self.controller = Some(reservation.owner.clone());
             }
             self.active_controller = Some(id);
         }
-        let page = matches!(reservation.endpoint, Endpoint::Page { .. });
         self.notes_tx.send_modify(|notes| {
             notes.clients.retain(|id, _| self.clients.contains_key(id));
             notes.clients.insert(id, (false, false));
@@ -1471,7 +1526,11 @@ impl Broker {
             json!({ "kind": "client-open", "clients": self.clients.len() }),
         );
         if let Endpoint::Page { target_id } = reservation.endpoint {
-            if !self.start_page_attach(id, &target_id) {
+            let Some(seq) = page_seq else {
+                self.disconnect_client(id, 1008, "Target expired", true);
+                return false;
+            };
+            if !self.start_page_attach(id, &target_id, seq) {
                 self.disconnect_client(id, 1008, "Target expired", true);
             }
         }
@@ -1520,12 +1579,14 @@ impl Broker {
             );
             return;
         }
-        let Some(client) = self.clients.get(&client_id) else {
+        let Some((slots, ids)) = self
+            .clients
+            .get(&client_id)
+            .map(|client| (client.slots.clone(), client.ids.clone()))
+        else {
             return;
         };
-        let permits = client
-            .slots
-            .clone()
+        let permits = slots
             .try_acquire_owned()
             .ok()
             .zip(self.request_slots.clone().try_acquire_owned().ok());
@@ -1541,12 +1602,23 @@ impl Broker {
         };
         let metadata = value.metadata.take().unwrap();
         // actor 内无 await；权限检查及双槽成功后登记 ID，构成唯一语义准入点。
-        client.ids.lock().unwrap().insert(external_id);
+        let Some(seq) = self.take_admission_seq() else {
+            self.send_error(
+                client_id,
+                external_id,
+                -32000,
+                "CDP admission sequence exhausted",
+                error_session(&value),
+            );
+            return;
+        };
+        ids.lock().unwrap().insert(external_id);
         value.lease = Some(Arc::new(RequestLease {
             _client: local,
             _global: global,
-            ids: client.ids.clone(),
+            ids,
             id: external_id,
+            seq,
             _metadata: metadata,
         }));
         self.ensure_page_ready(client_id, value, external_id, &method);
@@ -1559,14 +1631,22 @@ impl Broker {
         external_id: i64,
         method: &str,
     ) {
-        let Some(client) = self.clients.get_mut(&client_id) else {
+        let Some(client) = self.clients.get(&client_id) else {
             return;
         };
+        // Browser.close 完成 controller/session 检查后直接进入共用 close barrier。
+        if method == "Browser.close" {
+            self.admit_request(client_id, request, external_id, method);
+            return;
+        }
         if client.page_ready {
             self.admit_request(client_id, request, external_id, method);
             return;
         }
         let bytes = request.bytes();
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return;
+        };
         if client.page_queue.len() >= MAX_PAGE_QUEUE
             || client.page_queue_bytes.saturating_add(bytes) > MAX_PAGE_QUEUE_BYTES
         {
@@ -1584,7 +1664,7 @@ impl Broker {
         external_id: i64,
         method: &str,
     ) {
-        if let Err(message) = self.check_request(client_id, &request, external_id, method) {
+        if let Err(message) = self.check_dispatch(client_id, &request, external_id, method) {
             self.send_error(
                 client_id,
                 external_id,
@@ -1732,6 +1812,7 @@ impl Broker {
             external_id: Some(external_id),
             explicit_session: error_session(request),
             epoch: client.epoch,
+            seq: None,
             method: method.to_string(),
             kind: PendingKind::Client,
             deadline: self.client_deadline,
@@ -1814,16 +1895,49 @@ impl Broker {
         external_id: i64,
         method: &str,
     ) -> Result<(), &'static str> {
-        let client = self.clients.get(&client_id).ok_or("Client is closed")?;
-        if client.closed {
-            return Err("Client is closed");
-        }
         if self.lifecycle != Lifecycle::Running {
             return Err(if self.lifecycle == Lifecycle::Flushing {
                 "Browser is flushing"
             } else {
                 "Browser is closing"
             });
+        }
+        self.check_client_work(client_id, request, external_id, method)
+    }
+
+    /// Drain 只放行 cutoff 前已准入的工作；身份与 session 仍逐次重验。
+    fn check_dispatch(
+        &self,
+        client_id: ClientId,
+        request: &Request,
+        external_id: i64,
+        method: &str,
+    ) -> Result<(), &'static str> {
+        let cutoff = self.dispatch_cutoff().ok_or("Browser is closing")?;
+        if !request
+            .lease
+            .as_ref()
+            .is_some_and(|lease| lease.seq <= cutoff)
+        {
+            return Err(if self.lifecycle == Lifecycle::Flushing {
+                "Browser is flushing"
+            } else {
+                "Browser is closing"
+            });
+        }
+        self.check_client_work(client_id, request, external_id, method)
+    }
+
+    fn check_client_work(
+        &self,
+        client_id: ClientId,
+        request: &Request,
+        external_id: i64,
+        method: &str,
+    ) -> Result<(), &'static str> {
+        let client = self.clients.get(&client_id).ok_or("Client is closed")?;
+        if client.closed {
+            return Err("Client is closed");
         }
         if client.role == Role::Viewer && !VIEW_METHODS.contains(&method) {
             return Err("Viewer connection cannot control the browser");
@@ -1849,6 +1963,33 @@ impl Broker {
             return Err(message);
         }
         Ok(())
+    }
+
+    /// 单调准入序号；耗尽后 fixed 拒绝，不 wrap、不 saturate。
+    fn take_admission_seq(&mut self) -> Option<u64> {
+        take_sequence(&mut self.next_admission_seq)
+    }
+
+    fn admission_cutoff(&self) -> u64 {
+        self.next_admission_seq.saturating_sub(1)
+    }
+
+    /// Running 放行全部已准入工作；只有 barrier 的 Drain 阶段继续派发旧工作。
+    fn dispatch_cutoff(&self) -> Option<u64> {
+        match self.lifecycle {
+            Lifecycle::Running => Some(u64::MAX),
+            Lifecycle::Flushing => self
+                .flush
+                .as_ref()
+                .filter(|state| matches!(state.stage, FlushStage::Drain))
+                .map(|state| state.cutoff),
+            Lifecycle::Closing => self
+                .close
+                .as_ref()
+                .filter(|state| matches!(state.stage, CloseStage::Drain))
+                .map(|state| state.cutoff),
+            Lifecycle::Lost | Lifecycle::Closed => None,
+        }
     }
 
     fn send_error(
@@ -2132,6 +2273,7 @@ struct PendingSpec {
     external_id: Option<i64>,
     explicit_session: Option<String>,
     epoch: u64,
+    seq: Option<u64>,
     method: String,
     kind: PendingKind,
     deadline: Duration,
@@ -2217,6 +2359,7 @@ impl Broker {
             return Err("Browser session is lost".to_string());
         }
         self.upstream_bytes = self.upstream_bytes.saturating_add(bytes);
+        let seq = spec.seq.or_else(|| request.as_ref().map(|lease| lease.seq));
         if let Some(client_id) = spec.client {
             if let Some(client) = self.clients.get_mut(&client_id) {
                 client.pending += 1;
@@ -2235,6 +2378,7 @@ impl Broker {
                 external_id: spec.external_id,
                 explicit_session: spec.explicit_session,
                 epoch: spec.epoch,
+                seq,
                 method: spec.method,
                 kind: spec.kind,
                 deadline: Instant::now() + spec.deadline,
@@ -2248,12 +2392,17 @@ impl Broker {
             let _ = reply.send(Err("browser session is lost".to_string()));
             return;
         }
+        if self.lifecycle != Lifecycle::Running {
+            let _ = reply.send(Err("Browser is busy".to_string()));
+            return;
+        }
         let spec = PendingSpec {
             client: None,
             role: None,
             external_id: None,
             explicit_session: None,
             epoch: self.control_epoch,
+            seq: None,
             method: "Target.getTargets".to_string(),
             kind: PendingKind::Targets(reply),
             deadline: self.internal_deadline,
@@ -2264,7 +2413,7 @@ impl Broker {
         }
     }
 
-    fn start_page_attach(&mut self, client_id: ClientId, target: &str) -> bool {
+    fn start_page_attach(&mut self, client_id: ClientId, target: &str, seq: u64) -> bool {
         let Some(client) = self.clients.get(&client_id) else {
             return false;
         };
@@ -2280,6 +2429,7 @@ impl Broker {
             external_id: None,
             explicit_session: None,
             epoch: client.epoch,
+            seq: Some(seq),
             method: "Target.attachToTarget".to_string(),
             kind: PendingKind::PageAttach {
                 target: target.to_string(),
@@ -2333,6 +2483,8 @@ impl Broker {
             UpstreamEvent::Raw(_) => unreachable!(),
             UpstreamEvent::Written { bytes } => {
                 self.upstream_bytes = self.upstream_bytes.saturating_sub(bytes);
+                // writer 结算必须直接唤醒 Drain，不能等下一次 tick。
+                self.pump_after_change();
             }
             UpstreamEvent::Lost(reason) => self.handle_lost(reason),
         }
@@ -2552,6 +2704,8 @@ impl Broker {
             if let Some(entry) = self.attachments.release_quarantine(&session) {
                 self.maybe_reap_client(entry.client);
             }
+            // attachment 事件同样必须唤醒 Drain，而不是只依赖 tick。
+            self.pump_after_change();
             return;
         };
         let recipient = attachment.client;
@@ -2561,10 +2715,12 @@ impl Broker {
             .is_some_and(|state| state.primary.as_deref() == Some(attachment.session.as_str()));
         if primary {
             self.disconnect_client(recipient, 1008, "Target expired", true);
+            self.pump_after_change();
             return;
         }
         self.deliver_event(recipient, &value);
         self.maybe_reap_client(recipient);
+        self.pump_after_change();
     }
 
     fn handle_response(&mut self, mut value: Received) {
@@ -2638,7 +2794,7 @@ impl Broker {
                 let _ = reply.send(Err("Target discovery timed out".to_string()));
             }
             PendingKind::Flush => {
-                self.fail_flush(message);
+                // 先保留未结算身份，再失败本次屏障；新 flush 在结算前固定拒绝。
                 self.record_unknown(
                     id,
                     Unknown {
@@ -2647,10 +2803,12 @@ impl Broker {
                         client,
                         role,
                         epoch,
+                        seq: pending.seq,
                         method,
                         kind: UnknownKind::Flush,
                     },
                 );
+                self.fail_flush(message);
             }
             PendingKind::Close => {
                 let browser_stage = self
@@ -2672,11 +2830,25 @@ impl Broker {
                             client,
                             role,
                             epoch,
+                            seq: pending.seq,
                             method,
                             kind: UnknownKind::Close,
                         },
                     );
                 } else {
+                    self.record_unknown(
+                        id,
+                        Unknown {
+                            _request: pending.request.clone(),
+                            _internal: pending.internal.clone(),
+                            client,
+                            role,
+                            epoch,
+                            seq: pending.seq,
+                            method,
+                            kind: UnknownKind::Flush,
+                        },
+                    );
                     self.fail_close(message);
                 }
             }
@@ -2691,6 +2863,7 @@ impl Broker {
                             client: Some(client),
                             role,
                             epoch,
+                            seq: pending.seq,
                             method,
                             kind: UnknownKind::PageAttach { target },
                         },
@@ -2736,6 +2909,7 @@ impl Broker {
                             client: Some(managed_client),
                             role: managed_role,
                             epoch,
+                            seq: pending.seq,
                             method,
                             kind: UnknownKind::Managed {
                                 target,
@@ -2768,6 +2942,7 @@ impl Broker {
                             client: Some(retire_client),
                             role: Some(Role::Controller),
                             epoch,
+                            seq: pending.seq,
                             method,
                             kind: UnknownKind::RetirementAuto { id: retirement },
                         },
@@ -2791,6 +2966,7 @@ impl Broker {
                             client: Some(retire_client),
                             role: Some(Role::Controller),
                             epoch,
+                            seq: pending.seq,
                             method,
                             kind: UnknownKind::RetirementDetach {
                                 id: retirement,
@@ -2800,21 +2976,32 @@ impl Broker {
                     );
                 }
             }
-            PendingKind::QuarantineDetach { session } => {
-                if self.attachments.block_quarantine(&session) {
-                    self.record_unknown(
-                        id,
-                        Unknown {
-                            _request: pending.request.clone(),
-                            _internal: pending.internal.clone(),
-                            client: None,
-                            role: None,
-                            epoch,
-                            method,
-                            kind: UnknownKind::QuarantineDetach { session },
+            PendingKind::QuarantineDetach {
+                session,
+                client,
+                epoch: detach_epoch,
+            } => {
+                // early detached 可先移除记录，但未结算的上游写身份仍必须保留。
+                let _ =
+                    self.attachments
+                        .mark_quarantine_awaiting(&session, id, client, detach_epoch);
+                self.record_unknown(
+                    id,
+                    Unknown {
+                        _request: pending.request.clone(),
+                        _internal: pending.internal.clone(),
+                        client: None,
+                        role: None,
+                        epoch: detach_epoch,
+                        seq: pending.seq,
+                        method,
+                        kind: UnknownKind::QuarantineDetach {
+                            session,
+                            client,
+                            epoch: detach_epoch,
                         },
-                    );
-                }
+                    },
+                );
             }
             PendingKind::Client => {
                 if let Some(client) = client {
@@ -2835,6 +3022,7 @@ impl Broker {
                             client,
                             role,
                             epoch,
+                            seq: pending.seq,
                             method,
                             kind: UnknownKind::Plain,
                         },
@@ -2906,10 +3094,19 @@ impl Broker {
                     self.attachments.clear_intent(&target, client);
                 }
             }
-            UnknownKind::QuarantineDetach { session } => {
+            UnknownKind::QuarantineDetach {
+                session,
+                client,
+                epoch: detach_epoch,
+            } => {
+                // 迟到结果仍按 upstream/client/epoch/session 精确匹配，不误删其他清理身份。
                 if failed {
-                    self.attachments.block_quarantine(&session);
-                } else if let Some(entry) = self.attachments.release_quarantine(&session) {
+                    self.attachments
+                        .finish_quarantine_failure(&session, id, client, detach_epoch);
+                } else if let Some(entry) =
+                    self.attachments
+                        .finish_quarantine_success(&session, id, client, detach_epoch)
+                {
                     self.maybe_reap_client(entry.client);
                 }
             }
@@ -2973,8 +3170,12 @@ impl Broker {
             } => {
                 self.retirement_detach_response(id, retirement, &session, value);
             }
-            PendingKind::QuarantineDetach { session } => {
-                self.quarantine_detach_response(&session, value);
+            PendingKind::QuarantineDetach {
+                session,
+                client,
+                epoch: detach_epoch,
+            } => {
+                self.quarantine_detach_response(&session, id, client, detach_epoch, value);
             }
         }
         self.pump_after_change();
@@ -3183,6 +3384,7 @@ impl Broker {
             external_id: None,
             explicit_session: None,
             epoch: work.epoch,
+            seq: None,
             method: "Target.getTargets".to_string(),
             kind: PendingKind::Managed,
             deadline: self.internal_deadline,
@@ -3359,6 +3561,7 @@ impl Broker {
             external_id: None,
             explicit_session,
             epoch,
+            seq: None,
             method: "Target.attachToTarget".to_string(),
             kind: PendingKind::Managed,
             deadline: self.internal_deadline,
@@ -3521,11 +3724,13 @@ impl Broker {
     }
 
     fn pump_management(&mut self) {
-        if self.management_active.is_some()
-            || self.lifecycle != Lifecycle::Running
-            || self.flush.is_some()
-            || self.close.is_some()
-            || self.control_active.is_some()
+        if self.management_active.is_some() {
+            return;
+        }
+        let Some(cutoff) = self.dispatch_cutoff() else {
+            return;
+        };
+        if self.control_active.is_some()
             || !self.retirements.is_empty()
             || self
                 .unknown
@@ -3538,9 +3743,28 @@ impl Broker {
             let Some(work) = self.management_queue.pop_front() else {
                 return;
             };
+            if !work
+                .request
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.seq <= cutoff)
+            {
+                let session = work.explicit_session.clone();
+                let message = self.lifecycle_busy_message();
+                self.send_error(work.client, work.external_id, -32000, message, session);
+                continue;
+            }
             if self.dispatch_managed(work) {
                 return;
             }
+        }
+    }
+
+    fn lifecycle_busy_message(&self) -> &'static str {
+        if self.lifecycle == Lifecycle::Flushing {
+            "Browser is flushing"
+        } else {
+            "Browser is closing"
         }
     }
 
@@ -3587,6 +3811,7 @@ impl Broker {
             external_id: work.external_id.into(),
             explicit_session: work.explicit_session.clone(),
             epoch: work.epoch,
+            seq: None,
             method: work.method.clone(),
             kind: PendingKind::Managed,
             deadline: self.internal_deadline,
@@ -3737,6 +3962,12 @@ fn attach_session(value: &Received) -> Option<LeasedIdentity> {
     value.attached.clone()
 }
 
+fn take_sequence(next: &mut u64) -> Option<u64> {
+    let seq = *next;
+    *next = seq.checked_add(1)?;
+    Some(seq)
+}
+
 fn stage_id(stage: &ManagedStage) -> Option<u64> {
     match stage {
         ManagedStage::Sent { id } => Some(*id),
@@ -3854,6 +4085,7 @@ impl Broker {
             external_id: None,
             explicit_session: None,
             epoch: self.control_epoch,
+            seq: None,
             method: "Target.setAutoAttach".to_string(),
             kind: PendingKind::RetirementAuto { id: retirement },
             deadline: self.internal_deadline,
@@ -3890,6 +4122,7 @@ impl Broker {
             external_id: None,
             explicit_session: None,
             epoch: self.control_epoch,
+            seq: None,
             method: "Target.detachFromTarget".to_string(),
             kind: PendingKind::RetirementDetach {
                 id: retirement,
@@ -4036,21 +4269,13 @@ impl Broker {
         }
     }
 
-    fn quarantine_detach_response(&mut self, session: &str, value: &Received) {
-        if value.has_error() {
-            self.attachments.block_quarantine(session);
-        } else if let Some(entry) = self.attachments.release_quarantine(session) {
-            self.maybe_reap_client(entry.client);
-        }
-    }
-
     /// quarantine 清理只用不占 attachment 槽的内部 reserve；容量不足时留待下次 tick。
     fn pump_quarantine(&mut self) {
         if matches!(self.lifecycle, Lifecycle::Lost | Lifecycle::Closed) {
             return;
         }
         loop {
-            let Some((session, owner)) = self.attachments.next_quarantine() else {
+            let Some((session, owner, epoch)) = self.attachments.next_quarantine() else {
                 return;
             };
             // 自动溢出先确认禁用 autoattach，再清理该 session。
@@ -4061,16 +4286,22 @@ impl Broker {
             {
                 return;
             }
-            let Some(id) = self.spawn_quarantine_detach(&session) else {
+            let Some(id) = self.spawn_quarantine_detach(&session, owner, epoch) else {
                 return;
             };
-            if !self.attachments.set_quarantine_pending(&session, Some(id)) {
-                return;
-            }
+            // 同一步 actor 内记录不会消失；失败仅表示身份已变，保留 pending 等待结算。
+            let _ = self
+                .attachments
+                .mark_quarantine_sent(&session, id, owner, epoch);
         }
     }
 
-    fn spawn_quarantine_detach(&mut self, session: &str) -> Option<u64> {
+    fn spawn_quarantine_detach(
+        &mut self,
+        session: &str,
+        client: ClientId,
+        epoch: u64,
+    ) -> Option<u64> {
         let params = json!({ "sessionId": session });
         let spec = PendingSpec {
             client: None,
@@ -4078,14 +4309,62 @@ impl Broker {
             external_id: None,
             explicit_session: None,
             epoch: self.control_epoch,
+            seq: None,
             method: "Target.detachFromTarget".to_string(),
             kind: PendingKind::QuarantineDetach {
                 session: session.to_string(),
+                client,
+                epoch,
             },
             deadline: self.internal_deadline,
         };
         self.send_request("Target.detachFromTarget", Some(&params), None, spec)
             .ok()
+    }
+
+    /// 成功与失败都按 upstream/client/epoch/session 精确匹配，不碰其他清理身份。
+    fn quarantine_detach_response(
+        &mut self,
+        session: &str,
+        upstream: u64,
+        client: ClientId,
+        epoch: u64,
+        value: &Received,
+    ) {
+        if value.has_error() {
+            self.attachments
+                .finish_quarantine_failure(session, upstream, client, epoch);
+        } else if let Some(entry) = self
+            .attachments
+            .finish_quarantine_success(session, upstream, client, epoch)
+        {
+            self.maybe_reap_client(entry.client);
+        }
+    }
+
+    /// 新的显式 flush/close 才复活 ConfirmedFailure；有匹配在途身份时不重试。
+    fn retry_quarantines(&mut self) {
+        for (session, client, epoch) in self.attachments.confirmed_quarantine() {
+            let busy = self.pending.values().any(|pending| {
+                matches!(
+                    &pending.kind,
+                    PendingKind::QuarantineDetach { session: current, .. } if current == &session
+                )
+            }) || self.unknown.values().any(|unknown| {
+                matches!(
+                    &unknown.kind,
+                    UnknownKind::QuarantineDetach { session: current, .. } if current == &session
+                )
+            });
+            if !busy {
+                self.attachments.retry_quarantine(&session, client, epoch);
+            }
+        }
+    }
+
+    fn quarantine_blocked(&self) -> bool {
+        self.attachments.quarantine_awaiting_late()
+            || self.attachments.quarantine_confirmed_failure()
     }
 
     fn pump_control(&mut self) {
@@ -4102,9 +4381,15 @@ impl Broker {
             self.reply_control_queue("Browser is busy");
             return;
         }
-        let Some((owner, takeover, reply)) = self.control_queue.pop_front() else {
+        let Some(entry) = self.control_queue.pop_front() else {
             return;
         };
+        let ControlEntry {
+            owner,
+            takeover,
+            reply,
+            ..
+        } = entry;
         if !valid_owner(&owner) {
             let _ = reply.send(Err(ControlError::Other(
                 "A short owner name is required".to_string(),
@@ -4168,9 +4453,15 @@ impl Broker {
         if !self.retirements.iter().any(|retire| retire.failed) {
             return;
         }
-        let Some((owner, takeover, reply)) = self.control_queue.pop_front() else {
+        let Some(entry) = self.control_queue.pop_front() else {
             return;
         };
+        let ControlEntry {
+            owner,
+            takeover,
+            reply,
+            ..
+        } = entry;
         if !valid_owner(&owner) {
             let _ = reply.send(Err(ControlError::Other(
                 "A short owner name is required".to_string(),
@@ -4253,8 +4544,10 @@ impl Broker {
     }
 
     fn reply_control_queue(&mut self, message: &str) {
-        while let Some((_, _, reply)) = self.control_queue.pop_front() {
-            let _ = reply.send(Err(ControlError::Other(message.to_string())));
+        while let Some(entry) = self.control_queue.pop_front() {
+            let _ = entry
+                .reply
+                .send(Err(ControlError::Other(message.to_string())));
         }
     }
 
@@ -4298,16 +4591,21 @@ impl Broker {
             let _ = reply.send(Err("Browser is closing".to_string()));
             return;
         }
-        if self.control_active.is_some() {
+        if self.control_active.is_some() || !self.control_queue.is_empty() {
             let _ = reply.send(Err("Control change is in progress".to_string()));
             return;
         }
         self.lifecycle = Lifecycle::Flushing;
+        let cutoff = self.admission_cutoff();
         self.flush = Some(FlushState {
             reply: Some(reply),
             stage: FlushStage::Drain,
+            cutoff,
+            drain_until: Instant::now() + self.internal_deadline,
         });
-        self.pump_flush();
+        // 只有显式 barrier 可以复活确认失败的清理；本次失败将固定拒绝。
+        self.retry_quarantines();
+        self.pump_after_change();
     }
 
     fn pump_flush(&mut self) {
@@ -4320,14 +4618,26 @@ impl Broker {
         if !matches!(flush.stage, FlushStage::Drain) {
             return;
         }
+        // 结果未知或清理无法确认时立即固定失败，不发送 flush、不清除原工作。
+        if self.quarantine_blocked() {
+            self.fail_flush(QUARANTINE_UNCONFIRMED_MESSAGE.to_string());
+            return;
+        }
         if self.outcome_unknown() {
             self.fail_flush("previous request outcome is unknown".to_string());
             return;
         }
-        if self.management_active.is_some()
-            || !self.retirements.is_empty()
-            || self.has_write_pending()
-        {
+        let Some((cutoff, drain_until)) = self
+            .flush
+            .as_ref()
+            .map(|state| (state.cutoff, state.drain_until))
+        else {
+            return;
+        };
+        if !self.drain_complete(cutoff) {
+            if drain_until <= Instant::now() {
+                self.fail_flush(DRAIN_TIMEOUT_MESSAGE.to_string());
+            }
             return;
         }
         let spec = PendingSpec {
@@ -4336,6 +4646,7 @@ impl Broker {
             external_id: None,
             explicit_session: None,
             epoch: self.control_epoch,
+            seq: None,
             method: "Kitesurf.flushProfile".to_string(),
             kind: PendingKind::Flush,
             deadline: self.internal_deadline,
@@ -4449,7 +4760,7 @@ impl Broker {
             }
             self.validate_session(id, explicit_session.as_deref())?;
         }
-        if self.control_active.is_some() {
+        if self.control_active.is_some() || !self.control_queue.is_empty() {
             return Err("Control change is in progress".to_string());
         }
         self.close = Some(CloseState {
@@ -4460,13 +4771,17 @@ impl Broker {
             explicit_session,
             reply,
             stage: CloseStage::Drain,
+            cutoff: self.admission_cutoff(),
+            drain_until: Instant::now() + self.internal_deadline,
             finalize_until: None,
             started: Instant::now(),
             notified: false,
             succeeded: false,
         });
         self.lifecycle = Lifecycle::Closing;
-        self.pump_close();
+        // close 与 flush 对称：准入时给明确失败的清理一次显式重试。
+        self.retry_quarantines();
+        self.pump_after_change();
         Ok(())
     }
 
@@ -4501,11 +4816,23 @@ impl Broker {
             CloseStage::Flush => 1,
             CloseStage::Browser => 2,
         };
+        let (cutoff, drain_until) = (state.cutoff, state.drain_until);
         if stage == 0 {
-            if self.management_active.is_some()
-                || !self.retirements.is_empty()
-                || self.has_write_pending()
-            {
+            // 清理无法确认时保持受限状态；不发送 flush，也不伪报成功。
+            if self.quarantine_blocked() {
+                let notify = self.close.as_ref().is_some_and(|state| !state.notified);
+                if notify {
+                    if let Some(state) = self.close.as_mut() {
+                        state.notified = true;
+                    }
+                    self.close_restricted(QUARANTINE_UNCONFIRMED_MESSAGE.to_string());
+                }
+                return;
+            }
+            if !self.drain_complete(cutoff) {
+                if drain_until <= Instant::now() {
+                    self.fail_close(DRAIN_TIMEOUT_MESSAGE.to_string());
+                }
                 return;
             }
             let spec = PendingSpec {
@@ -4514,6 +4841,7 @@ impl Broker {
                 external_id: None,
                 explicit_session: None,
                 epoch: self.control_epoch,
+                seq: None,
                 method: "Kitesurf.flushProfile".to_string(),
                 kind: PendingKind::Close,
                 deadline: self.internal_deadline,
@@ -4560,6 +4888,7 @@ impl Broker {
             external_id: None,
             explicit_session: None,
             epoch: self.control_epoch,
+            seq: None,
             method: "Browser.close".to_string(),
             kind: PendingKind::Close,
             deadline: self.internal_deadline,
@@ -4576,6 +4905,7 @@ impl Broker {
 
     fn fail_close(&mut self, message: String) {
         let message = match self.close.as_ref().map(|state| &state.stage) {
+            Some(CloseStage::Drain) if message == DRAIN_TIMEOUT_MESSAGE => message,
             Some(CloseStage::Flush | CloseStage::Drain) => "Profile flush failed".to_string(),
             _ if message.to_ascii_lowercase().contains("unknown") => {
                 "Browser close outcome unknown".to_string()
@@ -4772,17 +5102,42 @@ impl Broker {
         }
     }
 
-    fn has_write_pending(&self) -> bool {
-        self.pending.values().any(|pending| {
-            pending.client.is_some()
-                || matches!(
-                    pending.kind,
-                    PendingKind::Managed
-                        | PendingKind::PageAttach { .. }
-                        | PendingKind::RetirementAuto { .. }
-                        | PendingKind::RetirementDetach { .. }
-                )
-        })
+    /// cutoff 内队列、在途、清理与 writer-held 写全部结算才算 Drain 完成。
+    fn drain_complete(&self, cutoff: u64) -> bool {
+        if self.management_active.is_some() || !self.retirements.is_empty() {
+            return false;
+        }
+        if self.attachments.quarantine_count() > 0 {
+            return false;
+        }
+        // 相关 unknown 与 pending 一样按 cutoff 保留，只读 viewer 结果不参与 drain。
+        if self.unknown.values().any(|unknown| {
+            unknown.role != Some(Role::Viewer) && unknown.seq.is_none_or(|seq| seq <= cutoff)
+        }) {
+            return false;
+        }
+        if self.management_queue.iter().any(|work| {
+            work.request
+                .lease
+                .as_ref()
+                .is_none_or(|lease| lease.seq <= cutoff)
+        }) {
+            return false;
+        }
+        if self
+            .clients
+            .values()
+            .any(|client| !client.page_queue.is_empty())
+        {
+            return false;
+        }
+        if self.pending.values().any(|pending| match pending.kind {
+            PendingKind::Flush | PendingKind::Close => false,
+            _ => pending.seq.is_none_or(|seq| seq <= cutoff),
+        }) {
+            return false;
+        }
+        self.upstream_bytes == 0
     }
 
     fn pump_after_change(&mut self) {
