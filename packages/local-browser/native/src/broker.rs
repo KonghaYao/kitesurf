@@ -4720,32 +4720,51 @@ impl Broker {
         explicit_session: Option<String>,
         reply: Option<oneshot::Sender<Result<(), String>>>,
     ) -> Result<(), String> {
+        // 早退也必须答复 caller；否则 HTTP close 会把固定拒绝误报成 session lost。
+        let reject = |reply: Option<oneshot::Sender<Result<(), String>>>,
+                      message: &str|
+         -> Result<(), String> {
+            let message = message.to_string();
+            if let Some(reply) = reply {
+                let _ = reply.send(Err(message.clone()));
+            }
+            Err(message)
+        };
         if matches!(self.lifecycle, Lifecycle::Lost | Lifecycle::Closed) {
-            return Err("Browser session is lost".to_string());
+            return reject(reply, "Browser session is lost");
         }
         if self.lifecycle == Lifecycle::Flushing {
-            return Err("Browser is flushing".to_string());
+            return reject(reply, "Browser is flushing");
         }
         if self.close.is_some() {
-            return Err("Browser is closing".to_string());
+            return reject(reply, "Browser is closing");
         }
         if kind == CloseKind::Cdp {
-            let id = client.ok_or("Browser session is lost")?;
-            let state = self.clients.get(&id).ok_or("Browser session is lost")?;
+            let Some(id) = client else {
+                return reject(reply, "Browser session is lost");
+            };
+            let Some(state) = self.clients.get(&id) else {
+                return reject(reply, "Browser session is lost");
+            };
             if state.role != Role::Controller {
-                return Err("Viewer connection cannot control the browser".to_string());
+                return reject(reply, "Viewer connection cannot control the browser");
             }
             if state.retired
                 || self.active_controller != Some(id)
                 || self.controller.as_deref() != Some(state.owner.as_str())
                 || state.epoch != self.control_epoch
             {
-                return Err("Control has changed; reconnect and observe before acting".to_string());
+                return reject(
+                    reply,
+                    "Control has changed; reconnect and observe before acting",
+                );
             }
-            self.validate_session(id, explicit_session.as_deref())?;
+            if let Err(message) = self.validate_session(id, explicit_session.as_deref()) {
+                return reject(reply, message);
+            }
         }
         if self.control_active.is_some() || !self.control_queue.is_empty() {
-            return Err("Control change is in progress".to_string());
+            return reject(reply, "Control change is in progress");
         }
         self.close = Some(CloseState {
             _request: None,

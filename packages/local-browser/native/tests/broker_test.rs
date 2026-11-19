@@ -7,7 +7,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -1070,6 +1070,19 @@ async fn broker_with_deadlines(
     let profile = Arc::new(ProfileService::new(Arc::new(
         MemoryProfile::new("http://profile.invalid").expect("memory profile"),
     )));
+    BrokerHandle::start_with_deadlines(upstream, profile, observer, client, internal)
+}
+
+async fn broker_with_profile(
+    engine: &FakeEngine,
+    profile: Arc<ProfileService>,
+    client: Duration,
+    internal: Duration,
+) -> BrokerHandle {
+    let observer = Arc::new(Observer::disabled());
+    let upstream = Upstream::connect(&UpstreamAddress::Tcp(engine.address), observer.clone())
+        .await
+        .expect("connect fake upstream");
     BrokerHandle::start_with_deadlines(upstream, profile, observer, client, internal)
 }
 
@@ -2138,6 +2151,47 @@ async fn http_close_redacts_sensitive_upstream_failure_and_retries() {
     engine.kill();
 }
 
+#[tokio::test]
+async fn http_close_save_failure_keeps_host_alive_and_retries_without_replay() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+    let host = test_host(&broker);
+    let port = host.port();
+    let closing = tokio::spawn(http_close(port));
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.push(json!({
+      "id": request_id(&flush),
+      "error": { "code": -32000, "message": "synthetic-save-sensitive" }
+    }));
+    let failed = timeout(WAIT, closing).await.unwrap().unwrap();
+    assert!(failed.starts_with("HTTP/1.1 409"), "{failed}");
+    assert!(failed.contains("Profile flush failed"), "{failed}");
+    assert!(!failed.contains("synthetic-save-sensitive"));
+    // 明确失败不留 unknown；host 仍可读，profile 仍可重试。
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    assert!(broker.session().await.unwrap().alive);
+    let (status, body) = http_health(port).await;
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    assert_eq!(body["alive"], true);
+    expect_no_request(&mut engine).await;
+    let closing = tokio::spawn(http_close(port));
+    let retry = next_request(&mut engine).await;
+    assert_eq!(retry["method"], "Kitesurf.flushProfile");
+    assert_ne!(request_id(&retry), request_id(&flush));
+    engine.reply(request_id(&retry), json!({}));
+    let browser = next_request(&mut engine).await;
+    assert_eq!(browser["method"], "Browser.close");
+    engine.reply(request_id(&browser), json!({}));
+    let success = timeout(WAIT, closing).await.unwrap().unwrap();
+    assert!(success.starts_with("HTTP/1.1 200"), "{success}");
+    broker.writer_gone(alice.id);
+    assert!(timeout(WAIT, broker.wait_terminal()).await.unwrap());
+    host.stop().await;
+    engine.kill();
+}
+
 async fn http_close(port: u16) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -2148,6 +2202,55 @@ async fn http_close(port: u16) -> String {
         .unwrap()
         .unwrap();
     String::from_utf8(bytes).unwrap()
+}
+
+async fn http_health(port: u16) -> (String, Value) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut bytes = Vec::new();
+    timeout(WAIT, stream.read_to_end(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap();
+    (
+        head.lines().next().unwrap().to_owned(),
+        serde_json::from_str(body).unwrap(),
+    )
+}
+
+fn test_host(broker: &BrokerHandle) -> crate::relay::HostServer {
+    use crate::relay::{HostServer, SessionInfo};
+    let budget = broker.payload_budget();
+    let raw = crate::cdp_raw::LeasedRaw::literal(
+        r#"{"sessionId":"fake-session","buildVersion":"test","environment":"local"}"#,
+        &budget,
+    )
+    .unwrap();
+    let session = SessionInfo::from_raw(&raw, &budget, "test").unwrap();
+    drop(raw);
+    HostServer::bind(
+        0,
+        broker.clone(),
+        session,
+        "generation".into(),
+        "new-profile".into(),
+        Arc::new(ProfileService::new(Arc::new(
+            MemoryProfile::new("http://host.invalid").unwrap(),
+        ))),
+        Arc::new(Observer::disabled()),
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -3066,6 +3169,7 @@ async fn viewer_unknown_restricts_close_within_the_client_deadline() {
         "{expired}"
     );
     assert_eq!(broker.budget_snapshot().await, (1, 0, 1, 0));
+    let started = Instant::now();
     let mut closing = Box::pin(broker.close(CloseKind::Http, None, None, None));
     assert!(closing.as_mut().now_or_never().is_none());
     // 有界返回固定受限结果，而不是等迟到回复才推进。
@@ -3073,6 +3177,10 @@ async fn viewer_unknown_restricts_close_within_the_client_deadline() {
         .await
         .expect("close must settle within the client deadline")
         .expect_err("unknown outcome restricts close");
+    let elapsed = started.elapsed();
+    // 150ms client deadline + 50ms tick；600ms 上界只容纳调度，不用 WAIT=2s 冒充。
+    assert!(elapsed >= Duration::from_millis(150), "{elapsed:?}");
+    assert!(elapsed <= Duration::from_millis(600), "{elapsed:?}");
     assert_eq!(error, "Browser close outcome unknown");
     // 受限期间 unknown 与槽保留，新 control 不能越过。
     assert_eq!(broker.budget_snapshot().await, (1, 0, 1, 0));
@@ -3101,6 +3209,141 @@ async fn viewer_unknown_restricts_close_within_the_client_deadline() {
         .expect("closed watch")
         .expect("closed sender");
     assert!(*closed.borrow());
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CancelStage {
+    Drain,
+    Sent,
+    Status,
+}
+
+#[tokio::test]
+async fn cancelled_flush_caller_keeps_the_accepted_barrier_until_it_settles() {
+    for stage in [CancelStage::Drain, CancelStage::Sent, CancelStage::Status] {
+        cancel_flush_stage(stage).await;
+    }
+}
+
+// 取消只丢弃 caller receiver；actor 仍须完成 drain、snapshot 与 status。
+async fn cancel_flush_stage(stage: CancelStage) {
+    let mut engine = fake_engine().await;
+    let profile = Arc::new(ProfileService::new(Arc::new(
+        MemoryProfile::new("http://profile.invalid").expect("memory profile"),
+    )));
+    let gate = Arc::new(pressure::OutcomeGate::default());
+    *profile.outcome_gate.lock().unwrap() = Some(gate.clone());
+    let broker = broker_with_profile(
+        &engine,
+        profile.clone(),
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+    )
+    .await;
+    let alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+    let blocked = if matches!(stage, CancelStage::Drain) {
+        send(
+            &alice,
+            &broker,
+            r#"{"id":1,"method":"Page.navigate","params":{"url":"about:blank"}}"#,
+        )
+        .await;
+        let navigate = next_request(&mut engine).await;
+        assert_eq!(navigate["method"], "Page.navigate");
+        Some(navigate)
+    } else {
+        None
+    };
+    let mut flushing = Box::pin(broker.flush());
+    assert!(
+        flushing.as_mut().now_or_never().is_none(),
+        "{stage:?} flush stays pending"
+    );
+    // Session 排在 Flush 之后，是 actor 已接受本次屏障的消息级确认。
+    assert!(
+        broker.session().await.expect("actor session").alive,
+        "{stage:?} actor alive"
+    );
+    let first = match stage {
+        CancelStage::Drain => None,
+        _ => {
+            let flush = next_request(&mut engine).await;
+            assert_eq!(flush["method"], "Kitesurf.flushProfile", "{stage:?}");
+            Some(request_id(&flush))
+        }
+    };
+    match stage {
+        CancelStage::Drain => assert_eq!(broker.budget_snapshot().await, (1, 0, 0, 0)),
+        CancelStage::Sent => assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 1)),
+        CancelStage::Status => {
+            engine.reply(first.expect("flush id"), json!({ "saved": true }));
+            timeout(WAIT, gate.ready.notified())
+                .await
+                .expect("status stage entered");
+            assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+        }
+    }
+    // 调用者取消不是 request timeout：deadline 仍是 30s，后续屏障必须固定拒绝。
+    drop(flushing);
+    assert_eq!(
+        broker.flush().await.err().expect("flush rejected"),
+        "Browser is already flushing",
+        "{stage:?}"
+    );
+    assert!(
+        broker.session().await.expect("actor session").alive,
+        "{stage:?} actor alive"
+    );
+    assert_eq!(
+        broker
+            .close(CloseKind::Http, None, None, None)
+            .await
+            .unwrap_err(),
+        "Browser is flushing",
+        "{stage:?}"
+    );
+    assert!(broker.session().await.expect("actor session").alive);
+    expect_no_request(&mut engine).await;
+    match stage {
+        CancelStage::Drain => {
+            let navigate = blocked.expect("blocked navigate");
+            engine.reply(request_id(&navigate), json!({ "loaderId": "late" }));
+            let flush = next_request(&mut engine).await;
+            assert_eq!(flush["method"], "Kitesurf.flushProfile");
+            engine.reply(request_id(&flush), json!({ "saved": true }));
+        }
+        CancelStage::Sent => {
+            engine.reply(first.expect("flush id"), json!({ "saved": true }));
+        }
+        CancelStage::Status => {}
+    }
+    if !matches!(stage, CancelStage::Status) {
+        timeout(WAIT, gate.ready.notified())
+            .await
+            .expect("status stage entered");
+    }
+    gate.resume.notify_one();
+    timeout(WAIT, gate.sent.notified())
+        .await
+        .expect("status command sent");
+    // ProfileStatus 先于 Session 入队，因此 session 返回即已结算到 Running。
+    assert!(broker.session().await.expect("actor session").alive);
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    *profile.outcome_gate.lock().unwrap() = None;
+    let mut next = Box::pin(broker.flush());
+    assert!(next.as_mut().now_or_never().is_none());
+    let request = next_request(&mut engine).await;
+    assert_eq!(request["method"], "Kitesurf.flushProfile");
+    if let Some(first) = first {
+        assert_ne!(request_id(&request), first, "{stage:?} must not replay");
+    }
+    engine.reply(request_id(&request), json!({ "saved": true }));
+    timeout(WAIT, next)
+        .await
+        .expect("new flush completes")
+        .expect("new flush ok");
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    engine.kill();
 }
 
 #[tokio::test]
@@ -3457,6 +3700,157 @@ async fn close_flushes_before_browser_close_and_reports_success() {
         .expect("closed watch")
         .expect("closed sender");
     assert!(*closed.borrow());
+}
+
+#[tokio::test]
+async fn close_save_timeout_keeps_flush_unknown_and_retries_after_late_outcome() {
+    for late_error in [false, true] {
+        let mut engine = fake_engine().await;
+        let broker =
+            broker_with_deadlines(&engine, Duration::from_secs(2), Duration::from_millis(100))
+                .await;
+        let mut alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+        let mut closing = Box::pin(broker.close(CloseKind::Http, None, None, None));
+        assert!(closing.as_mut().now_or_never().is_none());
+        let flush = next_request(&mut engine).await;
+        assert_eq!(flush["method"], "Kitesurf.flushProfile");
+        let first = request_id(&flush);
+        let error = timeout(WAIT, closing)
+            .await
+            .expect("close save timeout")
+            .unwrap_err();
+        assert_eq!(error, "Profile flush failed", "late_error={late_error}");
+        // 保存 timeout 先记 flush unknown；Browser.close 从未发送。
+        assert_eq!(
+            broker.budget_snapshot().await,
+            (0, 0, 1, 1),
+            "late_error={late_error}"
+        );
+        assert!(broker.session().await.unwrap().alive);
+        expect_no_request(&mut engine).await;
+        // unknown 未结算时，新 close 只能等待，不得重发保存。
+        let mut retry = Box::pin(broker.close(CloseKind::Http, None, None, None));
+        assert!(retry.as_mut().now_or_never().is_none());
+        expect_no_request(&mut engine).await;
+        if late_error {
+            engine.push(json!({
+              "id": first,
+              "error": { "code": -32000, "message": "late save error" }
+            }));
+        } else {
+            engine.reply(first, json!({ "saved": true }));
+        }
+        // 结算后才发新的一次保存，且不是旧 id 重放。
+        let next = next_request(&mut engine).await;
+        assert_eq!(next["method"], "Kitesurf.flushProfile");
+        assert_ne!(request_id(&next), first);
+        engine.reply(request_id(&next), json!({ "saved": true }));
+        let browser = next_request(&mut engine).await;
+        assert_eq!(browser["method"], "Browser.close");
+        engine.reply(request_id(&browser), json!({}));
+        timeout(WAIT, retry)
+            .await
+            .expect("retry close settles")
+            .expect("retry close ok");
+        assert_eq!(
+            next_close(&mut alice).await,
+            (1000, "Browser closed".to_string())
+        );
+        assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+        broker.writer_gone(alice.id);
+        engine.kill();
+    }
+}
+
+#[tokio::test]
+async fn http_close_browser_timeout_keeps_closing_until_late_success() {
+    let mut engine = fake_engine().await;
+    let broker =
+        broker_with_deadlines(&engine, Duration::from_secs(2), Duration::from_millis(100)).await;
+    let mut alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+    let mut closed = broker.closed_watch();
+    let host = test_host(&broker);
+    let port = host.port();
+    let closing = tokio::spawn(http_close(port));
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    let browser = next_request(&mut engine).await;
+    assert_eq!(browser["method"], "Browser.close");
+    let failed = timeout(WAIT, closing).await.unwrap().unwrap();
+    assert!(failed.starts_with("HTTP/1.1 409"), "{failed}");
+    assert!(failed.contains("Browser close outcome unknown"), "{failed}");
+    // Browser.close 可能已执行：保留 Closing 与 unknown，不重发也不恢复授权。
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 1, 1));
+    assert_eq!(
+        broker.flush().await.err().expect("flush rejected"),
+        "Browser is closing"
+    );
+    assert_eq!(
+        broker
+            .close(CloseKind::Http, None, None, None)
+            .await
+            .unwrap_err(),
+        "Browser is closing"
+    );
+    expect_no_request(&mut engine).await;
+    engine.reply(request_id(&browser), json!({}));
+    assert_eq!(
+        next_close(&mut alice).await,
+        (1000, "Browser closed".to_string())
+    );
+    assert_eq!(broker.budget_snapshot().await, (0, 0, 0, 0));
+    broker.writer_gone(alice.id);
+    timeout(WAIT, closed.changed())
+        .await
+        .expect("closed watch")
+        .expect("closed sender");
+    assert!(*closed.borrow());
+    host.stop().await;
+    engine.kill();
+}
+
+#[tokio::test]
+async fn cdp_close_timeout_reports_one_error_and_late_error_restores_live() {
+    let mut engine = fake_engine().await;
+    let broker =
+        broker_with_deadlines(&engine, Duration::from_secs(2), Duration::from_millis(100)).await;
+    let mut alice = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+    send(&alice, &broker, r#"{"id":1,"method":"Browser.close"}"#).await;
+    let flush = next_request(&mut engine).await;
+    assert_eq!(flush["method"], "Kitesurf.flushProfile");
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    let browser = next_request(&mut engine).await;
+    assert_eq!(browser["method"], "Browser.close");
+    let error = next_frame(&mut alice).await;
+    assert_eq!(error["id"], 1);
+    assert_eq!(message(&error), "Browser close outcome unknown");
+    assert_eq!(broker.budget_snapshot().await, (1, 0, 1, 1));
+    expect_silence(&mut alice).await;
+    expect_no_request(&mut engine).await;
+    // 迟到 error 只恢复 live；不重复发送 close，也不再加一条错误帧。
+    engine.push(json!({
+      "id": request_id(&browser),
+      "error": { "code": -32000, "message": "late browser close error" }
+    }));
+    timeout(WAIT, async {
+        while broker.budget_snapshot().await != (0, 0, 0, 0) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late close error settles");
+    expect_silence(&mut alice).await;
+    expect_no_request(&mut engine).await;
+    assert!(broker.session().await.unwrap().alive);
+    send(&alice, &broker, r#"{"id":2,"method":"Browser.getVersion"}"#).await;
+    let version = next_request(&mut engine).await;
+    assert_eq!(version["method"], "Browser.getVersion");
+    engine.reply(request_id(&version), json!({ "product": "alive" }));
+    let reply = next_frame(&mut alice).await;
+    assert_eq!(reply["id"], 2);
+    assert_eq!(reply["result"]["product"], "alive");
+    engine.kill();
 }
 
 #[tokio::test]

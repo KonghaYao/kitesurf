@@ -3,7 +3,6 @@
 // https://opensource.org/licenses/Apache-2.0
 
 use super::*;
-use std::future::Future;
 use std::sync::Mutex;
 use crate::transport::{PayloadBudget, INTERNAL_BYTES, MAX_FRAME_BYTES, ORDINARY_BYTES};
 use tokio::sync::{oneshot, Notify, Semaphore};
@@ -488,7 +487,7 @@ pub(crate) struct OutcomeGate {
     pub(crate) ready: Notify,
     pub(crate) resume: Notify,
     command: Notify,
-    sent: Notify,
+    pub(crate) sent: Notify,
 }
 
 pub(in crate::broker) async fn send_profile_command(
@@ -496,17 +495,21 @@ pub(in crate::broker) async fn send_profile_command(
     command: crate::broker::BrokerCommand,
     gate: Arc<OutcomeGate>,
 ) {
-    let send = commands.send(command);
-    tokio::pin!(send);
-    std::future::poll_fn(|cx| {
-        match send.as_mut().poll(cx) {
-            std::task::Poll::Pending => gate.command.notify_one(),
-            std::task::Poll::Ready(_) => panic!("real actor command queue must be full"),
+    // 队列已满时等真实 actor 腾出容量；未满时直接入队，两种都由 sent 证明可观测。
+    let command = match commands.try_send(command) {
+        Ok(()) => {
+            gate.sent.notify_one();
+            return;
         }
-        std::task::Poll::Ready(())
-    })
-    .await;
-    send.await.ok().unwrap();
+        Err(mpsc::error::TrySendError::Full(command)) => {
+            gate.command.notify_one();
+            command
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            panic!("actor command queue closed")
+        }
+    };
+    commands.send(command).await.ok().unwrap();
     gate.sent.notify_one();
 }
 
@@ -1312,6 +1315,7 @@ async fn flush_window(cancel: bool) {
     check_budget(&budget);
     println!("flush-command cancel={cancel} presence={presence:?} command_capacity={} partial={:?} held={held:?} high={:?} heap={:?}", broker.commands.capacity(), socket.socket.test_presence(), budget.high_water(), allocations::stats());
     if cancel {
+        // abort 是 caller 取消，不是 2s/30s request timeout；actor 仍须结算。
         callback.abort();
         assert!(matches!(callback.await, Err(error) if error.is_cancelled()));
     } else {
