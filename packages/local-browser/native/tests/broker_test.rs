@@ -2009,7 +2009,7 @@ async fn diagnostic_latch_invalidates_health_before_actor_dispatch() {
     let (fatal, watch) = watch::channel(None);
     let broker = broker(&engine).await.with_diagnostics(watch);
     assert!(broker.session().await.unwrap().alive);
-    fatal.send(Some(EngineDiagnostic::Uncaught)).unwrap();
+    fatal.send(Some(EngineDiagnostic::InternalError)).unwrap();
     assert!(broker.session().await.is_none());
     assert!(!broker.wait_terminal().await);
     expect_no_request(&mut engine).await;
