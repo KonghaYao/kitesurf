@@ -43,7 +43,7 @@ jobs:
           common --lockfile_mode=error
           common --jobs=1
           common --local_test_jobs=1
-          common --experimental_disk_cache_gc_max_size=2G
+          build --experimental_disk_cache_gc_max_size=2G
           build -c opt
           EOF
       - name: Install Linux system fonts
