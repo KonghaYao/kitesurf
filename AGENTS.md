@@ -148,7 +148,7 @@ Use an explicit `KITESURF_PORT` or `--port` when other engines may be running, a
 - **Deploying:** `pnpm run deploy [wrangler deploy args]` builds with `--config=devtools` and
   uploads `:dist` and the assets unbundled (`scripts/engine-deploy.mjs`) to wrangler's account.
   `pnpm run deploy:preview` does the same with `wrangler versions upload`, which moves no traffic.
-  `packages/engine/wrangler.jsonc` stays a template with no account or routes. Agents never deploy.
+  `packages/engine/wrangler.jsonc` stays a template with no account or routes.
 - **Tracing:** send a `traceparent` header (or a bare trace id in it) with `pnpm dev:tracing` running.
 - **WPT:** `test:wpt` starts, health-checks and stops its own engines every `--batch-size` tests.
   It refuses to start if a port in its range is taken. `-j N` runs N engines and uses ports
@@ -169,7 +169,6 @@ Use an explicit `KITESURF_PORT` or `--port` when other engines may be running, a
 - Sign off every commit (`git commit -s`); see [CONTRIBUTING.md](CONTRIBUTING.md).
 - Do not commit plans, findings, inventories or scratch reproductions. `PLAN.md`, `TODO.md` and
   `FINDINGS.md` are gitignored for that purpose. Keep durable findings as a code comment.
-- Agents do not push; leave that to the person they work for.
 
 ### Code style
 
