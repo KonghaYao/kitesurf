@@ -16,6 +16,7 @@ import {
   resolveInspectorBaseUrl,
 } from "./inspector.ts";
 import { DEFAULT_ENGINE_HOST, type EngineHost } from "./host.ts";
+import { kitesurfProduct } from "./version.ts";
 
 // Loopback service binding for PageScript subresource fetches.
 export { SandboxOutbound } from "./eval/outbound.ts";
@@ -28,7 +29,6 @@ export { PageScriptTail } from "./eval/page-script-tail.ts";
 
 // Puppeteer reads the protocol version and WebSocket endpoint from /json/version.
 const VERSION_INFO = {
-  Browser: "Kitesurf/0.0.1",
   "Protocol-Version": "1.3",
   "User-Agent":
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
@@ -186,6 +186,7 @@ function discoveryVersion(c: Context<EngineApp>): Response {
   const scheme = url.protocol === "https:" ? "wss" : "ws";
   return Response.json({
     ...VERSION_INFO,
+    Browser: kitesurfProduct(c.env.env.KITESURF_VERSION),
     webSocketDebuggerUrl: `${scheme}://${host}/devtools/browser`,
   });
 }

@@ -34,6 +34,7 @@ import {
   DEFAULT_TTY_CELL_WIDTH_PX,
 } from "../tty/nav-params.ts";
 import { ttyFocusStylesheet, ttyUaStylesheet } from "../tty/stylesheet.ts";
+import { kitesurfProduct } from "../version.ts";
 import { wakeSceneStream } from "./scene-stream.ts";
 import {
   cancelAndRemoveTargetWheelQueues,
@@ -2105,7 +2106,7 @@ async function pushNavigateToPageScriptInner(
             cdpDebug: ctx.browser.cdpDebug,
             pixelFree: ctx.browser.skipSpeculativeRaster,
             fontDefer: ctx.browser.fontDefer,
-            userAgent: target.userAgentOverride || null,
+            userAgent: target.userAgentOverride || kitesurfProduct(ctx.env.KITESURF_VERSION),
             referrerPolicy: target.docReferrerPolicy ?? null,
             referrer: target.docReferrer ?? null,
             csp: target.docCsp ? [target.docCsp] : [],
@@ -2544,6 +2545,7 @@ function navErrorText(err: unknown, aborted: boolean): string | null {
   const msg = err instanceof Error ? err.message : String(err);
   if (name === "AbortError" || /\baborted\b/i.test(msg)) return "net::ERR_ABORTED";
   if (name === "InvalidRedirectError") return "net::ERR_INVALID_REDIRECT";
+  if (/failed to fetch|internal error; reference/i.test(msg)) return "net::ERR_FAILED";
   if (/refused|ECONNREFUSED|network connection lost/i.test(msg)) {
     return "net::ERR_CONNECTION_REFUSED";
   }
