@@ -32,15 +32,15 @@ import {
   type ShimEventCtors,
 } from "./state.ts";
 import { ensurePaintDom, invalidatePaintDom } from "./paint.ts";
-import { fetchGatedModuleSource } from "./inserted-scripts.ts";
+import { fetchGatedJsonModule, fetchGatedModuleSource } from "./inserted-scripts.ts";
 import { startupJsonModuleUrls } from "./startup-probe.ts";
 import { trustedFetch } from "./trusted-fetch.ts";
+import { memoryArea, sharedArea, StorageInterface, storageObject } from "./web-storage.ts";
 import { indexedDbGlobals } from "./indexeddb.ts";
 import { createScheduler } from "./scheduler.ts";
 import { installIdleCallbackGlobals, installPageTaskGlobals, queuePortTask } from "./page-tasks.ts";
 import { getBlobMimeType, normalizeBlobType, setBlobMimeType } from "./mime-type.ts";
 import { ksInternals } from "./internals.ts";
-import { makeWebStorage } from "./web-storage.ts";
 
 const MAX_IMAGE_DATA_PIXELS = 4096 * 4096;
 
@@ -471,8 +471,9 @@ export function installGlobals(
   if (!ksInternals.nativeImport) {
     ksInternals.nativeImport = function (url, type) {
       // A JSON request must not be answered with a baked JavaScript module, so only a record
-      // the navigate baked as JSON may resolve here; anything else goes through the gate, which
-      // parses it as JSON. The bake key is the resolver's registry name, not the requested URL.
+      // the navigate baked as JSON may resolve here; anything else goes through the gate, and
+      // the page realm parses it as JSON. The bake key is the resolver's registry name, not the
+      // requested URL.
       if (type === "json") {
         const name = bakedJsonModuleName(url, jsonModuleUrls, resolveModuleRegistryUrl);
         return name === undefined ? Promise.resolve(undefined) : import(name);
@@ -482,11 +483,12 @@ export function installGlobals(
   }
   if (!ksInternals.fetchModuleSource) {
     ksInternals.fetchModuleSource = function (url, referrer, type) {
-      return fetchGatedModuleSource(
-        String(url),
-        typeof referrer === "string" ? referrer : undefined,
-        type === "json" ? "json" : undefined,
-      );
+      const moduleUrl = String(url);
+      const from = typeof referrer === "string" ? referrer : undefined;
+      // A JSON module is parsed in the page realm and reaches boa as a namespace, so boa never
+      // holds its data as an object graph; every other module reaches it as source text.
+      if (type === "json") return fetchGatedJsonModule(moduleUrl, from);
+      return fetchGatedModuleSource(moduleUrl, from);
     };
   }
   if (!evalPatched) {
@@ -3097,10 +3099,21 @@ export function installGlobals(
     }
     installIdleCallbackGlobals();
     if (Object.getOwnPropertyDescriptor(globalThis, "localStorage") === undefined) {
-      // Opaque sandbox origins retain the throwing accessor below.
+      try {
+        Object.defineProperty(globalThis, "Storage", {
+          value: StorageInterface,
+          writable: true,
+          configurable: true,
+          enumerable: false,
+        });
+      } catch {}
+      // localStorage is a copy of the browser context's area when the engine seeded one
+      // (web-storage.ts). One isolate is one document, so the origin is fixed here.
+      const seed = state.sandbox.sameOrigin ? state.localStorageSeed : null;
+      // An opaque sandboxed origin has no storage bucket; the accessor throws, as in Chrome.
       const buckets = {
-        localStorage: makeWebStorage("localStorage"),
-        sessionStorage: makeWebStorage("sessionStorage"),
+        localStorage: storageObject(seed ? sharedArea(seed) : memoryArea()),
+        sessionStorage: storageObject(memoryArea()),
       };
       const storageAccessor =
         (name: keyof typeof buckets): (() => unknown) =>

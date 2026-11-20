@@ -9,7 +9,6 @@ export declare const hasHtml: boolean;
 export declare const htmlLength: number;
 export declare const url: string | null;
 export declare const cookies: string;
-export declare const webStorage: import("@kitesurf/jsrpc-types/web-storage").WebStorageSeed;
 export declare const scriptDescriptors: Array<{
   src: string | null;
   kind: "classic" | "module";
@@ -31,7 +30,10 @@ export declare const moduleScriptCount: number;
 export declare const resourceDrainQuietTurns: number;
 export declare const pixelFree: boolean;
 export declare const fontDefer: boolean;
+// The local browser answers every font request from the host's system font set.
 export declare const systemFonts: boolean;
+// The connection's UA font profile, validated by the engine; core's UA_FONT_PROFILES names it.
+export declare const fontProfile: string;
 export declare const moduleScriptUrls: string[];
 // Module URLs the navigate baked as JSON records; the runtime loader may answer only these
 // from the module map when an import requests type "json".

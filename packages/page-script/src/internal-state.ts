@@ -62,6 +62,11 @@ export interface KitesurfInternalState {
   currentScriptBodyKey?: string | undefined;
 
   endClassicScript: (() => Promise<void>) | null;
+  // Reports a caught script error to the Runtime.exceptionThrown buffer. The classic bundle
+  // catches per script, so this is the only signal a pageerror listener gets.
+  pushException:
+    | ((err: unknown, opts: { scriptId: string; url: string; text?: string }) => void)
+    | null;
   // Fires load (ok) or error at a parser-inserted external classic script. domIndex is its
   // ordinal among the document's <script> elements; rawSrc and src check the match.
   parserScriptLifecycle:
@@ -80,6 +85,8 @@ export interface KitesurfInternalState {
   navigateIframe: ((iframeEl: unknown, url: string, post?: IframePost) => void) | null;
 
   markNative: ((fn: unknown, name: string) => void) | null;
+
+  markRenamed: ((fn: unknown, internal: string, name: string) => void) | null;
 
   viewportW: number;
   viewportH: number;
@@ -145,6 +152,7 @@ export function createInternalState(): KitesurfInternalState {
     setCurrentScript: null,
     currentScriptSrc: undefined,
     endClassicScript: null,
+    pushException: null,
     parserScriptLifecycle: null,
     bundleDiag: null,
     afterIframeInsert: null,
@@ -153,6 +161,7 @@ export function createInternalState(): KitesurfInternalState {
     afterIframeSrcChange: null,
     navigateIframe: null,
     markNative: null,
+    markRenamed: null,
     viewportW: DEFAULT_VIEWPORT_WIDTH_PX,
     viewportH: DEFAULT_VIEWPORT_HEIGHT_PX,
     dispatchingUserEvent: false,
@@ -207,6 +216,9 @@ export interface KitesurfInternals {
   // The highest parent clock sample, in epoch ms. Date.now() can freeze within a turn, so
   // animation time floors to this; the wasm core reads it too.
   clockFloorMs?: number;
+  // The running animation frame's timestamp, in epoch ms, until the frame's task ends.
+  // Document timelines read it so they agree with the rAF callbacks' timestamp.
+  animationFrameTimeMs?: number;
   jsSpanEnter?: (op: string, bytes: number, detail: string) => number;
   jsSpanExit?: (slot: number) => void;
   // In lazy font mode, upgrades to the full fonts so text shaped outside layout (canvas, SVG)
@@ -245,9 +257,15 @@ export interface KitesurfInternals {
   // A baked module's V8 namespace, so boa reuses it instead of fetching. A JSON request only
   // resolves a record the navigate baked as JSON; anything else falls through to the gate.
   nativeImport?: (url: unknown, type?: unknown) => Promise<unknown>;
-  // A module body for boa's fetch-and-interpret path, through the script gate.
-  // The referrer is the importing module's URL, or the page's for an entry import.
-  fetchModuleSource?: (url: unknown, referrer?: unknown, type?: unknown) => Promise<string>;
+  // A module body for boa's fetch-and-interpret path, through the script gate. Source text is
+  // parsed by boa; a JSON module's namespace is wrapped as a synthetic module, so the page realm
+  // parses its data and boa never holds it as an object graph. The referrer is the importing
+  // module's URL, or the page's for an entry import.
+  fetchModuleSource?: (
+    url: unknown,
+    referrer?: unknown,
+    type?: unknown,
+  ) => Promise<string | object>;
   // Run due page timers while boa awaits; returns how many ran. Installed read-only.
   readonly pumpDueTimers?: (deadlineMs?: number) => number;
   // Ms until the next page timer is due, or Infinity.

@@ -72,10 +72,12 @@ copy_to_bin(
 )
 
 _CONFIG_PACKAGES = [
+    "docker",
     "packages/core/pkg",
     "packages/dom-shim",
     "packages/engine",
     "packages/engine/test/e2e",
+    "packages/engine-server",
     "packages/jsrpc-types",
     "packages/kitesurf-cli",
     "packages/local-browser",
@@ -212,6 +214,7 @@ test_suite(
         "//packages/dom-shim:build",
         "//packages/dom-shim:no_explicit_any",
         "//packages/dom-shim:types",
+        "//packages/dom-shim:vitest",
         "//packages/engine:types",
         "//packages/engine:types_e2e",
         "//packages/engine:types_e2e_demos",
@@ -236,6 +239,12 @@ test_suite(
         ":cargo_lock_isolation_test",
         "//scripts:lint_test",
         "//scripts:lint_types",
+        "//scripts:page_renderer_pdf_stream_test",
+        "//scripts:page_script_font_loader_test",
+        "//scripts:page_script_frame_bitmap_gate_test",
+        "//scripts:page_script_pdf_stream_test",
+        "//scripts:page_script_startup_input_test",
+        "//scripts:wasm_memory_views_test",
     ],
 )
 

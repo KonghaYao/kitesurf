@@ -31,8 +31,6 @@ import type {
   PackedResult,
 } from "@kitesurf/jsrpc-types/shared";
 import type { OutboundProps } from "./outbound.ts";
-import { webStorageFor } from "../state/web-storage.ts";
-import type { WebStorageDelivery } from "@kitesurf/jsrpc-types/web-storage";
 import {
   openPageScriptRpcSession,
   type RpcSessionCallable,
@@ -44,9 +42,11 @@ import { MAX_DOCUMENT_BYTES } from "../read-capped.ts";
 import { attributionTails, type AttributionTailExports } from "./attribution-tail.ts";
 import { makeWallClock, type HostClock } from "./host-clock.ts";
 import type { SandboxOutboundOverride } from "./outbound.ts";
+import type { SessionContext } from "../cdp/dispatch.ts";
 import type { ParentScriptDescriptor } from "../wasm.ts";
 import type { ScriptBundle } from "./script-bundle.ts";
 import { FALLBACK_MODULE_RESOLVER_SOURCE } from "./walk-module-graph.ts";
+import { DEFAULT_FONT_PROFILE, type FontProfile } from "../cdp/font-profile.ts";
 import type { WasmBake } from "./prefetch-wasm.ts";
 
 export interface PageScriptStub extends PageScriptSession {
@@ -60,7 +60,7 @@ export interface PageScriptStub extends PageScriptSession {
   getRenderPort(): Promise<RenderPortStub>;
 }
 
-type CtxWithExports = ExecutionContext & {
+type CtxWithExports = SessionContext & {
   exports: AttributionTailExports & {
     SandboxOutbound(opts: { props: OutboundProps }): Fetcher;
     PageScriptTail(opts: {
@@ -81,6 +81,26 @@ export const PAGE_SCRIPT_COMPAT_FLAGS: readonly string[] = [
   "no_nodejs_compat",
   "no_nodejs_compat_v2",
 ];
+
+// workerd's local-only, experimental flag that lets a Worker generate code from strings. The
+// isolate's eval paths try native code first and fall back to boa on the EvalError without it.
+const NATIVE_EVAL_COMPAT_FLAG = "allow_insecure_inefficient_logged_eval";
+
+/**
+ * The loaded workers' flags. With KITESURF_NATIVE_EVAL they add native eval, which as an
+ * experimental flag needs `allowExperimental`, so the engine needs the `experimental` flag.
+ */
+export function pageScriptCompatOptions(env: { KITESURF_NATIVE_EVAL?: string }): {
+  compatibilityFlags: string[];
+  allowExperimental?: boolean;
+} {
+  if (env.KITESURF_NATIVE_EVAL !== "1")
+    return { compatibilityFlags: [...PAGE_SCRIPT_COMPAT_FLAGS] };
+  return {
+    compatibilityFlags: [...PAGE_SCRIPT_COMPAT_FLAGS, NATIVE_EVAL_COMPAT_FLAG],
+    allowExperimental: true,
+  };
+}
 
 export const PAGE_SCRIPT_SUBREQUEST_CAP = 10_000;
 
@@ -160,6 +180,7 @@ export interface PageScriptStartupInput {
   cdpDebug: boolean;
   pixelFree: boolean;
   fontDefer?: boolean;
+  fontProfile?: FontProfile;
 }
 
 function emptyWasmBytes(): ArrayBuffer {
@@ -169,7 +190,7 @@ function emptyWasmBytes(): ArrayBuffer {
 interface GetOrCreatePageScriptOptions {
   env: {
     LOADER: WorkerLoader;
-    KITESURF_SIMULATE_PROD_EVAL?: string;
+    KITESURF_NATIVE_EVAL?: string;
     KITESURF_RESOURCE_DRAIN_QUIET_TURNS?: string;
     KITESURF_LAG_WATCHDOG?: string;
     KITESURF_PAGE_CPU_MS_CAP?: string;
@@ -178,7 +199,7 @@ interface GetOrCreatePageScriptOptions {
     HOST_CLOCK?: HostClock;
     KITESURF_SYSTEM_FONTS?: string;
   };
-  ctx: ExecutionContext;
+  ctx: SessionContext;
   key: PageScriptKey;
   pageOrigin: string;
   cookieSiteOrigin?: string;
@@ -210,13 +231,6 @@ export function getOrCreatePageScript({
   pageIsolate,
 }: GetOrCreatePageScriptOptions): PageScriptStub {
   const cx = ctx as CtxWithExports;
-  const storage = webStorageFor(key.connectionId);
-  const storageContext = key.cookieKey || key.connectionId;
-  const storageOrigin = originOf(pageOrigin);
-  const storageSeed = storage?.seed(storageContext, key.targetId, storageOrigin) ?? {
-    localStorage: [],
-    sessionStorage: [],
-  };
   const wall = makeWallClock(env);
   const name = pageScriptCacheKey(key);
   const caps = pageIsolateCaps(env, capOverrides);
@@ -250,6 +264,7 @@ export function getOrCreatePageScript({
   const pixelFree = startupInput.pixelFree === true;
   const fontDefer = startupInput.fontDefer === true;
   const systemFonts = env.KITESURF_SYSTEM_FONTS === "1";
+  const fontProfile = startupInput.fontProfile ?? DEFAULT_FONT_PROFILE;
   const configuredQuietTurns = Number.parseInt(env.KITESURF_RESOURCE_DRAIN_QUIET_TURNS ?? "", 10);
   const resourceDrainQuietTurns = Number.isFinite(configuredQuietTurns)
     ? Math.max(1, configuredQuietTurns)
@@ -277,7 +292,6 @@ export const hasHtml = ${JSON.stringify(hasHtml)};
 export const htmlLength = ${JSON.stringify(htmlLength)};
 export const url = ${JSON.stringify(url)};
 export const cookies = ${JSON.stringify(cookies)};
-export const webStorage = ${JSON.stringify(storageSeed)};
 export const scriptDescriptors = ${JSON.stringify(scriptDescriptors)};
 export const userAgent = ${JSON.stringify(userAgent)};
 export const referrer = ${JSON.stringify(referrer)};
@@ -292,6 +306,7 @@ export const lagWatchdog = ${JSON.stringify(lagWatchdog)};
 export const pixelFree = ${JSON.stringify(pixelFree)};
 export const fontDefer = ${JSON.stringify(fontDefer)};
 export const systemFonts = ${JSON.stringify(systemFonts)};
+export const fontProfile = ${JSON.stringify(fontProfile)};
 export const resourceDrainQuietTurns = ${JSON.stringify(resourceDrainQuietTurns)};
 export const csp = ${JSON.stringify(csp)};
 export const metaCsp = ${JSON.stringify(metaCsp)};
@@ -381,7 +396,7 @@ export const manifest = ${JSON.stringify(wasmBake ? wasmBake.manifest : {})};
   const mainModule = pageIsolateEntry(modules, pageIsolate);
   const stub = env.LOADER.load({
     compatibilityDate: PAGE_SCRIPT_COMPAT_DATE,
-    compatibilityFlags: [...PAGE_SCRIPT_COMPAT_FLAGS],
+    ...pageScriptCompatOptions(env),
     mainModule,
     modules,
     // Page modules run in this worker and can import its env, so the tail
@@ -443,10 +458,7 @@ export const manifest = ${JSON.stringify(wasmBake ? wasmBake.manifest : {})};
         }
       }
     : spanWrap;
-  let detachStorage: (() => void) | undefined;
   const session = openPageScriptRpcSession(entrypoint, {
-    onDead: () => detachStorage?.(),
-    onStorage: (change) => storage?.change(storageReceiver, change),
     now: makeWallClock(env),
     outbound: sandboxOutbound.session(outboundProps),
     wallCapMs: caps.wallMs > 0 ? caps.wallMs : undefined,
@@ -455,15 +467,6 @@ export const manifest = ${JSON.stringify(wasmBake ? wasmBake.manifest : {})};
     wrapOpen,
   });
   session.isolateStamp = isolateStamp;
-  const storageReceiver = {
-    context: storageContext,
-    tab: key.targetId,
-    origin: storageOrigin,
-    url: pageOrigin,
-    apply: (change: WebStorageDelivery) => session.queryDom("applyWebStorageChange", change),
-    flush: () => session.queryDom("flushWebStorage", {}),
-  };
-  detachStorage = storage?.register(storageReceiver);
   return session;
 }
 
@@ -474,11 +477,11 @@ export interface PageScriptInitTimings {
 export function spawnFramePageScript(
   env: {
     LOADER: WorkerLoader;
-    KITESURF_SIMULATE_PROD_EVAL?: string;
+    KITESURF_NATIVE_EVAL?: string;
     KITESURF_LAG_WATCHDOG?: string;
     KITESURF_SYSTEM_FONTS?: string;
   },
-  ctx: ExecutionContext,
+  ctx: SessionContext,
   args: {
     connectionId: string;
     targetId: string;
@@ -491,6 +494,7 @@ export function spawnFramePageScript(
     cookieSiteOrigin?: string;
     extraHeaders?: Record<string, string>;
     attributionHeaders?: Record<string, string>;
+    fontProfile: FontProfile;
     sandboxOutbound: SandboxOutboundOverride;
   },
 ): PageScriptStub {
@@ -510,7 +514,7 @@ export function spawnFramePageScript(
     key,
     pageOrigin,
     cookieSiteOrigin: args.cookieSiteOrigin,
-    startupInput: {},
+    startupInput: { fontProfile: args.fontProfile },
     attributionHeaders: args.attributionHeaders ?? {},
     mainLoaderId: args.frameLoaderId,
     extraHeaders: args.extraHeaders ?? {},

@@ -16,6 +16,7 @@ import type { DiagSpanTracker } from "./diag-spans.ts";
 import type { SandboxOutboundOverride } from "../eval/outbound.ts";
 import type { WheelQueue } from "./wheel-queue.ts";
 import type { StyleCache } from "./style-cache.ts";
+import type { FontProfile } from "./font-profile.ts";
 
 export type CdpMethod = keyof ProtocolMapping.Commands;
 
@@ -40,6 +41,14 @@ export interface CdpSuccess {
   id: number;
   result: unknown;
   sessionId?: string;
+}
+
+export class RawJsonResult {
+  constructor(
+    readonly pieces: readonly string[],
+    /** The parsed result, for in-process callers; a result may parse cheaper than its text. */
+    readonly parse: () => unknown = () => JSON.parse(pieces.join("")),
+  ) {}
 }
 
 export interface CdpError {
@@ -104,14 +113,25 @@ export type CdpEvent = {
 
 export type EventEmitter = (event: CdpEvent) => void;
 
+/**
+ * One CDP client (one WebSocket) on a browser session: the state Chrome keeps per DevTools
+ * client, not per browser. Everything the clients share stays on BrowserState.
+ */
+export interface CdpClientState {
+  // Page mode treats the socket as the page's own session; browser mode exposes page targets.
+  readonly connectionMode: "page" | "browser";
+  autoAttach: boolean;
+  flatten: boolean;
+}
+
 export interface BrowserState {
   flushProfile?: (targetId?: string) => Promise<void>;
   targets: Map<string, TargetState>;
   sandboxOutbound: SandboxOutboundOverride;
-  autoAttach: boolean;
-  flatten: boolean;
   cookies: CookieJar;
-  contexts: Map<string, { cookieJar: CookieJar }>;
+  contexts: Map<string, { cookieJar: CookieJar; localStorage: LocalStorage }>;
+  // The default context's localStorage, shared by its pages across navigations.
+  localStorage: LocalStorage;
   nextBrowserContextId: number;
   screencasts: Map<string, ScreencastState>;
   styleCache: StyleCache;
@@ -120,7 +140,6 @@ export interface BrowserState {
   layoutMode: "full" | "off";
   cdpDebug: boolean;
   isolateCapOverrides?: PageIsolateCapOverrides;
-  connectionMode: "page" | "browser";
   ttyKeyboard?: boolean;
   preNavScripts: Map<string, string>;
   learnedInsertedScripts: LearnedScripts;
@@ -140,6 +159,7 @@ export interface BrowserState {
   skipSpeculativeRaster: boolean;
   skipPartialRaster: boolean;
   fontDefer: boolean;
+  fontProfile: FontProfile;
   rendererSessionId: string | null;
   engineSessionId: string | null;
   wsClosing: boolean;
@@ -177,6 +197,7 @@ import type { DomHandle, DocScan } from "../wasm.ts";
 import type { PageScriptStub, PageIsolateCapOverrides } from "../eval/page-script.ts";
 import type { PageSession } from "./page-session.ts";
 import type { CookieJar } from "../cookies.ts";
+import type { LocalStorage } from "../state/local-storage.ts";
 
 // One navigation's child-frame admission, shared by every branch and depth: registered child
 // frames and the parse input their retained DOMs charged. A frame refunds its charge when its
@@ -287,6 +308,9 @@ export interface TargetState {
   url: string;
   title: string;
   html: string;
+  // The source was dropped once PageScript owned a large document, so a later fallback read
+  // must fail rather than report an empty page.
+  fallbackHtmlReleased: boolean;
   dom: DomHandle | null;
   docScan: DocScan | null;
   domEpoch: number;
@@ -321,6 +345,9 @@ export interface TargetState {
   nextNavigationHistoryId: number;
   viewportWidth: number | null;
   viewportHeight: number | null;
+  // Emulated device pixel ratio. Rendering stays in CSS pixels, but Playwright
+  // divides a `scale: "css"` screenshot's clip scale by it.
+  deviceScaleFactor: number;
   screencastConfigurationBarrier: Promise<void>;
   screencastConfigurationVersion: number;
   emulatedMedia: "screen" | "print";

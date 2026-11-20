@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 
+import { startEngine } from "../packages/engine-server/server.mjs";
 import { prepare } from "./wpt-engine.mjs";
 
 const ENGINE_TEST_TIMEOUT_MS = 60_000;
@@ -18,7 +19,7 @@ const SHUTDOWN_TIMEOUT_MS = 5_000;
 const REQUEST_TIMEOUT_MS = 5_000;
 
 test(
-  "engine preparation and serving retain the embedding host's config and binary imports",
+  "engine preparation and serving retain the embedding host's config, binary imports and V8 flags",
   { timeout: ENGINE_TEST_TIMEOUT_MS },
   async (t) => {
     const root = mkdtempSync(join(tmpdir(), "kitesurf-host-dist-"));
@@ -41,7 +42,7 @@ test(
     writeFileSync(join(root, "data.bin"), new Uint8Array([1, 2, 3]));
     writeFileSync(
       join(root, "index.js"),
-      'import data from "./data.bin"; export default { fetch(_request, env) { return new Response(`private host:${env.HOST_MARKER}:${new Uint8Array(data)}`); } };',
+      'import data from "./data.bin"; export default { fetch(_request, env) { return new Response(`private host:${env.HOST_MARKER}:${new Uint8Array(data)}:${typeof globalThis.gc}`); } };',
     );
     writeFileSync(
       config,
@@ -75,10 +76,12 @@ test(
         String(address.port),
         "--inspector-port",
         "0",
+        "--v8-flags",
+        " --expose-gc ",
       ],
       { stdio: ["ignore", "pipe", "pipe"] },
     );
-    const url = await new Promise((ready, reject) => {
+    const { url, line } = await new Promise((ready, reject) => {
       let output = "";
       child.once("error", reject);
       child.once("exit", (code) => reject(new Error(`engine exited ${code}: ${output}`)));
@@ -87,12 +90,51 @@ test(
       });
       child.stdout.on("data", (chunk) => {
         output += chunk;
-        const match = output.match(/\[wpt-engine\] ready on (http:\/\/[^\s]+)/);
-        if (match) ready(match[1]);
+        const match = output.match(/\[wpt-engine\] ready on (http:\/\/[^\s]+)(.*)\n/);
+        if (match) ready({ url: match[1], line: match[2] });
       });
     });
     const response = await fetch(url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
     assert.equal(response.status, 200);
-    assert.equal(await response.text(), "private host:private:1,2,3");
+    assert.match(line, /V8 flags --expose-gc\)$/);
+    assert.equal(await response.text(), "private host:private:1,2,3:function");
+  },
+);
+
+test(
+  "native eval adds the experimental flag once to a host that already sets it",
+  { timeout: ENGINE_TEST_TIMEOUT_MS },
+  async (t) => {
+    const root = mkdtempSync(join(tmpdir(), "kitesurf-native-eval-dist-"));
+    const config = join(root, "wrangler.jsonc");
+    const dist = join(root, "dist");
+    let miniflare;
+    t.after(async () => {
+      await miniflare?.dispose();
+      rmSync(root, { recursive: true, force: true });
+    });
+    writeFileSync(
+      join(root, "index.js"),
+      "export default { fetch(_request, env) { return new Response(env.KITESURF_NATIVE_EVAL); } };",
+    );
+    writeFileSync(
+      config,
+      JSON.stringify({
+        name: "kitesurf-test-host",
+        main: "index.js",
+        compatibility_date: "2026-09-11",
+        compatibility_flags: ["experimental"],
+      }),
+    );
+    await prepare(dist, config);
+    const server = createServer().listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const { port } = server.address();
+    server.close();
+    await once(server, "close");
+    const started = await startEngine({ dist, port, vars: { KITESURF_NATIVE_EVAL: "1" } });
+    miniflare = started.miniflare;
+    const response = await fetch(started.url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+    assert.equal(await response.text(), "1");
   },
 );

@@ -23,6 +23,7 @@ use boa_engine::{
     module::{ModuleLoader, ModuleRequest, Referrer, SyntheticModuleInitializer},
     object::{builtins::JsPromise, FunctionObjectBuilder, JsObject},
     property::Attribute,
+    realm::Realm,
     Context, JsArgs, JsNativeError, JsResult, JsString, JsValue as BoaValue, Module,
     NativeFunction, Source,
 };
@@ -106,7 +107,7 @@ async fn gated_module_source(
     url: &str,
     referrer: Option<&str>,
     module_type: Option<&str>,
-) -> Option<Result<String, String>> {
+) -> Option<Result<LoadedModule, String>> {
     let hook: js_sys::Function = get("fetchModuleSource")?.dyn_into().ok()?;
     let referrer = referrer.map_or(JsValue::UNDEFINED, JsValue::from_str);
     let module_type = module_type.map_or(JsValue::UNDEFINED, JsValue::from_str);
@@ -122,20 +123,21 @@ async fn gated_module_source(
         Ok(p) => p,
         Err(e) => return Some(Err(e)),
     };
-    match wasm_bindgen_futures::JsFuture::from(Promise::from(promise)).await {
-        Ok(v) => Some(
-            v.as_string()
-                .ok_or_else(|| "module body not a string".to_string()),
-        ),
-        Err(e) => Some(Err(format!("module refused for {url}: {e:?}"))),
-    }
+    let value = match wasm_bindgen_futures::JsFuture::from(Promise::from(promise)).await {
+        Ok(v) => v,
+        Err(e) => return Some(Err(format!("module refused for {url}: {e:?}"))),
+    };
+    Some(
+        module_body(&value)
+            .ok_or_else(|| format!("module body for {url} is neither source nor a namespace")),
+    )
 }
 
 async fn fetch_module_source(
     url: String,
     referrer: Option<String>,
     module_type: Option<String>,
-) -> Result<String, String> {
+) -> Result<LoadedModule, String> {
     if let Some(gated) =
         gated_module_source(&url, referrer.as_deref(), module_type.as_deref()).await
     {
@@ -172,6 +174,7 @@ async fn fetch_module_source(
     .await
     .map_err(|_| "text() rejected".to_string())?;
     text.as_string()
+        .map(LoadedModule::Source)
         .ok_or_else(|| "module body not a string".to_string())
 }
 
@@ -231,10 +234,23 @@ fn v8_namespace_to_synthetic(url: &str, ns: &wasm_bindgen::JsValue, ctx: &mut Co
     Module::synthetic(&names, init, Some(std::path::PathBuf::from(url)), None, ctx)
 }
 
+// What a module load produced: text for boa to parse, or a namespace the page realm already
+// built. A JSON module takes the namespace path, so its data is never parsed here.
 enum LoadedModule {
     Native(wasm_bindgen::JsValue),
     Source(String),
-    Err(String),
+}
+
+// A module body the page's hook answered: source text for a JavaScript module, or the namespace
+// of a JSON module the page realm parsed.
+fn module_body(value: &JsValue) -> Option<LoadedModule> {
+    if let Some(source) = value.as_string() {
+        return Some(LoadedModule::Source(source));
+    }
+    if value.is_object() {
+        return Some(LoadedModule::Native(value.clone()));
+    }
+    None
 }
 
 impl ModuleLoader for KsModuleLoader {
@@ -258,11 +274,8 @@ impl ModuleLoader for KsModuleLoader {
         // a JSON request from a record it baked as JSON, so a typed request cannot reach
         // JavaScript here.
         let loaded = match native_import_namespace(url.clone(), module_type.clone()).await {
-            Some(ns) => LoadedModule::Native(ns),
-            None => match fetch_module_source(url.clone(), referrer_url, module_type).await {
-                Ok(src) => LoadedModule::Source(src),
-                Err(msg) => LoadedModule::Err(msg),
-            },
+            Some(ns) => Ok(LoadedModule::Native(ns)),
+            None => fetch_module_source(url.clone(), referrer_url, module_type).await,
         };
         // Dedupe concurrent in-flight loads of the same URL: a sibling load may
         // have parsed and registered this module while we fetched.
@@ -272,16 +285,16 @@ impl ModuleLoader for KsModuleLoader {
         let module = {
             let ctx = &mut *context.borrow_mut();
             match loaded {
-                LoadedModule::Native(ns) => v8_namespace_to_synthetic(&url, &ns, ctx),
-                // A JSON module arrives wrapped as `export default <literal>` by the
-                // gated source hook, which types it from the response MIME.
-                LoadedModule::Source(src) => Module::parse(
+                Ok(LoadedModule::Native(ns)) => v8_namespace_to_synthetic(&url, &ns, ctx),
+                // An untyped import of a JSON-MIME body arrives wrapped as
+                // `export default <literal>`; a JSON-typed one arrives as a namespace above.
+                Ok(LoadedModule::Source(src)) => Module::parse(
                     Source::from_bytes(src.as_bytes())
                         .with_path(std::path::Path::new(url.as_str())),
                     None,
                     ctx,
                 )?,
-                LoadedModule::Err(msg) => {
+                Err(msg) => {
                     return Err(JsNativeError::typ().with_message(msg).into());
                 }
             }
@@ -1275,8 +1288,113 @@ fn marshal_cdp(value: BoaValue, return_by_value: bool, ctx: &mut Context) -> JsV
     }
 }
 
+struct FrameRealm {
+    realm: Realm,
+    window: JsValue,
+    bridge_handle: u64,
+}
+
+thread_local! {
+    static FRAME_REALMS: RefCell<HashMap<String, FrameRealm>> = RefCell::new(HashMap::new());
+}
+
+struct RealmGuard {
+    ptr: *mut Context,
+    previous: Option<Realm>,
+}
+
+impl Drop for RealmGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.previous.take() {
+            // SAFETY: single-threaded; the guard drops before any await yields `*ptr`.
+            unsafe {
+                let _ = (&mut *self.ptr).enter_realm(prev);
+            }
+        }
+    }
+}
+
+fn enter_frame_realm(
+    ptr: *mut Context,
+    frame: Option<(String, JsValue)>,
+) -> Result<RealmGuard, JsValue> {
+    let Some((frame_id, frame_window)) = frame else {
+        return Ok(RealmGuard {
+            ptr,
+            previous: None,
+        });
+    };
+    let existing = FRAME_REALMS.with(|cell| {
+        let realms = cell.borrow();
+        let entry = realms.get(&frame_id);
+        let hit = entry
+            .filter(|r| r.window == frame_window)
+            .map(|r| r.realm.clone());
+        drop(realms);
+        hit
+    });
+    // SAFETY: single-threaded; no await occurs while `ctx` is live.
+    let ctx = unsafe { &mut *ptr };
+    let (guard, created) = match existing {
+        Some(realm) => (
+            RealmGuard {
+                ptr,
+                previous: Some(ctx.enter_realm(realm)),
+            },
+            None,
+        ),
+        None => {
+            let realm = ctx
+                .create_realm()
+                .map_err(|e| js_sys::Error::new(&format!("{e}")))?;
+            let guard = RealmGuard {
+                ptr,
+                previous: Some(ctx.enter_realm(realm.clone())),
+            };
+            (guard, Some(realm))
+        }
+    };
+    if let Some(realm) = created {
+        let bridge_handle = crate::js::boa_bridge::install_realm_bridge(frame_window.clone(), ctx);
+        let old = FRAME_REALMS.with(|cell| {
+            let mut realms = cell.borrow_mut();
+            let prev = realms.insert(
+                frame_id,
+                FrameRealm {
+                    realm,
+                    window: frame_window,
+                    bridge_handle,
+                },
+            );
+            drop(realms);
+            prev
+        });
+        if let Some(stale) = old {
+            crate::js::boa_bridge::release_v8_value(stale.bridge_handle);
+        }
+    }
+    Ok(guard)
+}
+
 #[wasm_bindgen]
-pub fn ks_eval_cdp(src: String, await_promise: bool, return_by_value: bool) -> Promise {
+pub fn ks_release_frame_realm(frame_id: String) {
+    let removed = FRAME_REALMS.with(|cell| {
+        let mut realms = cell.borrow_mut();
+        let old = realms.remove(&frame_id);
+        drop(realms);
+        old
+    });
+    if let Some(entry) = removed {
+        crate::js::boa_bridge::release_v8_value(entry.bridge_handle);
+    }
+}
+
+fn eval_cdp_impl(
+    src: String,
+    frame: Option<(String, JsValue)>,
+    await_promise: bool,
+    return_by_value: bool,
+) -> Promise {
     arm_v8_ran();
     let ks_span = tracing::info_span!("wasm.boa_eval", src_bytes = src.len(), engine = "boa");
     wasm_bindgen_futures::future_to_promise(panic::AssertUnwindSafe(
@@ -1296,9 +1414,92 @@ pub fn ks_eval_cdp(src: String, await_promise: bool, return_by_value: bool) -> P
                     // counter, so a nested `with_context` under it reads as 2;
                     // it does not gate anything.
                     let _depth = crate::js::boa_bridge::DepthGuard::enter();
+                    let _realm_guard = enter_frame_realm(ptr, frame)?;
                     let ctx = unsafe { &mut *ptr };
                     heal_residual_stack(ctx);
                     let value = match ctx.eval(Source::from_bytes(src.as_bytes())) {
+                        Ok(v) => v,
+                        Err(e) => return Err(cdp_throw(&e, ctx)),
+                    };
+                    (ptr, value)
+                };
+                pump(ptr, || true).await;
+                drive_cdp(value, await_promise, return_by_value, ptr).await
+            },
+            ks_span,
+        ),
+    ))
+}
+
+#[wasm_bindgen]
+pub fn ks_eval_cdp(src: String, await_promise: bool, return_by_value: bool) -> Promise {
+    eval_cdp_impl(src, None, await_promise, return_by_value)
+}
+
+#[wasm_bindgen]
+pub fn ks_eval_cdp_in_frame(
+    src: String,
+    frame_id: String,
+    frame_window: JsValue,
+    await_promise: bool,
+    return_by_value: bool,
+) -> Promise {
+    eval_cdp_impl(
+        src,
+        Some((frame_id, frame_window)),
+        await_promise,
+        return_by_value,
+    )
+}
+
+fn call_cdp_impl(
+    fn_src: String,
+    this_v8: JsValue,
+    args_v8: js_sys::Array,
+    frame: Option<(String, JsValue)>,
+    await_promise: bool,
+    return_by_value: bool,
+) -> Promise {
+    arm_v8_ran();
+    let ks_span = tracing::info_span!("wasm.boa_call", src_bytes = fn_src.len(), engine = "boa");
+    let use_realm_global = frame.is_some() && this_v8.is_undefined();
+    wasm_bindgen_futures::future_to_promise(panic::AssertUnwindSafe(
+        tracing::Instrument::instrument(
+            async move {
+                let (ptr, value) = {
+                    let _boa_guard = acquire_boa_lock().await;
+                    if !ensure_persistent() {
+                        return Err(JsValue::from_str("kitesurf boa: context init failed"));
+                    }
+                    let ptr = context_ptr();
+                    if ptr.is_null() {
+                        return Err(JsValue::from_str("kitesurf boa: no context"));
+                    }
+                    // SAFETY: see eval_cdp_impl. &mut is never held across a yield.
+                    let _depth = crate::js::boa_bridge::DepthGuard::enter();
+                    let _realm_guard = enter_frame_realm(ptr, frame)?;
+                    let ctx = unsafe { &mut *ptr };
+                    heal_residual_stack(ctx);
+                    let fn_expr = format!("({fn_src})");
+                    let fn_val = match ctx.eval(Source::from_bytes(fn_expr.as_bytes())) {
+                        Ok(v) => v,
+                        Err(e) => return Err(js_sys::Error::new(&format!("{e}")).into()),
+                    };
+                    let Some(callable) = fn_val.as_object().filter(|o| o.is_callable()) else {
+                        return Err(JsValue::from_str(
+                            "kitesurf boa: callFunctionOn target is not a function",
+                        ));
+                    };
+                    let this_boa = if use_realm_global {
+                        ctx.global_object().clone().into()
+                    } else {
+                        crate::js::boa_bridge::v8_to_boa(this_v8, ctx)
+                    };
+                    let mut boa_args: Vec<BoaValue> = Vec::with_capacity(args_v8.length() as usize);
+                    for i in 0..args_v8.length() {
+                        boa_args.push(crate::js::boa_bridge::v8_to_boa(args_v8.get(i), ctx));
+                    }
+                    let value = match callable.call(&this_boa, &boa_args, ctx) {
                         Ok(v) => v,
                         Err(e) => return Err(cdp_throw(&e, ctx)),
                     };
@@ -1320,51 +1521,34 @@ pub fn ks_call_cdp(
     await_promise: bool,
     return_by_value: bool,
 ) -> Promise {
-    arm_v8_ran();
-    let ks_span = tracing::info_span!("wasm.boa_call", src_bytes = fn_src.len(), engine = "boa");
-    wasm_bindgen_futures::future_to_promise(panic::AssertUnwindSafe(
-        tracing::Instrument::instrument(
-            async move {
-                let (ptr, value) = {
-                    let _boa_guard = acquire_boa_lock().await;
-                    if !ensure_persistent() {
-                        return Err(JsValue::from_str("kitesurf boa: context init failed"));
-                    }
-                    let ptr = context_ptr();
-                    if ptr.is_null() {
-                        return Err(JsValue::from_str("kitesurf boa: no context"));
-                    }
-                    // SAFETY: see ks_eval_cdp. &mut is never held across a yield.
-                    let _depth = crate::js::boa_bridge::DepthGuard::enter();
-                    let ctx = unsafe { &mut *ptr };
-                    heal_residual_stack(ctx);
-                    let fn_expr = format!("({fn_src})");
-                    let fn_val = match ctx.eval(Source::from_bytes(fn_expr.as_bytes())) {
-                        Ok(v) => v,
-                        Err(e) => return Err(js_sys::Error::new(&format!("{e}")).into()),
-                    };
-                    let Some(callable) = fn_val.as_object().filter(|o| o.is_callable()) else {
-                        return Err(JsValue::from_str(
-                            "kitesurf boa: callFunctionOn target is not a function",
-                        ));
-                    };
-                    let this_boa = crate::js::boa_bridge::v8_to_boa(this_v8, ctx);
-                    let mut boa_args: Vec<BoaValue> = Vec::with_capacity(args_v8.length() as usize);
-                    for i in 0..args_v8.length() {
-                        boa_args.push(crate::js::boa_bridge::v8_to_boa(args_v8.get(i), ctx));
-                    }
-                    let value = match callable.call(&this_boa, &boa_args, ctx) {
-                        Ok(v) => v,
-                        Err(e) => return Err(cdp_throw(&e, ctx)),
-                    };
-                    (ptr, value)
-                };
-                pump(ptr, || true).await;
-                drive_cdp(value, await_promise, return_by_value, ptr).await
-            },
-            ks_span,
-        ),
-    ))
+    call_cdp_impl(
+        fn_src,
+        this_v8,
+        args_v8,
+        None,
+        await_promise,
+        return_by_value,
+    )
+}
+
+#[wasm_bindgen]
+pub fn ks_call_cdp_in_frame(
+    fn_src: String,
+    this_v8: JsValue,
+    args_v8: js_sys::Array,
+    frame_id: String,
+    frame_window: JsValue,
+    await_promise: bool,
+    return_by_value: bool,
+) -> Promise {
+    call_cdp_impl(
+        fn_src,
+        this_v8,
+        args_v8,
+        Some((frame_id, frame_window)),
+        await_promise,
+        return_by_value,
+    )
 }
 
 #[wasm_bindgen]

@@ -3,9 +3,11 @@
 // https://opensource.org/licenses/Apache-2.0
 
 import type { CookieEntry } from "../cookies.ts";
-import type { DispatchCtx } from "../cdp/dispatch.ts";
-import { jarForTarget } from "../cdp/target.ts";
-import type { LocalStorageSnapshot, SessionWebStorage } from "./web-storage.ts";
+import type { BrowserState } from "../cdp/types.ts";
+import { jarInBrowser } from "../cdp/target.ts";
+
+/** One origin's localStorage area as the profile stores it, in insertion order. */
+export type LocalStorageSnapshot = Array<[string, Array<[string, string]>]>;
 
 export interface ProfileSnapshot {
   cookies: CookieEntry[];
@@ -50,13 +52,11 @@ export class ProfileCommitter {
 }
 
 export async function flushProfile(
-  ctx: DispatchCtx,
-  storage: SessionWebStorage,
+  browser: BrowserState,
   committer?: ProfileCommitter,
   targetId?: string,
 ): Promise<void> {
-  await storage.flush(targetId);
-  for (const target of ctx.browser.targets.values()) {
+  for (const target of browser.targets.values()) {
     if (targetId !== undefined && target.targetId !== targetId) continue;
     const holders = [target, ...target.frames.values()];
     for (const holder of holders) {
@@ -72,7 +72,7 @@ export async function flushProfile(
       }
       if (holder.pageScript !== stub) continue;
       for (const raw of drained.cookieWrites ?? [])
-        jarForTarget(ctx, target).setFromDocumentCookie(url, raw);
+        jarInBrowser(browser, target).setFromDocumentCookie(url, raw);
     }
   }
   await committer?.flush();

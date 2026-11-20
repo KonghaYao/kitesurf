@@ -13,6 +13,7 @@ export {
 } from "./index.ts";
 export { DEFAULT_ENGINE_HOST } from "./host.ts";
 export type { EngineHost, ConnectionOptions } from "./host.ts";
+export type { FontProfile } from "./cdp/font-profile.ts";
 export { resolveSessionStore } from "./host.ts";
 export { MemorySessionStore, isStoredBytes, isStoredString } from "./state/session-store.ts";
 export type { SessionStore, StoreGuard, StoreStats, StoreTable } from "./state/session-store.ts";
@@ -42,8 +43,8 @@ export type { AxNode, BuiltTree, DomNode } from "./cdp/accessibility.ts";
 export { handlePage, mainFrame } from "./cdp/page.ts";
 export { sessionOf } from "./cdp/page-session.ts";
 export type { PageSession } from "./cdp/page-session.ts";
-export type { DispatchCtx, EngineCdpCommandExtension } from "./cdp/dispatch.ts";
-export type { TargetState } from "./cdp/types.ts";
+export type { DispatchCtx, EngineCdpCommandExtension, SessionContext } from "./cdp/dispatch.ts";
+export type { CdpClientState, TargetState } from "./cdp/types.ts";
 export { makeWallClock } from "./eval/host-clock.ts";
 export { isRecord, isStringArray, oneOf } from "./guards.ts";
 export { clampSide, clampViewport, MAX_PIXELS, MAX_SIDE, MIN_DIM } from "./cdp/viewport.ts";

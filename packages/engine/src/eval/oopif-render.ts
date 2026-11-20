@@ -20,8 +20,11 @@ import {
   type UpstreamEventHandler,
 } from "./page-script.ts";
 import type { SandboxOutboundOverride } from "./outbound.ts";
+import type { FontProfile } from "../cdp/font-profile.ts";
+import type { SessionContext } from "../cdp/dispatch.ts";
 import { stubQueryDom } from "../cdp/page-session.ts";
 import { disposeStub } from "../cdp/page-script-generation.ts";
+import { navigateSourceOf } from "@kitesurf/page-script/source-scan";
 import { walkRedirects } from "./redirect-walk.ts";
 import {
   documentKind,
@@ -60,6 +63,7 @@ export interface RenderFrameArgs {
   makeUpstreamHandler?: (isolate: { stub: PageScriptStub; url: string }) => UpstreamEventHandler;
   raster?: Partial<RasterizeOptions>;
   attributionHeaders?: Record<string, string>;
+  fontProfile: FontProfile;
 }
 
 export interface RenderFrameResult {
@@ -77,7 +81,7 @@ export type RenderFrameError = { ok: false; error: string; refused?: true };
 
 export interface FrameSpawnEnv {
   LOADER: WorkerLoader;
-  KITESURF_SIMULATE_PROD_EVAL?: string;
+  KITESURF_NATIVE_EVAL?: string;
   KITESURF_LAG_WATCHDOG?: string;
 }
 
@@ -171,7 +175,7 @@ function attachUpstreamHandler(
 
 export async function spawnAndNavigateFrame(
   env: FrameSpawnEnv,
-  ctx: ExecutionContext,
+  ctx: SessionContext,
   args: RenderFrameArgs,
 ): Promise<{ ok: true; stub: PageScriptStub; finalUrl: string } | RenderFrameError> {
   const pre = await prespawnFrameIsolate(env, ctx, args);
@@ -181,7 +185,7 @@ export async function spawnAndNavigateFrame(
 
 export async function prespawnFrameIsolate(
   env: FrameSpawnEnv,
-  ctx: ExecutionContext,
+  ctx: SessionContext,
   args: RenderFrameArgs,
 ): Promise<PrespawnedFrame | RenderFrameError> {
   const sandbox = args.sandbox;
@@ -218,6 +222,7 @@ export async function prespawnFrameIsolate(
       cookieKey: args.cookieKey,
       cookieSiteOrigin: frameDocumentCookieSite(args.cookieSiteOrigin, args.frameUrl),
       attributionHeaders: args.attributionHeaders,
+      fontProfile: args.fontProfile,
       sandboxOutbound: args.sandboxOutbound,
     });
   } catch (e) {
@@ -386,6 +391,7 @@ export async function prespawnFrameIsolate(
         cookieKey: args.cookieKey,
         cookieSiteOrigin: frameDocumentCookieSite(args.cookieSiteOrigin, finalUrl),
         attributionHeaders: args.attributionHeaders,
+        fontProfile: args.fontProfile,
         sandboxOutbound: args.sandboxOutbound,
       });
     } catch (e) {
@@ -409,7 +415,7 @@ export async function navigatePrespawnedFrame(
   try {
     await pre.warmup;
     const viewport = frameViewport(args.viewport);
-    await stub.navigate(html, finalUrl, {
+    await stub.navigate(navigateSourceOf(html), finalUrl, {
       connectionId: args.connectionId,
       mainFrameId: args.frameId,
       cookieKey: args.cookieKey ?? "",

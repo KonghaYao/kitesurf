@@ -16,7 +16,6 @@ import type { RenderPort } from "./page-renderer.ts";
 import type { WorkerEventParams, WorkerNavigatorInfo } from "./dedicated-worker.ts";
 import type { SandboxRestrictions } from "./sandbox.ts";
 import type { CommittedOrigin } from "./frame-origin.ts";
-import type { WebStorageChange } from "./web-storage.ts";
 
 export interface ModulePreloadPin {
   url: string;
@@ -26,11 +25,42 @@ export interface ModulePreloadPin {
 export type { SandboxRestrictions } from "./sandbox.ts";
 export type { CommittedOrigin } from "./frame-origin.ts";
 
+/** The font faces a document's source wants before its first layout. */
+export interface SourceFontScan {
+  /** A `<canvas>`, or `<svg>` with `<text>`, which paints glyph outlines. */
+  outline: boolean;
+  symbols: boolean;
+  symbols2: boolean;
+  emoji: boolean;
+  cjk: boolean;
+  /** Regional Han faces (`JP`, `TC`) the page's `lang` or kana asks for. */
+  cjkRegions: string[];
+  mono: boolean;
+  serif: boolean;
+  /** Script face tags, in registration order. */
+  scripts: string[];
+}
+
+/** A document sent to `navigate` as UTF-8 with the whole-source scans PageScript needs, so the
+ * page isolate can free the source after the parse. A string would live until a major GC. */
+export interface NavigateSource {
+  utf8: Uint8Array;
+  fonts: SourceFontScan;
+  /** Whether the source has an `on…=` attribute. */
+  eventHandlerAttributes: boolean;
+  /** The leading doctype, normalised, and the UTF-8 offset just past it. */
+  doctype: { markup: string; utf8End: number } | null;
+}
+
 export interface NavigateOptions {
   cookies?: string;
   connectionId?: string;
   mainFrameId?: string;
   cookieKey?: string;
+  // The browser context's localStorage area for the document's origin (engine
+  // state/local-storage.ts). Absent for an opaque origin or a child frame, whose localStorage
+  // stays in the isolate for this document only.
+  localStorage?: Array<[string, string]>;
   // The effective iframe sandbox restrictions for this document, already intersected with its
   // ancestors. Absent means no restrictions.
   sandbox?: SandboxRestrictions;
@@ -93,6 +123,8 @@ export interface DrainConsoleReply extends JsWindowDrain {
 export interface EvalOptions {
   returnByValue?: boolean;
   awaitPromise?: boolean;
+  // Targets a parent-hosted same-origin child frame's contentWindow realm in this isolate.
+  frameId?: string;
 }
 
 export interface CallFunctionOnOptions extends EvalOptions {
@@ -214,7 +246,11 @@ export interface MouseDispatchReply extends KeyDispatchReply {
 
 export interface PageScriptSession {
   /** Resolves at DOMContentLoaded while the session continues the resource drain. */
-  navigate(html: string, url: string, opts?: NavigateOptions): Promise<NavigateSummary>;
+  navigate(
+    html: string | NavigateSource,
+    url: string,
+    opts?: NavigateOptions,
+  ): Promise<NavigateSummary>;
   /** Waits for the bounded resource drain, `load`, and post-load tasks during navigation.
    * Resource draining has a 25-second budget; teardown can return partial results.
    * A pipelined call waits for `navigate` to publish the drain.
@@ -261,7 +297,7 @@ export type PageScriptReply<M extends PageScriptMethod> = Awaited<ReturnType<Pag
 type NoParams = Record<string, never>;
 
 export interface PageScriptWireParams {
-  navigate: { html: string; url: string; opts?: NavigateOptions };
+  navigate: { html: string | NavigateSource; url: string; opts?: NavigateOptions };
   awaitLoad: NoParams;
   unload: NoParams;
   drainConsole: NoParams;
@@ -327,7 +363,6 @@ export type PageScriptEntrypoint = PageScriptSession & {
 export type PageScriptEntrypointStub = Fetcher<PageScriptEntrypoint>;
 
 export interface UpstreamEvents {
-  "kitesurf.webStorageChanged": WebStorageChange;
   "kitesurf.bindingCalled": { name: string; payload: string };
   "kitesurf.diag": { ev: "start" | "end"; op: string; t: number };
   "kitesurf.formSubmitNavigate": NavigatePost;
@@ -346,6 +381,9 @@ export interface UpstreamEvents {
   "kitesurf.frameNavigated": { frameId: string; url: string; sandbox?: string | null };
   "kitesurf.frameStoppedLoading": { frameId: string };
   "kitesurf.insertedScriptRan": { url: string; bytes: number; run: "baked" | "stale" | "boa" };
+  // localStorage changes on a page with a seeded area, batched per microtask. The engine applies
+  // them to the browser context's area for the origin.
+  "kitesurf.localStorage": { ops: LocalStorageOp[] };
   "kitesurf.modelContextToolsAdded": { tools: WebMcpTool[] };
   "kitesurf.modelContextToolsRemoved": { names: string[] };
   "kitesurf.navigatedWithinDocument": {
@@ -378,6 +416,12 @@ export interface UpstreamEvents {
 }
 
 export type UpstreamEventName = keyof UpstreamEvents;
+
+/** A change to a shared localStorage area, as the engine applies it. */
+export type LocalStorageOp =
+  | { op: "set"; key: string; value: string }
+  | { op: "remove"; key: string }
+  | { op: "clear" };
 
 export interface WebMcpTool {
   name: string;

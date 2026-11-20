@@ -28,11 +28,13 @@ import type {
 } from "./types.ts";
 import type { DispatchCtx } from "./dispatch.ts";
 import { resolveTarget, sessionOf, stubQueryDom, type QueryDomResult } from "./page-session.ts";
+import { emitOopifExecutionContext, emitOopifExecutionContextDestroyed } from "./runtime.ts";
 import {
   applyTtyNavParams,
   DEFAULT_TTY_CELL_HEIGHT_PX,
   DEFAULT_TTY_CELL_WIDTH_PX,
 } from "../tty/nav-params.ts";
+import { navigateSourceOf } from "@kitesurf/page-script/source-scan";
 import { ttyFocusStylesheet, ttyUaStylesheet } from "../tty/stylesheet.ts";
 import { kitesurfProduct } from "../version.ts";
 import { wakeSceneStream } from "./scene-stream.ts";
@@ -139,7 +141,13 @@ import { isWorkerUpstreamEvent } from "./dedicated-workers.ts";
 import { isRecord } from "../guards.ts";
 import { classifyRequest } from "../request-blocker.ts";
 import { emitMutations } from "./dom.ts";
+import { frontendNodes, sessionKeyOf } from "./dom-frontend.ts";
 import { cookieKeyFor } from "./cookie-jar-registry.ts";
+import {
+  localStorageOrigin,
+  readLocalStorageOps,
+  type LocalStorage,
+} from "../state/local-storage.ts";
 import { dropTargetImages } from "../eval/resource-store.ts";
 import {
   documentKind,
@@ -164,14 +172,17 @@ import {
 import {
   emitFrameTarget,
   jarForTarget,
+  localStorageForTarget,
   announceOopifTarget,
   destroyOopifTarget,
 } from "./target.ts";
 import {
   ensureTargetDom,
   freeDetachedDom,
+  releaseFallbackHtml,
   releaseFrameDom,
   releaseTargetDom,
+  releasedFallbackError,
 } from "./dom-release.ts";
 import { clearStyleSheetsForNavigate, syncStyleSheetsFromEnumeration } from "./css.ts";
 import { emitScriptParsed, hasDebuggerListeners, makeCompiledScriptMeta } from "./debugger.ts";
@@ -194,6 +205,15 @@ const AUTO_RELOAD_SETTLED_MS = 2_000;
 const MILLISECONDS_PER_SECOND = 1_000;
 const MAX_IMAGE_QUALITY = 100;
 const DEFAULT_IMAGE_QUALITY = 80;
+// Encoded bytes E plus base64 and JSON strings cost about 3.7E in the engine.
+// At 16 MiB that leaves room for a 40-60 MB baseline in a 128 MB isolate.
+const MAX_SCREENSHOT_ENCODED_BYTES = 16 * 1024 * 1024;
+const MAX_SCREENSHOT_DIMENSION = 65_535;
+// The band rasterizer walks the whole scene once per 128-row band, so a large area is minutes of
+// work even when both sides are legal. 64M px admits a 1280x40000 full-page capture.
+const MAX_SCREENSHOT_PIXELS = 64 * 1024 * 1024;
+const MAX_WEBP_SCREENSHOT_PIXELS = 2_560 * 2_560;
+const MAX_WEBP_SCREENSHOT_DIMENSION = 4_096;
 const MIN_SCREENCAST_DIMENSION = 32;
 const MIN_SCREENCAST_FRAME_INTERVAL_MS = 16;
 const MAX_SCREENCAST_FRAME_INTERVAL_MS = 1_000;
@@ -302,7 +322,9 @@ async function renderViaPageRenderer(
     omitBackground: boolean;
     sinceSeq?: number;
     clip?: { x: number; y: number; width: number; height: number };
+    documentCrop?: boolean;
     partialKey?: string;
+    encodedLimit?: number;
     images?: "raw" | "encoded";
   },
 ): Promise<
@@ -347,6 +369,103 @@ async function renderViaPageRenderer(
     scrollX: res.scrollX,
     scrollY: res.scrollY,
   };
+}
+
+type ScreenshotFormat = "png" | "jpeg" | "webp";
+
+interface ScreenshotCapture {
+  clip: { x: number; y: number; width: number; height: number } | null;
+  fullDocument: boolean;
+  width: number;
+  height: number;
+}
+
+function readScreenshotClipRect(
+  clip: Protocol.Page.Viewport | undefined,
+): { x: number; y: number; width: number; height: number } | null {
+  if (!clip) return null;
+  const { x, y, width, height } = clip;
+  return typeof x === "number" &&
+    typeof y === "number" &&
+    typeof width === "number" &&
+    typeof height === "number"
+    ? { x, y, width, height }
+    : null;
+}
+
+// Rendering is in CSS pixels, so a clip scale only works when it cancels the emulated device
+// pixel ratio. Playwright's `scale: "css"` sends exactly that (1 / deviceScaleFactor).
+function assertSupportedClipScale(
+  clip: Protocol.Page.Viewport | undefined,
+  deviceScaleFactor: number,
+): void {
+  if (!clip || clip.scale === undefined || clip.scale === 1) return;
+  if (clip.scale * (deviceScaleFactor || 1) === 1) return;
+  throw new Error("Page.captureScreenshot failed: clip.scale other than 1 is not supported");
+}
+
+// A clip wins; otherwise a beyond-viewport capture spans the document, and the viewport is the
+// fallback for both.
+async function resolveScreenshotCapture(
+  ctx: DispatchCtx,
+  target: TargetState,
+  params: Protocol.Page.CaptureScreenshotRequest | undefined,
+): Promise<ScreenshotCapture> {
+  const requestedClip = readScreenshotClipRect(params?.clip);
+  const fullDocument = !requestedClip && params?.captureBeyondViewport === true;
+  const metrics = fullDocument ? await sessionOf(ctx, target).callIfLive.layoutMetrics({}) : null;
+  const clip =
+    requestedClip ??
+    (metrics ? { x: 0, y: 0, width: metrics.contentWidth, height: metrics.contentHeight } : null);
+  return {
+    clip,
+    fullDocument,
+    width: Math.ceil(clip?.width ?? target.viewportWidth ?? DEFAULT_VIEWPORT_WIDTH),
+    height: Math.ceil(clip?.height ?? target.viewportHeight ?? DEFAULT_VIEWPORT_HEIGHT),
+  };
+}
+
+// The drain can land resources that grow the document, so a full-document capture measures again.
+async function remeasureAfterDrain(
+  ctx: DispatchCtx,
+  target: TargetState,
+  params: Protocol.Page.CaptureScreenshotRequest | undefined,
+  capture: ScreenshotCapture,
+  format: ScreenshotFormat,
+): Promise<ScreenshotCapture> {
+  if (!capture.fullDocument) return capture;
+  const remeasured = await resolveScreenshotCapture(ctx, target, params);
+  if (!remeasured.clip) return capture;
+  assertScreenshotRasterLimits(remeasured.width, remeasured.height, format);
+  return remeasured;
+}
+
+function assertScreenshotRasterLimits(
+  width: number,
+  height: number,
+  format: ScreenshotFormat,
+): void {
+  if (width > MAX_SCREENSHOT_DIMENSION || height > MAX_SCREENSHOT_DIMENSION) {
+    throw new Error(
+      `Page.captureScreenshot failed: requested ${width}x${height} px exceeds the 65535 px per-side raster limit; capture a smaller clip`,
+    );
+  }
+  // Bounded for every format, not only WebP: the band walk is the cost, not the encoder.
+  if (width * height > MAX_SCREENSHOT_PIXELS) {
+    throw new Error(
+      `Page.captureScreenshot failed: requested ${width}x${height} px exceeds the ${MAX_SCREENSHOT_PIXELS} px total raster limit; capture a smaller clip`,
+    );
+  }
+  if (format !== "webp") return;
+  if (
+    width > MAX_WEBP_SCREENSHOT_DIMENSION ||
+    height > MAX_WEBP_SCREENSHOT_DIMENSION ||
+    width * height > MAX_WEBP_SCREENSHOT_PIXELS
+  ) {
+    throw new Error(
+      `Page.captureScreenshot failed: requested ${width}x${height} px exceeds WebP limits of ${MAX_WEBP_SCREENSHOT_DIMENSION} px per side and ${MAX_WEBP_SCREENSHOT_PIXELS} px total; use png or jpeg`,
+    );
+  }
 }
 
 function recordNavigationHistory(target: TargetState, url: string, transitionType: string): void {
@@ -687,6 +806,7 @@ export async function handlePage(
       target.url = url;
       target.title = "";
       target.html = "";
+      target.fallbackHtmlReleased = false;
       releaseTargetDom(target);
       target.docScan = null;
       target.docCsp = null;
@@ -712,6 +832,7 @@ export async function handlePage(
       if (url === "about:blank" || url === "") {
         const html = "<html><head></head><body></body></html>";
         target.html = html;
+        target.fallbackHtmlReleased = false;
         const blitzUrl = sanitizeBaseUrl(url);
         try {
           target.dom = createDom(html, blitzUrl);
@@ -976,6 +1097,7 @@ export async function handlePage(
             html = '<?xml version="1.0" encoding="UTF-8"?>\n' + sniffHead;
           }
           target.html = html;
+          target.fallbackHtmlReleased = false;
           releaseTargetDom(target);
           target.docScan = traceSpan(
             ctx.env.HOST_TRACER,
@@ -1013,6 +1135,7 @@ export async function handlePage(
           releaseTargetDom(target);
           target.docScan = scanDocument(wrapper);
           target.html = wrapper;
+          target.fallbackHtmlReleased = false;
           pageHtml = wrapper;
         }
 
@@ -1077,7 +1200,10 @@ export async function handlePage(
           cdpMutations,
           exceptions,
         } = await pushNavigateToPageScript(ctx, target, inlinedPageHtml, finalUrl, armedIframeGate);
-        if (target.pageScript) releaseTargetDom(target);
+        if (target.pageScript) {
+          releaseTargetDom(target);
+          releaseFallbackHtml(target);
+        }
         await backfillIframeOwnerNodeIds(target);
         emitFrameDclComplete(ctx, target, mainFrame(target), req.sessionId);
         scheduleLoadCompleteEmit(ctx, target, req.sessionId, armedIframeGate);
@@ -1171,6 +1297,7 @@ export async function handlePage(
       const url = sanitizeBaseUrl(requestedUrl);
       target.url = url;
       target.html = html;
+      target.fallbackHtmlReleased = false;
       releaseTargetDom(target);
       target.docCsp = null;
       target.docCspReportOnly = null;
@@ -1200,14 +1327,17 @@ export async function handlePage(
       emitCapturedConsole(ctx, target, capturedConsole, req.sessionId);
       emitCapturedExceptions(ctx, target, exceptions, req.sessionId);
       emitMutations(ctx, target, cdpMutations);
-      if (target.pageScript) releaseTargetDom(target);
+      if (target.pageScript) {
+        releaseTargetDom(target);
+        releaseFallbackHtml(target);
+      }
       return {};
     }
 
     case "Page.captureScreenshot": {
       try {
         const reqFormat = req.params?.format;
-        const format: "png" | "jpeg" | "webp" =
+        const format: ScreenshotFormat =
           reqFormat === "jpeg" ? "jpeg" : reqFormat === "webp" ? "webp" : "png";
         const reqQuality = req.params?.quality;
         const quality =
@@ -1215,7 +1345,10 @@ export async function handlePage(
             ? reqQuality
             : DEFAULT_IMAGE_QUALITY;
         const omitBackground = req.params?.omitBackground === true;
-        const clip = req.params?.clip;
+        assertSupportedClipScale(req.params?.clip, target.deviceScaleFactor);
+        let capture = await resolveScreenshotCapture(ctx, target, req.params);
+        let clip = capture.clip;
+        assertScreenshotRasterLimits(capture.width, capture.height, format);
 
         const pageUrl = target.url || "https://kitesurf.local/";
         if (target.pageScript) {
@@ -1223,28 +1356,24 @@ export async function handlePage(
           const __drainStart = Date.now();
           let drainInfo: Record<string, unknown> | null = null;
           let __graceTimer: ReturnType<typeof setTimeout> | null = null;
-          const __clipRect = (() => {
-            if (!clip || typeof clip !== "object") return null;
-            const { x, y, width, height } = clip;
-            return typeof x === "number" &&
-              typeof y === "number" &&
-              typeof width === "number" &&
-              typeof height === "number"
-              ? { x, y, width, height }
-              : null;
-          })();
           try {
+            // A full-document capture drains unscoped: an unloaded image at the document bottom
+            // starts at the measured height, outside any rect sized from it.
             const drain = stubQueryDom(ps, "awaitPendingResources", {
               timeoutMs: RENDER_DRAIN_TIMEOUT_MS,
-              scope: __clipRect
-                ? {
-                    mode: "rect",
-                    x: __clipRect.x,
-                    y: __clipRect.y,
-                    w: __clipRect.width,
-                    h: __clipRect.height,
-                  }
-                : { mode: "viewport" },
+              ...(capture.fullDocument
+                ? {}
+                : {
+                    scope: clip
+                      ? {
+                          mode: "rect",
+                          x: clip.x,
+                          y: clip.y,
+                          w: clip.width,
+                          h: clip.height,
+                        }
+                      : { mode: "viewport" },
+                  }),
             }).catch(() => null);
             const drainResult = await traceSpan(
               ctx.env.HOST_TRACER,
@@ -1271,12 +1400,16 @@ export async function handlePage(
             target,
             __drainStart + RENDER_DRAIN_TIMEOUT_MS + RENDER_DRAIN_GRACE_MS - Date.now(),
           );
+          capture = await remeasureAfterDrain(ctx, target, req.params, capture, format);
+          clip = capture.clip;
           const __rpcStart = Date.now();
           const viaRenderer = await renderViaPageRenderer(ctx, target, {
             format,
             quality,
             omitBackground,
             ...(clip ? { clip } : {}),
+            ...(clip && capture.fullDocument ? { documentCrop: true } : {}),
+            encodedLimit: MAX_SCREENSHOT_ENCODED_BYTES,
             ...(ctx.browser.screencasts.has(target.targetId)
               ? {}
               : { partialKey: partialKeyFor(ctx, target) }),
@@ -1293,7 +1426,7 @@ export async function handlePage(
             );
           }
           if ("failed" in viaRenderer) {
-            throw new Error(`Page.captureScreenshot failed: ${viaRenderer.failed}`);
+            throw rendererFailure(viaRenderer.failed, capture.width, capture.height);
           }
           if (viaRenderer.bytes && viaRenderer.bytes.length > 0) {
             return { data: bytesToBase64(viaRenderer.bytes) };
@@ -1325,6 +1458,7 @@ export async function handlePage(
           }
         }
         if (!html) {
+          if (target.fallbackHtmlReleased) throw releasedFallbackError("Page.captureScreenshot");
           return { data: TINY_TRANSPARENT_PNG_B64 };
         }
         const width = target.viewportWidth ?? DEFAULT_VIEWPORT_WIDTH;
@@ -1670,6 +1804,15 @@ const TINY_TRANSPARENT_PNG_B64 =
 
 const EMPTY_PDF_B64 =
   "JVBERi0xLjQKMSAwIG9iago8PC9UeXBlIC9DYXRhbG9nIC9QYWdlcyAyIDAgUj4+CmVuZG9iagoyIDAgb2JqCjw8L1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDE+PgplbmRvYmoKMyAwIG9iago8PC9UeXBlIC9QYWdlIC9QYXJlbnQgMiAwIFIgL01lZGlhQm94IFswIDAgNjEyIDc5Ml0gL1Jlc291cmNlcyA8PD4+IC9Db250ZW50cyA0IDAgUj4+CmVuZG9iago0IDAgb2JqCjw8L0xlbmd0aCAwPj4Kc3RyZWFtCgplbmRzdHJlYW0KZW5kb2JqCnhyZWYKMCA1CjAwMDAwMDAwMDAgNjU1MzUgZgowMDAwMDAwMDA5IDAwMDAwIG4KMDAwMDAwMDA1OCAwMDAwMCBuCjAwMDAwMDAxMTEgMDAwMDAgbgowMDAwMDAwMjEzIDAwMDAwIG4KdHJhaWxlcgo8PC9TaXplIDUgL1Jvb3QgMSAwIFI+PgpzdGFydHhyZWYKMjY0CiUlRU9G";
+
+function rendererFailure(failed: string, width: number, height: number): Error {
+  if (failed.startsWith("encoded-limit:")) {
+    return new Error(
+      `Page.captureScreenshot failed: encoded image exceeds ${MAX_SCREENSHOT_ENCODED_BYTES} bytes (${width}x${height} px); capture a smaller clip, or use format "jpeg" with a lower quality`,
+    );
+  }
+  return new Error(`Page.captureScreenshot failed: ${failed}`);
+}
 
 function bytesToBase64(bytes: Uint8Array): string {
   return bytes.toBase64();
@@ -2106,6 +2249,7 @@ async function pushNavigateToPageScriptInner(
             cdpDebug: ctx.browser.cdpDebug,
             pixelFree: ctx.browser.skipSpeculativeRaster,
             fontDefer: ctx.browser.fontDefer,
+            fontProfile: ctx.browser.fontProfile,
             userAgent: target.userAgentOverride || kitesurfProduct(ctx.env.KITESURF_VERSION),
             referrerPolicy: target.docReferrerPolicy ?? null,
             referrer: target.docReferrer ?? null,
@@ -2131,8 +2275,21 @@ async function pushNavigateToPageScriptInner(
 
   const raBakeMs = ctx.analytics.now() - raBakeStart;
 
+  // The browser context's localStorage for the document's origin: the page gets a copy and sends
+  // its changes back as upstream events.
+  const lsOrigin = localStorageOrigin(url);
+  const sharedLocalStorage = lsOrigin
+    ? { storage: localStorageForTarget(ctx, target), origin: lsOrigin }
+    : undefined;
   if (pendingPageScript) {
-    installUpstreamEventHandler(ctx, target, pendingPageScript, generation, url);
+    installUpstreamEventHandler(
+      ctx,
+      target,
+      pendingPageScript,
+      generation,
+      url,
+      sharedLocalStorage,
+    );
     installIsolateLimitSurface(
       ctx,
       target,
@@ -2165,7 +2322,7 @@ async function pushNavigateToPageScriptInner(
           tracer.getSpanContext(),
         );
       }
-      const navPromise = ps.navigate(html, url, {
+      const navPromise = ps.navigate(navigateSourceOf(html), url, {
         cookies: initialCookies,
         ...(traced ? { traced: true } : {}),
         expectIframeInstalls: owesIframeInstalls,
@@ -2190,6 +2347,10 @@ async function pushNavigateToPageScriptInner(
         connectionId: ctx.connectionId,
         mainFrameId: target.frameId,
         cookieKey: cookieKeyFor(ctx.connectionId, target.browserContextId),
+        // Read after retireStub, so the old document's last writes are in.
+        ...(sharedLocalStorage
+          ? { localStorage: sharedLocalStorage.storage.entries(sharedLocalStorage.origin) }
+          : {}),
         modulePreloadPins: preloadSeeds.map(({ url, integrity }) => ({ url, integrity })),
         // The legacy plan (no bundle: a failed bake) gates its parser scripts from these.
         scriptPolicy: {
@@ -2341,7 +2502,7 @@ async function pushNavigateToPageScriptInner(
         });
       } catch {}
     }
-    if (target.cssEnabledSessions.size > 0 || ctx.browser.connectionMode === "page") {
+    if (target.cssEnabledSessions.size > 0 || ctx.client.connectionMode === "page") {
       try {
         await syncStyleSheetsFromEnumeration(ctx, target, pendingPageScript);
       } catch {}
@@ -2817,6 +2978,8 @@ function scheduleLoadCompleteEmit(
             }
             if (f.url && f.url !== "about:blank" && frameNeedsIsolate(f) && ps) {
               await spawnOopifPipeline(ctx, target, f);
+            } else if (ps) {
+              announceParentHostedFrameContext(ctx, target, f);
             }
             emitChildFrameDclLoad(ctx, target, f, sessionId);
           }),
@@ -3089,6 +3252,8 @@ function emitDocumentUpdated(
   sessionId: string | undefined,
 ): void {
   for (const s of targetSessions(target, sessionId)) {
+    // The client drops its nodes and asks for the document again.
+    frontendNodes(target, sessionKeyOf(s)).reset();
     ctx.emit({
       method: "DOM.documentUpdated",
       sessionId: s,
@@ -3521,6 +3686,7 @@ function oopifSpawnArgs(ctx: DispatchCtx, target: TargetState, f: FrameState): R
     parentOrigin: originOf(embedder ? embedder.url : target.url),
     cookieSiteOrigin: frameCookieSiteOrigin(target, f),
     attributionHeaders: ctx.browser.attributionHeaders,
+    fontProfile: ctx.browser.fontProfile,
     makeUpstreamHandler: ({ stub, url }) => {
       // The isolate is sealed with the restrictions active when it was spawned; a later navigation
       // reassigns frame.sandbox before this document's unload handlers run.
@@ -3676,6 +3842,30 @@ function clearRefusedFrameBitmap(target: TargetState, f: FrameState): void {
   void ps.clearFrameBitmap({ ownerBackendNodeId: f.ownerBackendNodeId }).catch(() => {});
 }
 
+// A script-free same-origin child keeps its document in the parent isolate. Announcing its context
+// lets CDP evaluate against that same contentWindow/contentDocument without spawning an isolate.
+function isParentHostedFrame(frame: FrameState): boolean {
+  return (
+    frame.parentFrameId !== null &&
+    !frame.detached &&
+    !frame.framePolicyBlocked &&
+    !frame.requestBlocked &&
+    !frameNeedsIsolate(frame)
+  );
+}
+
+function announceParentHostedFrameContext(
+  ctx: DispatchCtx,
+  target: TargetState,
+  frame: FrameState,
+): void {
+  if (frame.execContextId > 0 || !isParentHostedFrame(frame)) return;
+  const nextId = ctx.browser.execContextSeq ?? 2;
+  ctx.browser.execContextSeq = nextId + 1;
+  frame.execContextId = nextId;
+  emitOopifExecutionContext(ctx, frame, target.url);
+}
+
 async function spawnOopifPipeline(
   ctx: DispatchCtx,
   target: TargetState,
@@ -3808,8 +3998,7 @@ async function spawnOopifPipeline(
       for (const p of queued ?? []) deliverPostMessageToChild(f, p);
     }
     f.execContextId = ctx.browser.execContextSeq++;
-    const { emitOopifExecutionContext } = await import("./runtime.ts");
-    emitOopifExecutionContext(ctx, f);
+    emitOopifExecutionContext(ctx, f, target.url);
     announceOopifTarget(ctx, f);
     if (ctx.browser.skipSpeculativeRaster) return;
     const manager = getRendererManager(ctx, target);
@@ -3879,16 +4068,19 @@ function teardownOopifStubForFrame(
     ctx.browser.dedicatedWorkers.terminateFrame(target.targetId, f.frameId, reason);
   }
   if (ctx && f.parentFrameId !== null) {
-    if (ctx.browser.connectionMode === "browser" || f.sessions.size > 0) {
+    if (ctx.client.connectionMode === "browser" || f.sessions.size > 0) {
       destroyOopifTarget(ctx, f);
     } else {
       ctx.browser.networkEvents.deleteTargetAttribution(f.frameId);
     }
   }
-  if (!f.pageScript) return;
   const destroyedCtxId = f.execContextId;
-  f.lastRenderSeq = -1;
   f.execContextId = 0;
+  if (ctx && destroyedCtxId > 0) {
+    emitOopifExecutionContextDestroyed(ctx, destroyedCtxId);
+  }
+  if (!f.pageScript) return;
+  f.lastRenderSeq = -1;
   void retireStub(
     f,
     atClose ? "wsClosed" : "frameTeardown",
@@ -3897,12 +4089,6 @@ function teardownOopifStubForFrame(
   );
   f.pageScriptUrl = null;
   f.pageScriptSandbox = undefined;
-  if (ctx && destroyedCtxId > 0) {
-    (async () => {
-      const { emitOopifExecutionContextDestroyed } = await import("./runtime.ts");
-      emitOopifExecutionContextDestroyed(ctx, destroyedCtxId);
-    })();
-  }
 }
 
 function rebuildFrameTreeChildren(target: TargetState, budget: ChildFrameBudget): void {
@@ -4022,6 +4208,9 @@ export function installUpstreamEventHandler(
   stub: PageScriptStub,
   generation: number,
   url: string,
+  // Where this document's localStorage changes go: absent for an opaque origin, whose
+  // localStorage stays in the page (state/local-storage.ts).
+  sharedLocalStorage?: { storage: LocalStorage; origin: string },
 ): void {
   if (target.navigateGeneration === generation) target.pageScriptUrl = url;
   if (typeof stub.setUpstreamEventHandler !== "function") return;
@@ -4035,8 +4224,16 @@ export function installUpstreamEventHandler(
   );
   const loaderId = target.loaderId;
   stub.setUpstreamEventHandler((event, params) => {
-    if (target.navigateGeneration !== generation) return;
     if (ctx.browser.wsClosing) return;
+    // Before the generation check: a write the old document made just before a navigation still
+    // happened, and this closure knows its origin.
+    if (event === "kitesurf.localStorage") {
+      if (sharedLocalStorage) {
+        sharedLocalStorage.storage.apply(sharedLocalStorage.origin, readLocalStorageOps(params));
+      }
+      return;
+    }
+    if (target.navigateGeneration !== generation) return;
     if (event === "kitesurf.diag") {
       target.diagSpans?.handle(params);
       return;
@@ -4556,8 +4753,12 @@ function handleUpstreamFrameEvent(
     if (urlChanged || revived) {
       emitFrameTarget(ctx, frame);
     }
-    if (!frame.pageScript && !frame.oopifSpawning && frameNeedsIsolate(frame)) {
-      ctx.ctx.waitUntil(spawnOopifPipeline(ctx, target, frame).catch(() => {}));
+    if (!frame.pageScript && !frame.oopifSpawning) {
+      if (frameNeedsIsolate(frame)) {
+        ctx.ctx.waitUntil(spawnOopifPipeline(ctx, target, frame).catch(() => {}));
+      } else {
+        announceParentHostedFrameContext(ctx, target, frame);
+      }
     }
     return;
   }

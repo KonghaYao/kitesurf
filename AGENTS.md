@@ -49,6 +49,12 @@ A pnpm monorepo. One line per package; read the code for details.
 - `packages/local-browser/`: local Rust/workerd host, SQLite profile, CDP connection ownership
   and single-executable packaging. The Node host supplies the compatibility baseline in tests.
   The local engine entry is `engine/src/local/index.ts`.
+- `packages/engine-server/`: serves the built `:dist` on Miniflare without `wrangler dev`, for the
+  WPT, Playwright and Puppeteer runners (`scripts/wpt-engine.mjs serve`).
+- `docker/`: the Docker image (`Dockerfile`, built from the repository root), which runs the
+  engine on workerd alone behind `front.js` with the config from `scripts/workerd-config.mjs`,
+  and the Jaeger compose file for `pnpm dev:tracing`. `.github/workflows/docker.yml` publishes
+  the image on tags.
 - `packages/engine/test/fixtures-worker/`: the fixtures Worker that serves `/__fixtures/*` in dev
   and tests only.
 - `scripts/`: development and CI tooling, including the WPT runners, the lint rules and the
@@ -62,10 +68,14 @@ Engine-wide invariants. The owning code carries the detail; keep these in sync w
 
 - Runtime code generation (`Runtime.evaluate`, `eval`, `new Function`, computed `import()`) runs on
   boa inside the per-target PageScript isolate, in dev and production, never in the parent Worker.
-  The loaded worker never gets a native-eval compatibility flag.
-- The CDP WebSocket bounds the session. Per-connection state lives in `handleWebSocket`'s closure;
-  no Durable Object holds it. The local host keeps this upstream socket alive across client
-  disconnects and persists cookies/localStorage through its profile service binding.
+  Only `KITESURF_NATIVE_EVAL=1` on a local workerd (`packages/engine-server`, the Docker image)
+  changes this: the loaded workers get workerd's experimental native-eval flag, so the paths that
+  try V8 first (CDP evaluation, page `eval` and `new Function`) stay on V8. Cloudflare rejects the
+  flag.
+- The CDP WebSocket bounds the session. `BrowserSession` (`cdp/connection.ts`) holds the browser
+  state and `ClientConnection` its one socket, and the session ends when that socket closes. No
+  Durable Object holds it. The local host keeps this socket alive across client disconnects and
+  persists cookies/localStorage through its profile service binding.
 - Each `Page.navigate` loads a fresh anonymous PageScript worker with `env.LOADER.load` and kills
   the previous one. Use `load()`, never a named `LOADER.get`.
 - Wasm panics unwind (`packages/core/.cargo/config.toml`, symlinked into `renderer-core`), so the
@@ -81,6 +91,12 @@ Engine-wide invariants. The owning code carries the detail; keep these in sync w
 - A new target has a live `about:blank` document: `ensurePageScript` (`cdp/dom.ts`) starts a lazy
   isolate, because many clients evaluate without navigating.
 - Layout is incremental. Work done at box construction needs explicit `CONSTRUCT_BOX` damage.
+- Offscreen inline text is evicted by default: after a resolve, an inline root more than two
+  viewport heights from the viewport drops its shaped text and keeps a 48-byte break summary that
+  layout replays, so paint, geometry and print are unchanged. Print and PDF pin their extent
+  (`inline_keep_extent`) so their text stays shaped, and `BaseDocument::set_inline_layout_eviction`
+  turns it off (Rust only, no wasm export). The work is vendor patch `blitz-dom/0078`; the
+  differential tests are `packages/core/src/layout/tests/inline_eviction.rs`.
 - Partial frames are composited in the renderer isolate (`SceneRasterizer`), so CDP clients
   never see one. The terminal scene stream is the exception; see `packages/engine/src/rbi.ts`.
 - `history.pushState` stays in the document unless the navigate URL opts in with
@@ -92,6 +108,10 @@ Do not undo these.
 
 - The sandbox ships a pure-JS `MessagePort`; page JS must never reach the native one.
 - Every outbound request needs a deadline, and an ignored response body must be cancelled.
+- The global's named-properties object (`packages/dom-shim/src/window.ts`) is an ordinary object,
+  never a Proxy: with a Proxy in the global's prototype chain, V8 resolves an unresolvable
+  reference without calling its `has` trap and assigns through `set`, so strict code created a
+  global instead of throwing ReferenceError.
 
 We do not shim single-subtest differences from the spec in the platform; we pin the test and report
 upstream. Reproduce by running the snippet under `node` and under
@@ -193,9 +213,10 @@ Use an explicit `KITESURF_PORT` or `--port` when other engines may be running, a
 ### Tests
 
 - Never run a full suite unless asked; the runners are slow and memory-hungry. CI runs the
-  Playwright lane, but not the e2e or WPT lanes. Before reporting work complete, run
-  `pnpm run check` and the smallest relevant e2e subset. Uncaught workerd errors fail a run even
-  if assertions pass.
+  e2e suite (`//tests/e2e:gate`, one bazelflare action per file), the Playwright lane and the WPT
+  gate (`scripts/wpt-ci.sh`); a fork's pull request skips all three, and main runs them once it
+  merges. Before reporting work complete, run `pnpm run check` and the smallest relevant e2e
+  subset. Uncaught workerd errors fail a run even if assertions pass.
 - Do not put `--` before test arguments; pnpm forwards it and the runners misread it.
 - Prefer a hermetic e2e test (`packages/engine/test/e2e/**.e2e.test.ts`) over a script or demo.
   They boot the engine in-process with `@cloudflare/vitest-plugin` and drive it over CDP. Give each
@@ -214,4 +235,9 @@ Use an explicit `KITESURF_PORT` or `--port` when other engines may be running, a
 - Synchronous XHR. workerd has no way to block the JS thread on network I/O.
 - A fake `crypto.subtle`; Workers provide the real one.
 - WebGL, WebGPU, WebAudio, WebRTC, MediaStream and anti-bot fingerprinting.
-- IndexedDB/Cache Storage persistence, live-heap snapshots, and WebDriver; Kitesurf speaks CDP.
+- `sessionStorage` across navigations, IndexedDB/Cache Storage persistence, live-heap snapshots,
+  and storage across connections except the local host's profile. The engine keeps `localStorage`
+  per browser context and origin for the connection
+  (`packages/engine/src/state/local-storage.ts`), and the local host seeds and persists it through
+  its profile service binding.
+- WebDriver; Kitesurf speaks CDP.

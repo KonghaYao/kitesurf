@@ -69,8 +69,10 @@ async function waitHealth(port, timeoutMs) {
 }
 
 /** @typedef {{wsEndpoint: string, port: number, stop: () => void}} LocalEngine */
-/** @param {{tag: string, launcher: "wrangler" | "miniflare", dist: string, outDir: string, firstPort: number, skipBuildEnv: string}} options @returns {{buildBundles: () => Promise<void>, startEngine: () => Promise<LocalEngine>}} */
-export function localEngines({ tag, launcher, dist, outDir, firstPort, skipBuildEnv }) {
+/** @param {{tag: string, launcher: "wrangler" | "miniflare", dist: string, outDir: string, firstPort: number, skipBuildEnv: string, v8Flags?: string | null}} options @returns {{buildBundles: () => Promise<void>, startEngine: () => Promise<LocalEngine>}} */
+export function localEngines({ tag, launcher, dist, outDir, firstPort, skipBuildEnv, v8Flags }) {
+  if (v8Flags != null && launcher !== "miniflare")
+    throw new Error(`[${tag}] --v8-flags needs --engine-launcher miniflare`);
   installCleanup();
   let nextPort = firstPort;
 
@@ -120,6 +122,7 @@ export function localEngines({ tag, launcher, dist, outDir, firstPort, skipBuild
             "--inspector-port",
             String(iport),
             ...MINIFLARE_VARS.flatMap((value) => ["--var", value]),
+            ...(v8Flags == null ? [] : ["--v8-flags", v8Flags]),
           ]
         : [
             "dev",
@@ -135,8 +138,12 @@ export function localEngines({ tag, launcher, dist, outDir, firstPort, skipBuild
             String(iport),
           ];
     cliArgs.push("--var", SUITE_SERVER_VAR);
-    if (process.env.KITESURF_SIMULATE_PROD_EVAL)
-      cliArgs.push("--var", "KITESURF_SIMULATE_PROD_EVAL:1");
+    // Native eval needs the engine's experimental flag, which only the Miniflare launcher sets.
+    if (process.env.KITESURF_NATIVE_EVAL === "1") {
+      if (launcher !== "miniflare")
+        throw new Error("KITESURF_NATIVE_EVAL needs --engine-launcher miniflare");
+      cliArgs.push("--var", "KITESURF_NATIVE_EVAL:1");
+    }
     mkdirSync(outDir, { recursive: true });
     const logPath = join(outDir, `kitesurf-engine-${port}.log`);
     const fd = openSync(logPath, "w");

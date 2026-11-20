@@ -2,19 +2,22 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 // https://opensource.org/licenses/Apache-2.0
 
-// Owns one CDP WebSocket's state, event flow, deadlines, and resource cleanup.
+// A BrowserSession owns one browser; a ClientConnection owns one CDP WebSocket that drives it.
 
 import { nanoid } from "nanoid";
-import { dispatch, type DispatchCtx } from "./dispatch.ts";
+import { dispatch, type DispatchCtx, type SessionContext } from "./dispatch.ts";
 import { traceSpan } from "../tracing.ts";
 import { endLocalTraceSession, localTraceEventWrap } from "../tracing-local.ts";
 import {
   SKIP_SPECULATIVE_RASTER_HEADER,
   parseCdpRequest,
   type BrowserState,
+  type CdpClientState,
   type CdpEvent,
   type CdpRequest,
   type CdpResponse,
+  type CdpSuccess,
+  RawJsonResult,
 } from "./types.ts";
 import { ensureBrowserTarget, createPageTarget, engineMemoryBreakdown } from "./target.ts";
 import { pumpBackgroundEvents, teardownOopifStubs } from "./page.ts";
@@ -45,19 +48,22 @@ import {
   SESSION_ID_HEADER,
   emitSessionEnd,
   type HostClockTimer,
+  type SessionEndFields,
 } from "../observability.ts";
-import { resolveConnectionOptions, type EngineHost } from "../host.ts";
+import {
+  resolveConnectionOptions,
+  resolveSessionStore,
+  type ConnectionOptions,
+  type EngineHost,
+} from "../host.ts";
 import type { PageIsolateCapOverrides } from "../eval/page-script.ts";
 import { buildDispatchEnv } from "./dispatch-env.ts";
 import { markArrival } from "./arrival.ts";
 import { StyleCache } from "./style-cache.ts";
 import { makeWallClock } from "../eval/host-clock.ts";
-import {
-  SessionWebStorage,
-  registerWebStorage,
-  unregisterWebStorage,
-} from "../state/web-storage.ts";
-import { ProfileCommitter, flushProfile } from "../state/profile.ts";
+import { LocalStorage } from "../state/local-storage.ts";
+import { MemorySessionStore } from "../state/session-store.ts";
+import { ProfileCommitter, flushProfile, type ProfilePersistence } from "../state/profile.ts";
 // Wrangler generates the ambient `Env` declaration from wrangler.jsonc.
 
 const NOISY_CDP_METHODS = new Set<string>([
@@ -66,408 +72,410 @@ const NOISY_CDP_METHODS = new Set<string>([
   "Page.screencastFrameAck",
 ]);
 
+const IDLE_SESSION_MS = 10 * 60_000;
+const MAX_SESSION_MS = 60 * 60_000;
 const BACKGROUND_EVENT_DRAIN_INTERVAL_MS = 200;
 const CDP_CONNECTION_ID_LENGTH = 10;
 const CDP_DEBUG_SESSION_ID_PREFIX_CHARS = 6;
 
-/**
- * Accepts a CDP WebSocket request and returns a 101 response with its session ID.
- * `ctx.waitUntil` keeps connection state alive until the socket closes or errors.
- */
-export async function handleWebSocket(
-  request: Request,
-  env: Env,
-  ctx: ExecutionContext,
-  onCtx?: (dispatchCtx: DispatchCtx) => void,
-  opts?: {
-    exemptIdleDeadline?: boolean;
-    externalOutbound?: ExternalOutbound;
-    onDispatch?: (dispatch: (req: CdpRequest) => Promise<CdpResponse>) => void;
-    host?: EngineHost;
-  },
-): Promise<Response> {
-  // Also used as the analytics session ID and log correlation key.
-  const connectionId = nanoid(CDP_CONNECTION_ID_LENGTH);
-  const options = resolveConnectionOptions(request, connectionId, opts?.host);
-  const persistence = await opts?.host?.openProfile?.(connectionId, env);
+function isRawJsonSuccess(payload: unknown): payload is CdpSuccess & { result: RawJsonResult } {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return false;
+  const id: unknown = Reflect.get(payload, "id");
+  const sessionId: unknown = Reflect.get(payload, "sessionId");
+  return (
+    typeof id === "number" &&
+    (sessionId === undefined || typeof sessionId === "string") &&
+    !Reflect.has(payload, "error") &&
+    Reflect.get(payload, "result") instanceof RawJsonResult
+  );
+}
 
-  // External sessions provide their outbound policy before dispatch; regular
-  // WebSocket upgrades use the default policy.
+export function registerDispatchConsumer(
+  onDispatch: ((dispatch: (req: CdpRequest) => Promise<CdpResponse>) => void) | undefined,
+  tracedDispatch: (req: CdpRequest) => Promise<CdpResponse>,
+): void {
+  onDispatch?.(async (req) => {
+    const response = await tracedDispatch(req);
+    if (!isRawJsonSuccess(response)) return response;
+    const result = response.result.parse();
+    return { ...response, result };
+  });
+}
 
-  const pair = new WebSocketPair();
-  const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
+export function serializeCdpPayload(payload: unknown): string {
+  if (!isRawJsonSuccess(payload)) {
+    const serialized = JSON.stringify(payload);
+    if (serialized === undefined) throw new TypeError("CDP payload is not JSON serializable");
+    return serialized;
+  }
+  // `result` may be a streamed page; join its JSON pieces instead of building the object first.
+  const sessionField =
+    payload.sessionId === undefined ? "" : ',"sessionId":' + JSON.stringify(payload.sessionId);
+  return [
+    '{"id":',
+    JSON.stringify(payload.id),
+    ',"result":',
+    ...payload.result.pieces,
+    sessionField,
+    "}",
+  ].join("");
+}
 
-  server.accept();
+/** Options read from a CDP upgrade URL. A malformed URL keeps the defaults. */
+export interface ConnectionParams {
+  connectionMode: "page" | "browser";
+  layoutMode: "full" | "off";
+  // From the `/?url=` inspector redirect: navigate without the user entering the URL.
+  initialUrl: string | null;
+  debug: boolean;
+  cdpDebug: boolean;
+  // Lower-only: the URL can shorten a deadline but never extend it.
+  idleMs: number;
+  maxSessionMs: number;
+  isolateCapOverrides: PageIsolateCapOverrides;
+}
 
-  let initialLayoutMode: "full" | "off" = "full";
-  // Optional initialUrl from the `/?url=` inspector redirect; navigate without
-  // requiring the inspector user to enter the URL manually.
-  let initialUrl: string | null = null;
-  let debug = false;
-  let cdpDebug = false;
-  let idleMs = options.idleTimeoutMs || Infinity;
-  let maxSessionMs = options.maxSessionMs || Infinity;
-  const isolateCapOverrides: PageIsolateCapOverrides = {};
-  let connectionMode: "page" | "browser" = "browser";
+export function parseConnectionParams(request: Request): ConnectionParams {
+  const params: ConnectionParams = {
+    connectionMode: "browser",
+    layoutMode: "full",
+    initialUrl: null,
+    debug: false,
+    cdpDebug: false,
+    idleMs: IDLE_SESSION_MS,
+    maxSessionMs: MAX_SESSION_MS,
+    isolateCapOverrides: {},
+  };
   try {
     const wsUrl = new URL(request.url);
     if (wsUrl.pathname.startsWith("/devtools/page/")) {
-      connectionMode = "page";
+      params.connectionMode = "page";
     }
     const param = wsUrl.searchParams.get("layout");
     if (param === "off" || param === "0" || param === "false") {
-      initialLayoutMode = "off";
+      params.layoutMode = "off";
     }
     const iu = wsUrl.searchParams.get("initialUrl");
     if (iu) {
       try {
         const parsed = new URL(iu);
         if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-          initialUrl = parsed.toString();
+          params.initialUrl = parsed.toString();
         }
       } catch {}
     }
     const dbg = wsUrl.searchParams.get("debug");
     if (dbg === "1" || dbg === "true") {
-      debug = true;
+      params.debug = true;
     }
     const cdpDbg = wsUrl.searchParams.get("cdpDebug");
     if (cdpDbg === "1" || cdpDbg === "true") {
-      cdpDebug = true;
+      params.cdpDebug = true;
     }
     const cpuCapRaw = Number.parseInt(wsUrl.searchParams.get("ksCpuCapMs") ?? "", 10);
     if (Number.isFinite(cpuCapRaw) && cpuCapRaw > 0) {
-      isolateCapOverrides.cpuMs = cpuCapRaw;
+      params.isolateCapOverrides.cpuMs = cpuCapRaw;
     }
     const wallCapRaw = Number.parseInt(wsUrl.searchParams.get("ksWallCapMs") ?? "", 10);
     if (Number.isFinite(wallCapRaw) && wallCapRaw > 0) {
-      isolateCapOverrides.wallMs = wallCapRaw;
+      params.isolateCapOverrides.wallMs = wallCapRaw;
     }
     const idleRaw = Number.parseInt(wsUrl.searchParams.get("ksIdleMs") ?? "", 10);
     if (Number.isFinite(idleRaw) && idleRaw > 0) {
-      idleMs = Math.min(idleMs, idleRaw);
+      params.idleMs = Math.min(params.idleMs, idleRaw);
     }
     const maxSessionRaw = Number.parseInt(wsUrl.searchParams.get("ksMaxSessionMs") ?? "", 10);
     if (Number.isFinite(maxSessionRaw) && maxSessionRaw > 0) {
-      maxSessionMs = Math.min(maxSessionMs, maxSessionRaw);
+      params.maxSessionMs = Math.min(params.maxSessionMs, maxSessionRaw);
     }
   } catch {}
+  return params;
+}
 
-  // The WebSocket owns this closure's state; keep the invocation alive until close or error.
-  const wsLifetime = new Promise<void>((resolve) => {
-    server.addEventListener("close", () => resolve());
-    server.addEventListener("error", () => resolve());
-  });
-  ctx.waitUntil(wsLifetime);
+// The host owns the application deadlines, and a zero removes one (the local browser keeps a
+// session open for as long as its socket lives). A ksIdleMs/ksMaxSessionMs parameter already
+// lowered the default, so it still shortens whatever the host allows.
+function applyHostDeadlines(
+  params: ConnectionParams,
+  options: Required<ConnectionOptions>,
+): void {
+  const idle = options.idleTimeoutMs || Infinity;
+  params.idleMs = params.idleMs === IDLE_SESSION_MS ? idle : Math.min(idle, params.idleMs);
+  const max = options.maxSessionMs || Infinity;
+  params.maxSessionMs =
+    params.maxSessionMs === MAX_SESSION_MS ? max : Math.min(max, params.maxSessionMs);
+}
 
-  let sendCount = 0;
-  let sendBytesTotal = 0;
-  let sendFailCount = 0;
-  let screencastFramesSent = 0;
-  let screencastFrameBytesSent = 0;
-  let screencastAcksReceived = 0;
-  let wsClosing = false;
-  let browserCloseSent = false;
-  let memAtClose: ReturnType<typeof engineMemoryBreakdown> | null = null;
+export interface BrowserSessionOptions {
+  host?: EngineHost;
+  externalOutbound?: ExternalOutbound;
+  // The host's egress for this session. Called once, and only without an external outbound.
+  egress?: () => ExternalOutbound | undefined;
+  // A host profile loaded before the socket accepts commands (EngineHost.openProfile).
+  persistence?: ProfilePersistence;
+  // The connection id the host loaded that profile under; the session mints its own otherwise.
+  connectionId?: string;
+}
 
-  const send = (payload: unknown): boolean => {
-    if (wsClosing) {
-      sendFailCount++;
-      return false;
-    }
-    try {
-      const str = JSON.stringify(payload);
-      if (
-        payload &&
-        typeof payload === "object" &&
-        (payload as { method?: string }).method === "Page.screencastFrame"
-      ) {
-        screencastFramesSent++;
-        screencastFrameBytesSent += str.length;
-        if (screencastFramesSent % 5 === 1) {
-          console.log(
-            `[kitesurf-ws] screencastFrame #${screencastFramesSent} ` +
-              `bytes=${str.length} totalBytes=${screencastFrameBytesSent} ` +
-              `acksReceived=${screencastAcksReceived}`,
-          );
-        }
-      }
-      server.send(str);
-      sendCount++;
-      sendBytesTotal += str.length;
-      return true;
-    } catch (err) {
-      sendFailCount++;
-      const msg =
-        err instanceof Error
-          ? `${err.name}: ${err.message}`
-          : err && typeof err === "object" && "message" in err
-            ? `${(err as { name?: string }).name ?? "Error"}: ${(err as { message?: string }).message ?? ""}`
-            : String(err);
-      console.error(
-        `[kitesurf-ws] send failed (#${sendFailCount}, ` +
-          `sendCount=${sendCount}, totalBytes=${sendBytesTotal}): ${msg}`,
+export interface ClientOptions {
+  // Exempts the client from the idle deadline only; the session's wall-clock cap still applies.
+  exemptIdleDeadline?: boolean;
+  onCtx?: (dispatchCtx: DispatchCtx) => void;
+  onDispatch?: (dispatch: (req: CdpRequest) => Promise<CdpResponse>) => void;
+}
+
+/**
+ * One browser: targets, cookie jars, the network log, the renderer, the background drain, the
+ * wall-clock cap and teardown. It has at most one client and ends when that client leaves.
+ */
+export class BrowserSession {
+  // Also the analytics session ID, the log correlation key and the key of every
+  // module-scoped registry (network tracker, cookie jars, interception, images). The upgrade
+  // handler mints it, so a host profile can load under it before the session exists.
+  readonly id: string;
+  readonly browser: BrowserState;
+  readonly analytics: KitesurfAnalytics;
+  // WebSocket events lose the local trace context; handlers rejoin the one captured here.
+  readonly rejoinLocalTrace: ReturnType<typeof localTraceEventWrap>;
+  readonly arrivalClock: () => number;
+  // Engine memory at teardown, for the client's close line.
+  memAtClose: ReturnType<typeof engineMemoryBreakdown> | null = null;
+  readonly #env: Env;
+  readonly #ctx: SessionContext;
+  readonly #dispatchEnv: DispatchCtx["env"];
+  readonly #maxSessionMs: number;
+  /** The browser context's localStorage; the host profile persists it (state/profile.ts). */
+  readonly storage: LocalStorage;
+  /** Saves the host profile after a cookie or localStorage change; absent without one. */
+  readonly committer: ProfileCommitter | undefined;
+  readonly #commandExtension: DispatchCtx["commandExtension"];
+  readonly #requestBlocker: DispatchCtx["requestBlocker"];
+  #client: ClientConnection | null = null;
+  readonly #openedAt: number;
+  readonly #drainTimer: ReturnType<typeof setInterval>;
+  #deadlineFired = false;
+  // The client idled out: the drain stops while the socket closes.
+  #idleClosed = false;
+  #disposed = false;
+
+  constructor(
+    request: Request,
+    env: Env,
+    ctx: SessionContext,
+    params: ConnectionParams,
+    opts: BrowserSessionOptions = {},
+  ) {
+    this.#env = env;
+    this.#ctx = ctx;
+    this.id = opts.connectionId ?? nanoid(CDP_CONNECTION_ID_LENGTH);
+    const connectionId = this.id;
+    const options = resolveConnectionOptions(request, connectionId, opts.host, env);
+    applyHostDeadlines(params, options);
+    this.#maxSessionMs = params.maxSessionMs;
+
+    // Retain response bodies only when Network.enable requests buffering.
+    const networkEvents = new NetworkEventTracker((event) => this.route(event), connectionId);
+
+    this.analytics = new KitesurfAnalytics(
+      {
+        sessionId: connectionId,
+        entrypoint: options.entrypoint,
+        connectionMode: params.connectionMode,
+        environment: env.KITESURF_ENV ?? "",
+        buildVersion: env.KITESURF_VERSION ?? "",
+        colo: (request.cf as { colo?: string } | undefined)?.colo ?? "",
+      },
+      new SafePerformance((env as { HOST_CLOCK?: HostClockTimer }).HOST_CLOCK),
+      {
+        factory: opts.host?.telemetry,
+        request,
+        props: ctx.props,
+        env,
+        waitUntil: (p) => ctx.waitUntil(p),
+      },
+    );
+
+    registerTracker(connectionId, networkEvents);
+    const requestBlocker = opts.host?.requestBlocker;
+    if (requestBlocker) registerRequestBlocker(connectionId, requestBlocker);
+    this.#requestBlocker = requestBlocker;
+
+    let committer: ProfileCommitter | undefined;
+    // A profile save is debounced, so a page's write is on disk shortly after it happens.
+    const changed = () => committer?.changed();
+    const persistence = opts.persistence;
+    const cookies = createCookieJar(persistence?.initial.cookies, changed);
+    registerCookieJar(connectionId, cookies);
+    const storage = new LocalStorage(
+      resolveSessionStore(connectionId, env, opts.host),
+      undefined,
+      changed,
+    );
+    for (const [origin, entries] of persistence?.initial.localStorage ?? [])
+      storage.apply(
+        origin,
+        entries.map(([key, value]) => ({ op: "set" as const, key, value })),
       );
-      return false;
-    }
-  };
-
-  const emit = (event: CdpEvent) => send(event);
-
-  // Retain response bodies only when Network.enable requests buffering.
-  const networkEvents = new NetworkEventTracker(emit, connectionId);
-
-  const analytics = new KitesurfAnalytics(
-    {
-      sessionId: connectionId,
-      entrypoint: options.entrypoint,
-      connectionMode,
-      environment: env.KITESURF_ENV ?? "",
-      buildVersion: env.KITESURF_VERSION ?? "",
-      colo: (request.cf as { colo?: string } | undefined)?.colo ?? "",
-    },
-    new SafePerformance((env as { HOST_CLOCK?: HostClockTimer }).HOST_CLOCK),
-    {
-      factory: opts?.host?.telemetry,
-      request,
-      props: ctx.props,
-      env,
-      waitUntil: (p) => ctx.waitUntil(p),
-    },
-  );
-
-  registerTracker(connectionId, networkEvents);
-  const requestBlocker = opts?.host?.requestBlocker;
-  if (requestBlocker) registerRequestBlocker(connectionId, requestBlocker);
-
-  let committer: ProfileCommitter | undefined;
-  const changed = () => committer?.changed();
-  const cookies = createCookieJar(persistence?.initial.cookies, changed);
-  const storage = new SessionWebStorage(
-    connectionId,
-    persistence?.initial.localStorage ?? [],
-    changed,
-  );
-  registerWebStorage(connectionId, storage);
-  if (persistence)
-    committer = new ProfileCommitter(persistence, () => ({
-      cookies: cookies.getAll(),
-      localStorage: storage.snapshot(),
-    }));
-  registerCookieJar(connectionId, cookies);
-  const workerBudget = new DynamicWorkerBudget();
-  const browser: BrowserState = {
-    targets: new Map(),
-    sandboxOutbound: createSandboxOutboundOverride(
-      (ctx as ExecutionContext & { exports: SandboxOutboundExports }).exports,
-      env,
-      opts?.externalOutbound,
-      opts?.externalOutbound ? undefined : opts?.host?.egress?.(env, ctx),
-    ),
-    contexts: new Map(),
-    nextBrowserContextId: 1,
-    autoAttach: false,
-    flatten: false,
-    cookies,
-    screencasts: new Map(),
-    styleCache: new StyleCache(),
-    imageCache: new Map(),
-    networkEvents,
-    layoutMode: initialLayoutMode,
-    cdpDebug,
-    isolateCapOverrides,
-    connectionMode,
-    ttyKeyboard: false,
-    preNavScripts: new Map<string, string>(),
-    learnedInsertedScripts: new Map(),
-    pendingBindings: new Set<string>(),
-    execContextSeq: 3,
-    runtimeEnabledSessions: new Set<string>(),
-    rendererManager: null,
-    workerBudget,
-    dedicatedWorkers: new DedicatedWorkers(workerBudget, (p) => ctx.waitUntil(p)),
-    skipSpeculativeRaster: request.headers.get(SKIP_SPECULATIVE_RASTER_HEADER) === "1",
-    skipPartialRaster: env.KITESURF_DISABLE_PARTIAL_RASTER === "1",
-    // Deferred-fonts opt-in. See BrowserState.fontDefer.
-    fontDefer: options.fontDefer,
-    rendererSessionId: null,
-    engineSessionId: null,
-    wsClosing: false,
-    attributionHeaders: pickHeaders(request, opts?.host?.attributionHeaders),
-  };
-
-  browser.workerBudget.countPageTargets = () => {
-    let n = 0;
-    for (const t of browser.targets.values()) {
-      if (t.type !== "page") continue;
-      if (t.pageScriptLease || t.navigateGeneration > 0) n += 1;
-    }
-    return n;
-  };
-
-  const dispatchCtx: DispatchCtx = {
-    browser,
-    emit,
-    // Host bindings belong to this WebSocket's lifetime, not a worker-global cache.
-    commandExtension: opts?.host?.createCdpCommandExtension?.(env),
-    requestBlocker,
-    env: buildDispatchEnv(env),
-    ctx,
-    connectionId,
-    analytics,
-  };
-  browser.flushProfile = (targetId) => flushProfile(dispatchCtx, storage, committer, targetId);
-
-  const tracedDispatch = (req: CdpRequest) =>
-    NOISY_CDP_METHODS.has(req.method)
-      ? dispatch(dispatchCtx, req)
-      : traceSpan(env.HOST_TRACER, "cdp." + req.method, () => dispatch(dispatchCtx, req), {
-          connectionId,
-        });
-
-  try {
-    onCtx?.(dispatchCtx);
-    opts?.onDispatch?.(tracedDispatch);
-  } catch (err) {
-    console.warn("[kitesurf-ws] in-process consumer threw:", err);
-  }
-
-  ensureBrowserTarget(dispatchCtx);
-  const initialPage = createPageTarget(dispatchCtx, "about:blank");
-  emit({
-    method: "Target.targetCreated",
-    params: { targetInfo: { ...visibleInfo(initialPage, connectionMode) } },
-  });
-
-  const sessionOpenedAt = Date.now();
-  let lastClientMessageAt = sessionOpenedAt;
-  let deadlineFired = false;
-
-  const closeIfExpired = (): boolean => {
-    if (deadlineFired || wsClosing) return deadlineFired;
-    const now = Date.now();
-    const idleExempt = opts?.exemptIdleDeadline === true;
-    const reason =
-      now - sessionOpenedAt > maxSessionMs
-        ? `kitesurf: session exceeded ${maxSessionMs} ms`
-        : !idleExempt && now - lastClientMessageAt > idleMs
-          ? `kitesurf: idle for ${idleMs} ms with no client CDP traffic`
-          : null;
-    if (reason === null) return false;
-    deadlineFired = true;
-    console.warn(`[kitesurf-ws] closing session ${connectionId}: ${reason}`);
-    try {
-      server.close(1001, reason);
-    } catch {}
-    return true;
-  };
-
-  const drainTimer = setInterval(() => {
-    if (closeIfExpired()) return;
-    if (browser.targets.size === 0) return;
-    networkEvents.drain();
-    drainInterception(connectionId);
-    for (const t of browser.targets.values()) {
-      pumpBackgroundEvents(dispatchCtx, t);
-    }
-  }, BACKGROUND_EVENT_DRAIN_INTERVAL_MS);
-  ctx.waitUntil(
-    new Promise<void>((resolve) => {
-      const cleanup = () => {
-        clearInterval(drainTimer);
-        resolve();
-      };
-      server.addEventListener("close", cleanup, { once: true });
-      server.addEventListener("error", cleanup, { once: true });
-    }),
-  );
-
-  if (initialUrl !== null) {
-    const syntheticReq: CdpRequest = {
-      id: -1,
-      method: "Page.navigate",
-      params: { url: initialUrl },
+    this.storage = storage;
+    if (persistence)
+      committer = new ProfileCommitter(persistence, () => ({
+        cookies: cookies.getAll(),
+        localStorage: storage.origins().map((origin) => [origin, storage.entries(origin)]),
+      }));
+    this.committer = committer;
+    const workerBudget = new DynamicWorkerBudget();
+    const browser: BrowserState = {
+      targets: new Map(),
+      sandboxOutbound: createSandboxOutboundOverride(
+        (ctx as SessionContext & { exports: SandboxOutboundExports }).exports,
+        env,
+        opts.externalOutbound,
+        opts.externalOutbound ? undefined : opts.egress?.(),
+      ),
+      contexts: new Map(),
+      localStorage: storage,
+      nextBrowserContextId: 1,
+      cookies,
+      screencasts: new Map(),
+      styleCache: new StyleCache(),
+      imageCache: new Map(),
+      networkEvents,
+      layoutMode: params.layoutMode,
+      cdpDebug: params.cdpDebug,
+      isolateCapOverrides: params.isolateCapOverrides,
+      ttyKeyboard: false,
+      preNavScripts: new Map<string, string>(),
+      learnedInsertedScripts: new Map(),
+      pendingBindings: new Set<string>(),
+      execContextSeq: 3,
+      runtimeEnabledSessions: new Set<string>(),
+      rendererManager: null,
+      workerBudget,
+      dedicatedWorkers: new DedicatedWorkers(workerBudget, (p) => ctx.waitUntil(p)),
+      skipSpeculativeRaster: request.headers.get(SKIP_SPECULATIVE_RASTER_HEADER) === "1",
+      skipPartialRaster: env.KITESURF_DISABLE_PARTIAL_RASTER === "1",
+      // Deferred-fonts opt-in. See BrowserState.fontDefer.
+      fontDefer: options.fontDefer,
+      fontProfile: options.fontProfile,
+      rendererSessionId: null,
+      engineSessionId: null,
+      wsClosing: false,
+      attributionHeaders: pickHeaders(request, opts.host?.attributionHeaders),
     };
-    void (async () => {
-      try {
-        const response = await tracedDispatch(syntheticReq);
-        if (debug) {
-          console.log("[cdp auto-navigate]", initialUrl, "->", JSON.stringify(response));
-        }
-      } catch (err) {
-        console.error("[cdp auto-navigate threw]", err);
+    this.browser = browser;
+
+    // The local host's Kitesurf.flushProfile, Browser.close and Target.closeTarget await this.
+    browser.flushProfile = (targetId) => flushProfile(browser, committer, targetId);
+
+    browser.workerBudget.countPageTargets = () => {
+      let n = 0;
+      for (const t of browser.targets.values()) {
+        if (t.type !== "page") continue;
+        if (t.pageScriptLease || t.navigateGeneration > 0) n += 1;
       }
-    })();
+      return n;
+    };
+
+    // Host bindings belong to the session's lifetime, not a worker-global cache.
+    this.#commandExtension = opts.host?.createCdpCommandExtension?.(env);
+    this.#dispatchEnv = buildDispatchEnv(env);
+
+    this.#openedAt = Date.now();
+    this.rejoinLocalTrace = localTraceEventWrap(env);
+    this.arrivalClock = makeWallClock(this.#dispatchEnv);
+    this.#drainTimer = setInterval(() => this.#tick(), BACKGROUND_EVENT_DRAIN_INTERVAL_MS);
   }
 
-  const rejoinLocalTrace = localTraceEventWrap(env);
-  const arrivalClock = makeWallClock(dispatchCtx.env);
+  get disposed(): boolean {
+    return this.#disposed;
+  }
 
-  server.addEventListener("message", (event) => {
-    // Preserve queue delay for request-boundary timing.
-    const arrivedAt = arrivalClock();
-    lastClientMessageAt = Date.now();
-    void rejoinLocalTrace(async () => {
-      const parsed = parseCdpRequest(
-        typeof event.data === "string"
-          ? event.data
-          : new TextDecoder().decode(event.data as ArrayBuffer),
-      );
-      if (!parsed.ok) {
-        send(parsed.error);
-        return;
-      }
-      const req = parsed.request;
-      markArrival(req, arrivedAt);
+  /** A dispatch context that acts for `client`. Its events go through `route`. */
+  makeCtx(client: CdpClientState): DispatchCtx {
+    return {
+      browser: this.browser,
+      emit: (event) => this.route(event),
+      commandExtension: this.#commandExtension,
+      requestBlocker: this.#requestBlocker,
+      env: this.#dispatchEnv,
+      ctx: this.#ctx,
+      connectionId: this.id,
+      analytics: this.analytics,
+      client,
+    };
+  }
 
-      if (debug && !NOISY_CDP_METHODS.has(req.method)) {
-        console.log(
-          "[cdp <-]",
-          req.id,
-          req.method,
-          req.sessionId ? `(s=${req.sessionId.slice(0, CDP_DEBUG_SESSION_ID_PREFIX_CHARS)})` : "",
-        );
-      }
+  /** Delivers an event to the client, if one is connected. */
+  route(event: CdpEvent): void {
+    if (this.#disposed) return;
+    this.#client?.deliver(event);
+  }
 
-      if (req.method === "Page.screencastFrameAck") {
-        screencastAcksReceived++;
-      }
-
-      try {
-        if (req.method === "Browser.close") await browser.flushProfile?.();
-        const response = await tracedDispatch(req);
-        if (debug && !NOISY_CDP_METHODS.has(req.method)) {
-          console.log("[cdp ->]", req.id, req.method, "ok");
-        }
-        const sent = send(response);
-        // Chrome exits after it answers Browser.close, which drops the socket. Clients behind
-        // a proxy wait for that drop, so `browser.close()` hangs unless the engine closes too.
-        if (req.method === "Browser.close" && !("error" in response)) {
-          try {
-            server.close(1000, "Browser.close");
-            browserCloseSent = sent;
-          } catch {}
-        }
-      } catch (err) {
-        console.error("[cdp dispatch threw]", req.method, err);
-        send({
-          id: req.id,
-          error: { code: -32000, message: String(err) },
-          sessionId: req.sessionId,
-        });
-      }
+  /** Connects a CDP client on an accepted server-side socket. */
+  attachClient(
+    server: WebSocket,
+    params: ConnectionParams,
+    opts: ClientOptions = {},
+  ): ClientConnection {
+    if (this.#disposed) throw new Error("browser session has ended");
+    if (this.#client) throw new Error("browser session already has a client");
+    const client = new ClientConnection(this, server, params, opts, {
+      onLeave: (end) => this.#clientLeft(end),
     });
-  });
+    this.#client = client;
+    client.start();
+    return client;
+  }
 
-  // A socket can terminate with an error, a close, or both. Release everything once, from
-  // whichever arrives first; the platform may never send the close.
-  let tornDown = false;
-  function teardownConnection(): void {
-    if (tornDown) return;
-    tornDown = true;
-    committer?.stop();
-    unregisterWebStorage(connectionId);
-    wsClosing = true;
+  #clientLeft(end: SessionEndFields): void {
+    this.#client = null;
+    this.dispose(end);
+  }
+
+  // Returns true from the tick on which the wall-clock cap fires, and on every later one.
+  #closeIfExpired(): boolean {
+    if (this.#deadlineFired || this.#disposed) return this.#deadlineFired;
+    if (Date.now() - this.#openedAt <= this.#maxSessionMs) return false;
+    this.#deadlineFired = true;
+    const reason = `kitesurf: session exceeded ${this.#maxSessionMs} ms`;
+    console.warn(`[kitesurf-ws] closing session ${this.id}: ${reason}`);
+    this.#client?.close(1001, reason);
+    return true;
+  }
+
+  #tick(): void {
+    // Once the client idles out, the wall-clock cap must not close its socket a second time.
+    if (this.#idleClosed || this.#closeIfExpired()) return;
+    if (this.#client?.closeIfIdle()) {
+      this.#idleClosed = true;
+      return;
+    }
+    const ctx = this.#client?.ctx;
+    const browser = this.browser;
+    if (!ctx || browser.targets.size === 0) return;
+    browser.networkEvents.drain();
+    drainInterception(this.id);
+    for (const t of browser.targets.values()) {
+      pumpBackgroundEvents(ctx, t);
+    }
+  }
+
+  /** Ends the session: emits session_end, retires every isolate and sweeps the registries. */
+  dispose(end: SessionEndFields): void {
+    if (this.#disposed) return;
+    const browser = this.browser;
+    emitSessionEnd(this.analytics, {
+      ...end,
+      workerLeases: end.workerLeases ?? browser.workerBudget.snapshot(),
+    });
+    this.#disposed = true;
+    clearInterval(this.#drainTimer);
+    this.committer?.stop();
+    const client = this.#client;
+    this.#client = null;
+    client?.close(1001, "kitesurf: browser session ended");
+    const connectionId = this.id;
+    const ctx = this.#ctx;
     browser.wsClosing = true;
     // Stop scene streams before retiring their targets and renderer.
     stopSceneStreams(browser);
@@ -479,8 +487,8 @@ export async function handleWebSocket(
       browser.rendererManager?.close("engine WS closed");
     } catch {}
     unregisterTracker(connectionId);
-    memAtClose = engineMemoryBreakdown(browser);
-    networkEvents.dispose();
+    this.memAtClose = engineMemoryBreakdown(browser);
+    browser.networkEvents.dispose();
     unregisterOutboundFilters(connectionId);
     unregisterRequestBlocker(connectionId);
     unregisterInterception(connectionId);
@@ -508,39 +516,257 @@ export async function handleWebSocket(
       });
       releaseAllDomHandles(target);
     }
-    rejoinLocalTrace(() => endLocalTraceSession(env));
+    this.rejoinLocalTrace(() => endLocalTraceSession(this.#env));
+  }
+}
+
+function newClientState(connectionMode: "page" | "browser"): CdpClientState {
+  return { connectionMode, autoAttach: false, flatten: false };
+}
+
+interface ClientHooks {
+  // The client is gone. Called once.
+  onLeave: (end: SessionEndFields) => void;
+}
+
+/** One CDP WebSocket on a BrowserSession: sending, the idle deadline and the message loop. */
+export class ClientConnection {
+  readonly state: CdpClientState;
+  readonly ctx: DispatchCtx;
+  readonly #session: BrowserSession;
+  readonly #server: WebSocket;
+  readonly #params: ConnectionParams;
+  readonly #opts: ClientOptions;
+  readonly #hooks: ClientHooks;
+  readonly #tracedDispatch: (req: CdpRequest) => Promise<CdpResponse>;
+  #sendCount = 0;
+  #sendBytesTotal = 0;
+  #sendFailCount = 0;
+  #screencastFramesSent = 0;
+  #screencastFrameBytesSent = 0;
+  #screencastAcksReceived = 0;
+  #closing = false;
+  // Only client CDP messages renew this; engine activity must not keep an idle client open.
+  #lastClientMessageAt = Date.now();
+  #deadlineFired = false;
+  #left = false;
+  // A Browser.close response reached the socket; a later transport loss is that close landing.
+  #browserCloseSent = false;
+
+  constructor(
+    session: BrowserSession,
+    server: WebSocket,
+    params: ConnectionParams,
+    opts: ClientOptions,
+    hooks: ClientHooks,
+  ) {
+    this.#session = session;
+    this.#server = server;
+    this.#params = params;
+    this.#opts = opts;
+    this.#hooks = hooks;
+    this.state = newClientState(params.connectionMode);
+    const ctx = session.makeCtx(this.state);
+    this.ctx = ctx;
+    const connectionId = session.id;
+    this.#tracedDispatch = (req: CdpRequest) =>
+      NOISY_CDP_METHODS.has(req.method)
+        ? dispatch(ctx, req)
+        : traceSpan(ctx.env.HOST_TRACER, "cdp." + req.method, () => dispatch(ctx, req), {
+            connectionId,
+          });
   }
 
-  server.addEventListener("close", (ev) => {
-    const closeEv = ev as CloseEvent;
-    emitSessionEnd(analytics, {
-      endReason: "close",
-      closeCode: closeEv.code ?? 0,
-      wasClean: closeEv.wasClean ? 1 : 0,
-      workerLeases: workerBudget.snapshot(),
-    });
-    teardownConnection();
-  });
+  /** Sends an event or response to this client alone; false when the socket refused it. */
+  deliver(payload: unknown): boolean {
+    if (this.#closing) {
+      this.#sendFailCount++;
+      return false;
+    }
+    try {
+      const str = serializeCdpPayload(payload);
+      if (
+        payload &&
+        typeof payload === "object" &&
+        (payload as { method?: string }).method === "Page.screencastFrame"
+      ) {
+        this.#screencastFramesSent++;
+        this.#screencastFrameBytesSent += str.length;
+        if (this.#screencastFramesSent % 5 === 1) {
+          console.log(
+            `[kitesurf-ws] screencastFrame #${this.#screencastFramesSent} ` +
+              `bytes=${str.length} totalBytes=${this.#screencastFrameBytesSent} ` +
+              `acksReceived=${this.#screencastAcksReceived}`,
+          );
+        }
+      }
+      this.#server.send(str);
+      this.#sendCount++;
+      this.#sendBytesTotal += str.length;
+      return true;
+    } catch (err) {
+      this.#sendFailCount++;
+      const msg =
+        err instanceof Error
+          ? `${err.name}: ${err.message}`
+          : err && typeof err === "object" && "message" in err
+            ? `${(err as { name?: string }).name ?? "Error"}: ${(err as { message?: string }).message ?? ""}`
+            : String(err);
+      console.error(
+        `[kitesurf-ws] send failed (#${this.#sendFailCount}, ` +
+          `sendCount=${this.#sendCount}, totalBytes=${this.#sendBytesTotal}): ${msg}`,
+      );
+      return false;
+    }
+  }
 
-  server.addEventListener("error", (ev) => {
+  // Closes the socket. The session tears down from the close listener.
+  close(code: number, reason: string): void {
+    try {
+      this.#server.close(code, reason);
+    } catch {}
+  }
+
+  // The close listener, close() and a transport error can each report the same departure.
+  #leave(end: SessionEndFields): void {
+    this.#closing = true;
+    if (this.#left) return;
+    this.#left = true;
+    this.#hooks.onLeave(end);
+  }
+
+  /** Closes this client once it has sent nothing for its idle budget; true on the closing call. */
+  closeIfIdle(): boolean {
+    if (this.#deadlineFired || this.#closing) return false;
+    if (this.#opts.exemptIdleDeadline === true) return false;
+    const idleMs = this.#params.idleMs;
+    if (Date.now() - this.#lastClientMessageAt <= idleMs) return false;
+    this.#deadlineFired = true;
+    const reason = `kitesurf: idle for ${idleMs} ms with no client CDP traffic`;
+    console.warn(`[kitesurf-ws] closing session ${this.#session.id}: ${reason}`);
+    this.close(1001, reason);
+    return true;
+  }
+
+  /** Runs the in-process hooks, opens the initial blank page and starts listening. */
+  start(): void {
+    const server = this.#server;
+    const params = this.#params;
+
+    try {
+      this.#opts.onCtx?.(this.ctx);
+      registerDispatchConsumer(this.#opts.onDispatch, this.#tracedDispatch);
+    } catch (err) {
+      console.warn("[kitesurf-ws] in-process consumer threw:", err);
+    }
+
+    // After the hooks, as before the split: a page a hook creates is announced once, by the
+    // command that created it, and an onCtx that changes the browser state sees no targets.
+    ensureBrowserTarget(this.ctx);
+    const initialPage = createPageTarget(this.ctx, "about:blank");
+    this.deliver({
+      method: "Target.targetCreated",
+      params: { targetInfo: { ...visibleInfo(initialPage, params.connectionMode) } },
+    });
+
+    const initialUrl = params.initialUrl;
+    if (initialUrl !== null) {
+      const syntheticReq: CdpRequest = {
+        id: -1,
+        method: "Page.navigate",
+        params: { url: initialUrl },
+      };
+      void (async () => {
+        try {
+          const response = await this.#tracedDispatch(syntheticReq);
+          if (params.debug) {
+            console.log("[cdp auto-navigate]", initialUrl, "->", JSON.stringify(response));
+          }
+        } catch (err) {
+          console.error("[cdp auto-navigate threw]", err);
+        }
+      })();
+    }
+
+    server.addEventListener("message", (event) => this.#onMessage(event));
+    server.addEventListener("close", (ev) => {
+      const c = ev as CloseEvent;
+      this.#leave({ endReason: "close", closeCode: c.code ?? 0, wasClean: c.wasClean ? 1 : 0 });
+      this.#logClose(c);
+    });
+    server.addEventListener("error", (ev) => this.#onError(ev));
+  }
+
+  #onMessage(event: MessageEvent): void {
+    // Preserve queue delay for request-boundary timing.
+    const arrivedAt = this.#session.arrivalClock();
+    const params = this.#params;
+    this.#lastClientMessageAt = Date.now();
+    void this.#session.rejoinLocalTrace(async () => {
+      const parsed = parseCdpRequest(
+        typeof event.data === "string"
+          ? event.data
+          : new TextDecoder().decode(event.data as ArrayBuffer),
+      );
+      if (!parsed.ok) {
+        this.deliver(parsed.error);
+        return;
+      }
+      const req = parsed.request;
+      markArrival(req, arrivedAt);
+
+      if (params.debug && !NOISY_CDP_METHODS.has(req.method)) {
+        console.log(
+          "[cdp <-]",
+          req.id,
+          req.method,
+          req.sessionId ? `(s=${req.sessionId.slice(0, CDP_DEBUG_SESSION_ID_PREFIX_CHARS)})` : "",
+        );
+      }
+
+      if (req.method === "Page.screencastFrameAck") {
+        this.#screencastAcksReceived++;
+      }
+
+      try {
+        // The profile holds what the pages wrote; a save after the socket drops cannot report.
+        if (req.method === "Browser.close") await this.#session.browser.flushProfile?.();
+        const response = await this.#tracedDispatch(req);
+        if (params.debug && !NOISY_CDP_METHODS.has(req.method)) {
+          console.log("[cdp ->]", req.id, req.method, "ok");
+        }
+        const sent = this.deliver(response);
+        // Chrome exits after it answers Browser.close, which drops the socket. Clients behind
+        // a proxy wait for that drop, so `browser.close()` hangs unless the engine closes too.
+        if (req.method === "Browser.close" && !("error" in response)) {
+          this.#browserCloseSent = sent;
+          this.close(1000, "Browser.close");
+        }
+      } catch (err) {
+        console.error("[cdp dispatch threw]", req.method, err);
+        this.deliver({
+          id: req.id,
+          error: { code: -32000, message: String(err) },
+          sessionId: req.sessionId,
+        });
+      }
+    });
+  }
+
+  #onError(ev: Event): void {
     const e = ev as ErrorEvent & {
       error?: { name?: string; message?: string; stack?: string };
     };
     const msg = e.error?.message ?? e.message ?? "";
     // workerd can report transport loss before it dispatches the requested close event.
-    if (browserCloseSent && msg === "Network connection lost.") {
-      teardownConnection();
+    if (this.#browserCloseSent && msg === "Network connection lost.") {
+      this.#leave({ endReason: "close", closeCode: 1000, wasClean: 0 });
       return;
     }
-    const postClose = wsClosing && msg.includes("Network connection lost");
-    if (!wsClosing) {
-      emitSessionEnd(analytics, {
-        endReason: "error",
-        closeCode: 0,
-        wasClean: 0,
-        workerLeases: workerBudget.snapshot(),
-      });
-    }
+    const postClose = this.#closing && msg.includes("Network connection lost");
+    // workerd may never follow the error with a close event, so the client leaves now and the
+    // session ends with it.
+    if (!this.#closing) this.#leave({ endReason: "error", closeCode: 0, wasClean: 0 });
     const detail = {
       message: e.message,
       type: e.type,
@@ -550,12 +776,12 @@ export async function handleWebSocket(
       error_name: e.error?.name,
       error_message: e.error?.message,
       counters: {
-        sendCount,
-        sendBytesTotal,
-        sendFailCount,
-        screencastFramesSent,
-        screencastFrameBytesSent,
-        screencastAcksReceived,
+        sendCount: this.#sendCount,
+        sendBytesTotal: this.#sendBytesTotal,
+        sendFailCount: this.#sendFailCount,
+        screencastFramesSent: this.#screencastFramesSent,
+        screencastFrameBytesSent: this.#screencastFrameBytesSent,
+        screencastAcksReceived: this.#screencastAcksReceived,
       },
     };
     if (postClose) {
@@ -563,19 +789,18 @@ export async function handleWebSocket(
     } else {
       console.error(`[kitesurf-ws] error: ${JSON.stringify(detail)}`);
     }
-    teardownConnection();
-  });
+  }
 
-  server.addEventListener("close", (ev) => {
-    const c = ev as CloseEvent;
-    const mem = memAtClose ?? engineMemoryBreakdown(browser);
+  #logClose(c: CloseEvent): void {
+    const session = this.#session;
+    const mem = session.memAtClose ?? engineMemoryBreakdown(session.browser);
     console.log(
       `[kitesurf-ws] close: code=${c.code} reason="${c.reason}" wasClean=${c.wasClean} ` +
-        `sendCount=${sendCount} sendBytesTotal=${sendBytesTotal} ` +
-        `sendFailCount=${sendFailCount} ` +
-        `screencastFramesSent=${screencastFramesSent} ` +
-        `screencastFrameBytesSent=${screencastFrameBytesSent} ` +
-        `screencastAcksReceived=${screencastAcksReceived} ` +
+        `sendCount=${this.#sendCount} sendBytesTotal=${this.#sendBytesTotal} ` +
+        `sendFailCount=${this.#sendFailCount} ` +
+        `screencastFramesSent=${this.#screencastFramesSent} ` +
+        `screencastFrameBytesSent=${this.#screencastFrameBytesSent} ` +
+        `screencastAcksReceived=${this.#screencastAcksReceived} ` +
         `engineWasmBytes=${mem.wasmBytes} ` +
         `engineWasmDeltaBytes=${mem.wasmDeltaBytes} ` +
         `retainedBodyBytes=${mem.retainedBodyBytes} ` +
@@ -586,12 +811,61 @@ export async function handleWebSocket(
         `fontAssetCacheBytes=${mem.fontAssetCacheBytes} ` +
         `engineAccountedBytes=${mem.accountedBytes}`,
     );
+  }
+}
+
+/**
+ * Accepts a CDP WebSocket request and returns a 101 response with its session ID. The session
+ * has this one client and ends with its socket; `ctx.waitUntil` keeps it alive until then.
+ */
+export async function handleWebSocket(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  onCtx?: (dispatchCtx: DispatchCtx) => void,
+  opts?: {
+    exemptIdleDeadline?: boolean;
+    externalOutbound?: ExternalOutbound;
+    onDispatch?: (dispatch: (req: CdpRequest) => Promise<CdpResponse>) => void;
+    host?: EngineHost;
+  },
+): Promise<Response> {
+  const params = parseConnectionParams(request);
+  const connectionId = nanoid(CDP_CONNECTION_ID_LENGTH);
+
+  // Before the socket exists: a host hook that throws fails the upgrade, and leaves no accepted
+  // socket whose lifetime promise could never settle. External sessions provide their outbound
+  // policy before dispatch; regular upgrades use the default policy.
+  const persistence = await opts?.host?.openProfile?.(connectionId, env);
+  const session = new BrowserSession(request, env, ctx, params, {
+    host: opts?.host,
+    externalOutbound: opts?.externalOutbound,
+    egress: () => opts?.host?.egress?.(env, ctx),
+    persistence,
+    connectionId,
+  });
+
+  const pair = new WebSocketPair();
+  const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
+
+  server.accept();
+
+  const wsLifetime = new Promise<void>((resolve) => {
+    server.addEventListener("close", () => resolve());
+    server.addEventListener("error", () => resolve());
+  });
+  ctx.waitUntil(wsLifetime);
+
+  session.attachClient(server, params, {
+    exemptIdleDeadline: opts?.exemptIdleDeadline,
+    onCtx,
+    onDispatch: opts?.onDispatch,
   });
 
   return new Response(null, {
     status: 101,
     webSocket: client,
-    headers: { [SESSION_ID_HEADER]: connectionId },
+    headers: { [SESSION_ID_HEADER]: session.id },
   });
 }
 

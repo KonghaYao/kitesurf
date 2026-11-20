@@ -21,6 +21,7 @@ import type { DispatchCtx } from "../src/cdp/dispatch.ts";
 import type { CdpParamsOf, CdpRequest, CdpResultOf, TargetState } from "../src/cdp/types.ts";
 import type { PageScriptStub } from "../src/eval/page-script.ts";
 import type { QueryDomArgs, QueryDomMethod, QueryDomResult } from "@kitesurf/jsrpc-types/query-dom";
+import { testClient } from "./client-state.ts";
 
 type StubReplies = Partial<{ [M in QueryDomMethod]: QueryDomResult<M> }>;
 
@@ -67,6 +68,7 @@ function makeCtx(target: TargetState): DispatchCtx {
   return {
     browser: { targets: new Map([["t1", target]]) },
     env: {},
+    client: testClient(),
   } as DispatchCtx;
 }
 
@@ -131,6 +133,19 @@ describe("CSS.getInlineStylesForNode", () => {
     const target = makeTarget(makeStub({ getAttributes: { attributes: ["class", "x"] } }));
     const r = await handleCss(makeCtx(target), req("CSS.getInlineStylesForNode", { nodeId: 5 }));
     expect(r).toEqual({});
+  });
+
+  it("does not read a PageScript node id from the engine DOM when the isolate fails", async () => {
+    const target = makeTarget(makeStub({}, new Error("wasm panicked")));
+    const engineDomWithInlineStyle = { nodeInfo: () => ({ attributes: ["style", "color: red"] }) };
+    // oxlint-disable-next-line kitesurf/no-chained-type-assertions -- partial DomHandle fixture.
+    target.dom = engineDomWithInlineStyle as unknown as TargetState["dom"];
+
+    const response = await handleCss(
+      makeCtx(target),
+      req("CSS.getInlineStylesForNode", { nodeId: 5 }),
+    );
+    expect(response).toEqual({});
   });
 });
 
@@ -400,6 +415,7 @@ describe("CSS.enable opaque stylesheet fetches", () => {
       connectionId,
       emit: () => {},
       env: {},
+      client: testClient(),
     } as unknown as DispatchCtx;
     ctx.emit = (event) => {
       events.push(event.method);
@@ -686,6 +702,7 @@ describe("CSS opaque stylesheet read bounds", () => {
       connectionId: "c1",
       emit: () => {},
       env: {},
+      client: testClient(),
     } as unknown as DispatchCtx;
     const sync = async (ownerNodeId: number, sourceURL: string) => {
       replies.enumerateStyleSheets = {

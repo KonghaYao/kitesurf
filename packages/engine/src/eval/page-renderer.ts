@@ -23,6 +23,7 @@ import type {
   RendererMemoryStats,
 } from "@kitesurf/jsrpc-types/page-renderer";
 import type { DynamicWorkerBudget, WorkerLease } from "./worker-budget.ts";
+import type { SessionContext } from "../cdp/dispatch.ts";
 
 export type { RenderStage };
 
@@ -36,7 +37,7 @@ const PDF_CALL_TIMEOUT_MS = 30_000;
 const PORT_MINT_TIMEOUT_MS = 5_000;
 const MAX_RENDER_RASTER_ATTEMPTS = 2;
 
-type CtxWithExports = ExecutionContext & {
+type CtxWithExports = SessionContext & {
   exports: AttributionTailExports & {
     DeniedOutbound(opts: Record<string, never>): Fetcher;
     PageScriptTail(opts: {
@@ -77,7 +78,7 @@ export function withTimeout<T>(promise: Promise<T>, ms: number, label: string): 
 
 function loadRenderer(
   env: RendererEnv,
-  ctx: ExecutionContext,
+  ctx: SessionContext,
   connectionId: string,
   attributionHeaders: Record<string, string>,
   initialRes: { width: number; height: number } | null,
@@ -156,9 +157,16 @@ export interface RenderPdfResult {
   info?: string;
 }
 
+// An encoded-limit breach is deterministic: retrying the same frame cannot shrink it. Every other
+// raster failure may be a wedged renderer, which the caller retries against a fresh one.
+function isTerminalRenderFailure(result: RenderFrameResult): boolean {
+  if (result.ok || result.stage !== "raster") return true;
+  return result.error?.startsWith("encoded-limit:") === true;
+}
+
 export class PageRendererManager {
   private env: RendererEnv;
-  private ctx: ExecutionContext;
+  private ctx: SessionContext;
   private connectionId: string;
   private attributionHeaders: Record<string, string>;
   private stub: RendererStub | null = null;
@@ -188,7 +196,7 @@ export class PageRendererManager {
 
   constructor(
     env: RendererEnv,
-    ctx: ExecutionContext,
+    ctx: SessionContext,
     connectionId: string,
     attributionHeaders: Record<string, string> = {},
     budget: DynamicWorkerBudget | null = null,
@@ -307,7 +315,7 @@ export class PageRendererManager {
         for (let attempt = 0; attempt < MAX_RENDER_RASTER_ATTEMPTS; attempt++) {
           try {
             const result = await this.renderFrameOnce(source, opts);
-            if (result.ok || result.stage !== "raster") return result;
+            if (isTerminalRenderFailure(result)) return result;
             throw new Error(result.error ?? "renderFrame raster failure");
           } catch (error) {
             lastError = error instanceof Error ? error.message : String(error);
@@ -360,6 +368,8 @@ export class PageRendererManager {
           omitBackground: opts.omitBackground,
           ...(typeof opts.sinceSeq === "number" ? { sinceSeq: opts.sinceSeq } : {}),
           ...(opts.clip ? { clip: opts.clip } : {}),
+          ...(opts.clip && opts.documentCrop === true ? { documentCrop: true } : {}),
+          ...(opts.encodedLimit !== undefined ? { encodedLimit: opts.encodedLimit } : {}),
           ...(typeof opts.partialKey === "string" && opts.partialKey
             ? { partialKey: opts.partialKey }
             : {}),

@@ -9,13 +9,19 @@ import { installUpstreamEventHandler } from "../src/cdp/page.ts";
 import type { DispatchCtx } from "../src/cdp/dispatch.ts";
 import type { DedicatedWorkers, WorkerOwner } from "../src/cdp/dedicated-workers.ts";
 import type { CdpEvent, TargetState } from "../src/cdp/types.ts";
+import { testClient } from "./client-state.ts";
 import { NetworkEventTracker } from "../src/cdp/network-events.ts";
 import { learnedScriptsFor, type LearnedScripts } from "../src/eval/learned-scripts.ts";
 import type { PageScriptStub, UpstreamEventHandler } from "../src/eval/page-script.ts";
+import { LocalStorage } from "../src/state/local-storage.ts";
+import { MemorySessionStore } from "../src/state/session-store.ts";
 
 const BIG = 64 * 1024;
 
-function installFor(isolateUrl: string) {
+function installFor(
+  isolateUrl: string,
+  sharedLocalStorage?: Parameters<typeof installUpstreamEventHandler>[5],
+) {
   let handler: UpstreamEventHandler | null = null;
   const stub = {
     setUpstreamEventHandler(h: UpstreamEventHandler | null) {
@@ -38,6 +44,7 @@ function installFor(isolateUrl: string) {
     emit: (e: CdpEvent) => {
       emitted.push(e);
     },
+    client: testClient(),
   } as DispatchCtx;
   const target = {
     type: "page",
@@ -55,7 +62,7 @@ function installFor(isolateUrl: string) {
     nextNavigationHistoryId: 2,
     frames: new Map(),
   } as TargetState;
-  installUpstreamEventHandler(ctx, target, stub, 1, isolateUrl);
+  installUpstreamEventHandler(ctx, target, stub, 1, isolateUrl, sharedLocalStorage);
   const send = (event: UpstreamEventName, params: ReceivedUpstreamParams) =>
     handler!(event, params);
   return { store, emitted, target, send, ctx, stub };
@@ -68,6 +75,26 @@ describe("kitesurf.insertedScriptRan", () => {
     send("kitesurf.insertedScriptRan", { url: "https://cdn.test/a.js", bytes: BIG, run: "boa" });
     expect(learnedScriptsFor(store, "https://second.test/")).toEqual([]);
     expect(learnedScriptsFor(store, "https://first.test/")).toEqual(["https://cdn.test/a.js"]);
+  });
+});
+
+describe("kitesurf.localStorage", () => {
+  const A = "https://a.test";
+
+  it("applies an old document's writes after a navigation bumped the generation", () => {
+    const storage = new LocalStorage(new MemorySessionStore());
+    const { send, target } = installFor(`${A}/x`, { storage, origin: A });
+    target.navigateGeneration = 2;
+    send("kitesurf.localStorage", { ops: [{ op: "set", key: "k", value: "v" }, { op: "bad" }] });
+    expect(storage.entries(A)).toEqual([["k", "v"]]);
+  });
+
+  it("drops writes once the connection is closing", () => {
+    const storage = new LocalStorage(new MemorySessionStore());
+    const { send, ctx } = installFor(`${A}/x`, { storage, origin: A });
+    ctx.browser.wsClosing = true;
+    send("kitesurf.localStorage", { ops: [{ op: "set", key: "k", value: "v" }] });
+    expect(storage.entries(A)).toEqual([]);
   });
 });
 
