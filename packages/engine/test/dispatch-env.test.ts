@@ -15,6 +15,7 @@ const STRING_ENV_KEYS = [
   "KITESURF_LAG_WATCHDOG",
   "KITESURF_ALLOW_PRIVATE_NETWORK",
   "KITESURF_SYSTEM_FONTS",
+  "KITESURF_VERSION",
 ] as const;
 
 type DispatchEnv = DispatchCtx["env"];
