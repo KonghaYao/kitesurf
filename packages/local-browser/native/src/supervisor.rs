@@ -176,7 +176,6 @@ impl OutputCounts {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EngineDiagnostic {
-    Uncaught,
     InternalError,
     OutputReadFailed,
 }
@@ -184,7 +183,6 @@ pub enum EngineDiagnostic {
 impl EngineDiagnostic {
     pub fn category(self) -> &'static str {
         match self {
-            Self::Uncaught => "uncaught",
             Self::InternalError => "internal-error",
             Self::OutputReadFailed => "output-read-failed",
         }
@@ -193,7 +191,6 @@ impl EngineDiagnostic {
 
 struct Diagnostics {
     fatal: watch::Sender<Option<EngineDiagnostic>>,
-    uncaught: AtomicU64,
     internal: AtomicU64,
     read_failed: AtomicU64,
 }
@@ -201,7 +198,6 @@ struct Diagnostics {
 impl Diagnostics {
     fn record(&self, diagnostic: EngineDiagnostic, observer: &Observer) {
         let counter = match diagnostic {
-            EngineDiagnostic::Uncaught => &self.uncaught,
             EngineDiagnostic::InternalError => &self.internal,
             EngineDiagnostic::OutputReadFailed => &self.read_failed,
         };
@@ -388,7 +384,6 @@ impl RunningEngine {
             json!({ "code": status.code, "signal": status.signal, "reaped": self.reaped,
                 "stdoutLines": stdout, "stderrLines": stderr,
                 "fatal": self.check_diagnostics().is_err(),
-                "uncaught": self.diagnostics.uncaught.load(Ordering::Relaxed),
                 "internalErrors": self.diagnostics.internal.load(Ordering::Relaxed),
                 "outputReadFailures": self.diagnostics.read_failed.load(Ordering::Relaxed) }),
         );
@@ -466,7 +461,6 @@ pub async fn spawn(spec: EngineSpec) -> HostResult<RunningEngine> {
     let (fatal, _) = watch::channel(None);
     let diagnostics = Arc::new(Diagnostics {
         fatal,
-        uncaught: AtomicU64::new(0),
         internal: AtomicU64::new(0),
         read_failed: AtomicU64::new(0),
     });
@@ -555,11 +549,15 @@ fn spawn_control_reader(file: File, sender: mpsc::UnboundedSender<ControlMessage
     });
 }
 
+// A workerd internal error line starts with a workerd/ source location and names the JSG
+// context. Page and engine logs may contain arbitrary "uncaught" text, so only this line is
+// fatal; a request-level failure must not end the browser session.
+const INTERNAL_ERROR_LINE_PREFIX: &[u8] = b"workerd/";
+const INTERNAL_ERROR_MARK: &[u8] = b"sentryErrorContext = jsgInternalError";
+
 struct OutputScanner {
     line: Vec<u8>,
-    tail: Vec<u8>,
     oversized: bool,
-    fatal: u8,
     seen: bool,
 }
 
@@ -567,44 +565,13 @@ impl OutputScanner {
     fn new() -> Self {
         Self {
             line: Vec::new(),
-            tail: Vec::new(),
             oversized: false,
-            fatal: 0,
             seen: false,
         }
     }
 
-    fn byte(&mut self, byte: u8, diagnostics: &Diagnostics, observer: &Observer) {
+    fn byte(&mut self, byte: u8) {
         self.seen = true;
-        // ASCII 空白显式含 VT；Rust 的 is_ascii_whitespace 不含它。
-        let normalized = if matches!(
-            byte,
-            b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r' | b'-' | b'_'
-        ) {
-            b' '
-        } else {
-            byte.to_ascii_lowercase()
-        };
-        if normalized != b' ' || self.tail.last() != Some(&b' ') {
-            self.tail.push(normalized);
-        }
-        if self.tail.len() > 64 {
-            self.tail.remove(0);
-        }
-        self.detect(
-            b"uncaught",
-            1,
-            EngineDiagnostic::Uncaught,
-            diagnostics,
-            observer,
-        );
-        self.detect(
-            b"internal error",
-            2,
-            EngineDiagnostic::InternalError,
-            diagnostics,
-            observer,
-        );
         if !self.oversized {
             if self.line.len() == 8192 {
                 self.line.clear();
@@ -615,32 +582,34 @@ impl OutputScanner {
         }
     }
 
-    fn detect(
+    fn is_internal_error(&self) -> bool {
+        self.line.starts_with(INTERNAL_ERROR_LINE_PREFIX)
+            && self
+                .line
+                .windows(INTERNAL_ERROR_MARK.len())
+                .any(|window| window == INTERNAL_ERROR_MARK)
+    }
+
+    fn finish(
         &mut self,
-        pattern: &[u8],
-        bit: u8,
-        kind: EngineDiagnostic,
+        stream: &'static str,
+        counts: &OutputCounts,
         diagnostics: &Diagnostics,
         observer: &Observer,
     ) {
-        if self.fatal & bit == 0 && self.tail.ends_with(pattern) {
-            self.fatal |= bit;
-            diagnostics.record(kind, observer);
-        }
-    }
-
-    fn finish(&mut self, stream: &'static str, counts: &OutputCounts, observer: &Observer) {
         if !self.seen {
             return;
         }
         counts.bump(stream);
-        if self.fatal == 0 && !self.oversized {
-            safe_output(&String::from_utf8_lossy(&self.line), observer);
+        if !self.oversized {
+            if self.is_internal_error() {
+                diagnostics.record(EngineDiagnostic::InternalError, observer);
+            } else {
+                safe_output(&String::from_utf8_lossy(&self.line), observer);
+            }
         }
         self.line.clear();
-        self.tail.clear();
         self.oversized = false;
-        self.fatal = 0;
         self.seen = false;
     }
 }
@@ -686,13 +655,13 @@ fn spawn_line_reader<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
             };
             for byte in &chunk[..length] {
                 if *byte == b'\n' {
-                    scanner.finish(stream, &counts, &observer);
+                    scanner.finish(stream, &counts, &diagnostics, &observer);
                 } else {
-                    scanner.byte(*byte, &diagnostics, &observer);
+                    scanner.byte(*byte);
                 }
             }
         }
-        scanner.finish(stream, &counts, &observer);
+        scanner.finish(stream, &counts, &diagnostics, &observer);
     })
 }
 
@@ -706,87 +675,77 @@ fn kill(pid: u32, signal: i32) {
 mod output_tests {
     use super::*;
 
-    #[test]
-    fn bounded_scanner_finds_split_fatals_after_long_payload_before_markers() {
+    fn test_diagnostics() -> Diagnostics {
         let (fatal, _) = watch::channel(None);
-        let diagnostics = Diagnostics {
+        Diagnostics {
             fatal,
-            uncaught: AtomicU64::new(0),
             internal: AtomicU64::new(0),
             read_failed: AtomicU64::new(0),
-        };
-        let observer = Observer::disabled();
-        let mut scanner = OutputScanner::new();
-        for byte in std::iter::repeat_n(b'x', 100_000).chain(
-            b" UnCaUgHt [ks-gc] INTERNAL\t ERROR [kitesurf-fonts]"
-                .iter()
-                .copied(),
-        ) {
-            scanner.byte(byte, &diagnostics, &observer);
-            assert!(scanner.line.len() <= 8192);
-            assert!(scanner.tail.len() <= 64);
         }
-        assert_eq!(diagnostics.uncaught.load(Ordering::Relaxed), 1);
-        assert_eq!(diagnostics.internal.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            *diagnostics.fatal.borrow(),
-            Some(EngineDiagnostic::Uncaught)
-        );
+    }
+
+    fn feed(scanner: &mut OutputScanner, diagnostics: &Diagnostics, text: &[u8]) {
+        let counts = OutputCounts::default();
+        let observer = Observer::disabled();
+        for chunk in text.chunks(7) {
+            for byte in chunk {
+                scanner.byte(*byte);
+                assert!(scanner.line.len() <= 8192);
+            }
+        }
+        scanner.finish("stderr", &counts, diagnostics, &observer);
     }
 
     #[test]
-    fn ascii_whitespace_separated_internal_error_is_fatal_at_eof() {
-        let observer = Observer::disabled();
-        // 最终排空无换行：原反例的 VT 分隔必须命中同一固定类别。
-        let (fatal, _) = watch::channel(None);
-        let diagnostics = Diagnostics {
-            fatal,
-            uncaught: AtomicU64::new(0),
-            internal: AtomicU64::new(0),
-            read_failed: AtomicU64::new(0),
-        };
+    fn only_a_workerd_internal_error_line_is_fatal() {
+        let diagnostics = test_diagnostics();
         let mut scanner = OutputScanner::new();
-        for chunk in b"workerd INTERNAL\x0bERROR".chunks(7) {
-            for byte in chunk {
-                scanner.byte(*byte, &diagnostics, &observer);
-            }
-        }
+        feed(
+            &mut scanner,
+            &diagnostics,
+            b"uncaught page console test internal error",
+        );
+        feed(
+            &mut scanner,
+            &diagnostics,
+            b"sentryErrorContext = jsgInternalError",
+        );
+        assert_eq!(diagnostics.internal.load(Ordering::Relaxed), 0);
+        assert_eq!(*diagnostics.fatal.borrow(), None);
+
+        feed(
+            &mut scanner,
+            &diagnostics,
+            b"workerd/jsg/util.c++:391: error: e = x; sentryErrorContext = jsgInternalError; wdErrId = id",
+        );
         assert_eq!(diagnostics.internal.load(Ordering::Relaxed), 1);
         assert_eq!(
             *diagnostics.fatal.borrow(),
             Some(EngineDiagnostic::InternalError)
         );
+    }
 
-        // 单行 SP/TAB/VT/FF/CR 与连字符/下划线；LF 由生产 reader 划分日志行。
-        for separator in *b" \t\x0b\x0c\r-_" {
-            let (fatal, _) = watch::channel(None);
-            let diagnostics = Diagnostics {
-                fatal,
-                uncaught: AtomicU64::new(0),
-                internal: AtomicU64::new(0),
-                read_failed: AtomicU64::new(0),
-            };
-            let mut scanner = OutputScanner::new();
-            let mut bytes = vec![b'x'; 9_000];
-            bytes.extend_from_slice(b"WoRkErD InTeRnAl");
-            bytes.push(separator);
-            bytes.extend_from_slice(b"ErRoR");
-            for chunk in bytes.chunks(7) {
-                for byte in chunk {
-                    scanner.byte(*byte, &diagnostics, &observer);
-                }
-            }
-            assert_eq!(
-                diagnostics.internal.load(Ordering::Relaxed),
-                1,
-                "separator {separator:#04x}"
-            );
-            assert_eq!(
-                *diagnostics.fatal.borrow(),
-                Some(EngineDiagnostic::InternalError),
-                "separator {separator:#04x}"
-            );
-        }
+    #[test]
+    fn long_payload_stays_bounded_and_the_next_error_line_is_fatal() {
+        let diagnostics = test_diagnostics();
+        let mut scanner = OutputScanner::new();
+        feed(&mut scanner, &diagnostics, &[b'x'; 100_000]);
+        feed(
+            &mut scanner,
+            &diagnostics,
+            b"uncaught [ks-gc] internal\t error",
+        );
+        assert_eq!(diagnostics.internal.load(Ordering::Relaxed), 0);
+        feed(
+            &mut scanner,
+            &diagnostics,
+            b"workerd/jsg/util.c++:391: error: e = x; sentryErrorContext = jsgInternalError",
+        );
+        assert_eq!(diagnostics.internal.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *diagnostics.fatal.borrow(),
+            Some(EngineDiagnostic::InternalError)
+        );
     }
 
     #[test]

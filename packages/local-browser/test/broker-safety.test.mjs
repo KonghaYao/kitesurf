@@ -100,13 +100,18 @@ function inject() {
     process.stdout.write('[ks-gc] ' + JSON.stringify({at:1,done:2,extra:{payload}}) + '\\n');
     return;
   }
-  const error = phase === 'close' ? 'Uncaught Error: Network connection lost.' : 'UnCaUgHt Error';
-  process.stderr.write('[ks-gc] {"at":1,"done":2,"extra":"' + payload + '"} ' + error + ' ' + payload + '\\n');
-  process.stdout.write('workerd INTERNAL   ERROR ' + payload + '\\n');
+  if (phase === 'benign') {
+    process.stderr.write('Uncaught Error: Network connection lost. internal error ' + payload + '\\n');
+    process.stdout.write('uncaught page console test internal error ' + payload + '\\n');
+    return;
+  }
+  const marker = 'workerd/jsg/util.c++:391: error: e = x; sentryErrorContext = jsgInternalError; wdErrId = synthetic';
+  process.stderr.write('[ks-gc] {"at":1,"done":2,"extra":"' + payload + '"} ' + marker + ' ' + payload + '\\n');
+  process.stdout.write(marker + ' ' + payload + '\\n');
 }
 function drain() {
   const target = phase.endsWith('-stdout') ? process.stdout : process.stderr;
-  const bytes = Buffer.from('workerd INTERNAL\\x0bERROR ' + payload + ' ' + 'x'.repeat(16384));
+  const bytes = Buffer.from('workerd/jsg/util.c++:1: error: e = x; sentryErrorContext = jsgInternalError ' + payload + ' ' + 'x'.repeat(4000));
   for (let offset = 0; offset < bytes.length; offset += 7) target.write(bytes.subarray(offset, offset + 7));
 }
 const child = spawn(${JSON.stringify(workerd)}, process.argv.slice(2), {stdio:['ignore','pipe','pipe',3]});
@@ -116,7 +121,7 @@ child.stderr.pipe(process.stderr);
 if (phase === 'before') setTimeout(inject, 20);
 const timer = setInterval(() => {
   if (existsSync(${JSON.stringify(trigger)})) inject();
-  if (phase === 'close') {
+  if (phase === 'close' || phase === 'benign') {
     try { if (readFileSync(${JSON.stringify(observe)}, 'utf8').includes('"kind":"close-succeeded"')) inject(); } catch {}
   }
 }, 2);
@@ -150,7 +155,7 @@ async function wrapped(t, phase) {
     ...options,
     workerd: files.path,
     observe: files.observe,
-    expectedFailure: phase !== "gc",
+    expectedFailure: phase !== "gc" && phase !== "benign",
   });
   if (phase !== "before") assert.ok(host.port, host.stderr);
   t.after(() => host.stop());
@@ -196,7 +201,6 @@ for (const phase of ["before", "after", "close", "shutdown", "exit"]) {
       const exit = events.findLast((event) => event.kind === "engine-exit");
       assert.equal(exit?.reaped, true);
       assert.equal(exit?.fatal, true);
-      if (phase === "close") assert.equal(exit.uncaught, 1);
       const runDir = events.find((event) => event.kind === "run-dir")?.path;
       assert.ok(runDir && !existsSync(runDir));
       completed(host, 1, true);
@@ -210,6 +214,60 @@ for (const phase of ["before", "after", "close", "shutdown", "exit"]) {
     },
   );
 }
+
+test(
+  "page output naming uncaught or internal error is not fatal",
+  { timeout: 60_000 },
+  async (t) => {
+    const { host, childReaped, childPid } = await wrapped(t, "benign");
+    const closed = await withTimeout(host.request("/close", { method: "POST" }), 15_000);
+    assert.equal(closed.timeout, undefined);
+    assert.equal(closed.status, 200);
+    const status = await withTimeout(host.exit, 20_000);
+    assert.equal(status.timeout, undefined);
+    assert.equal(status.code, 0);
+    assert.ok(existsSync(childReaped), "wrapper must reap the real workerd before exiting");
+    assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" });
+    const events = host.events();
+    assert.equal(
+      events.some((event) => event.kind === "engine-diagnostic"),
+      false,
+    );
+    const exit = events.findLast((event) => event.kind === "engine-exit");
+    assert.equal(exit?.fatal, false);
+    completed(host, 0, false);
+  },
+);
+
+test("page console output does not stop the engine", { timeout: 60_000 }, async (t) => {
+  const host = await startNativeHost(options);
+  t.after(() => host.stop());
+  const cdp = await client(host);
+  t.after(() => cdp.ws.terminate());
+  const created = await cdp.call("Target.createTarget", { url: "about:blank" });
+  const attached = await cdp.call("Target.attachToTarget", {
+    targetId: created.result.targetId,
+    flatten: true,
+  });
+  const evaluated = await cdp.call(
+    "Runtime.evaluate",
+    {
+      expression: "console.error('uncaught page console test internal error'); 42",
+      returnByValue: true,
+    },
+    attached.result.sessionId,
+  );
+  assert.equal(evaluated.result.result.value, 42);
+  assert.equal((await host.request("/health")).body.alive, true);
+  assert.equal(
+    host.events().some((event) => event.kind === "engine-diagnostic"),
+    false,
+  );
+  assert.deepEqual((await cdp.call("Browser.close")).result, {});
+  const status = await withTimeout(host.exit, 20_000);
+  assert.equal(status.code, 0);
+  completed(host, 0, false);
+});
 
 for (const stream of ["stdout", "stderr"]) {
   test(

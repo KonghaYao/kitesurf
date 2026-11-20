@@ -623,7 +623,6 @@ function engineTests() {
       assert.ok(engineExit, "the engine exit event was not recorded");
       assert.equal(engineExit.reaped, true);
       assert.equal(engineExit.fatal, false);
-      assert.equal(engineExit.uncaught, 0);
       assert.equal(engineExit.internalErrors, 0);
       const shutdown = events.find((event) => event.kind === "shutdown");
       assert.ok(shutdown, "the host shutdown event was not recorded");
