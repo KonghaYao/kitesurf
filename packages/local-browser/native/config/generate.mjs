@@ -19,7 +19,7 @@ import { join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const MODULE_NAME = /^[A-Za-z0-9._/-]+$/;
-const VERSION = "0.5.0";
+const VERSION = "0.5.2";
 const GC_WRAPPER = "__ks_gc_wrapper.js";
 const IGNORED = new Set(["engine-mf.json"]);
 const GC_WRAPPER_SOURCE = `import worker from "./index.js";

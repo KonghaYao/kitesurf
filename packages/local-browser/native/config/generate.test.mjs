@@ -170,7 +170,7 @@ test("generate writes modules, manifests and three configs, replacing stale outp
     "engine-mf.json": JSON.stringify({
       compatibilityDate: "2026-09-11",
       compatibilityFlags: ["nodejs_compat"],
-      bindings: { KITESURF_ENV: "local", KITESURF_VERSION: "0.5.0" },
+      bindings: { KITESURF_ENV: "local", KITESURF_VERSION: "0.5.2" },
       workerLoaders: { LOADER: {} },
       assets: { binding: "FONT_ASSETS" },
     }),
@@ -182,7 +182,7 @@ test("generate writes modules, manifests and three configs, replacing stale outp
   mkdirSync(out, { recursive: true });
   writeFileSync(join(out, "stale.txt"), "stale");
   const result = generate({ dist, assets, out });
-  assert.deepEqual(result, { modules: 2, assets: 2, version: "0.5.0" });
+  assert.deepEqual(result, { modules: 2, assets: 2, version: "0.5.2" });
   assert.ok(!existsSync(join(out, "stale.txt")));
   const manifest = JSON.parse(readFileSync(join(out, "modules.json"), "utf8"));
   assert.equal(manifest.entry, "index.js");
@@ -220,7 +220,7 @@ test("generate writes modules, manifests and three configs, replacing stale outp
     assert.match(config, /\(name = "LOCAL_FONTS", service = "fonts"\)/, name);
     assert.match(config, /\(name = "fonts", external = \(http = \(\)\)\)/, name);
   }
-  assert.equal(generate({ dist, assets, out, releaseVersion: "0.5.1" }).version, "0.5.1");
+  assert.equal(generate({ dist, assets, out, releaseVersion: "0.5.2" }).version, "0.5.2");
   for (const name of [
     "modules.json",
     "modules-gc.capnp",
@@ -230,7 +230,7 @@ test("generate writes modules, manifests and three configs, replacing stale outp
     assert.ok(!existsSync(join(out, name)), `${name} is excluded from release`);
   }
   for (const name of ["local-public.capnp", "local-private.capnp"]) {
-    assert.match(readFileSync(join(out, name), "utf8"), /KITESURF_VERSION", text = "0\.5\.1"/);
+    assert.match(readFileSync(join(out, name), "utf8"), /KITESURF_VERSION", text = "0\.5\.2"/);
   }
 });
 

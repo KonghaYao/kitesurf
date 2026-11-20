@@ -25,6 +25,7 @@ import {
 } from "./host-adapter.mjs";
 
 const kind = process.env.KS_HOST_KIND || "native";
+const hostVersion = kind === "legacy" ? "0.5.0" : "0.5.2";
 const legacyOnly = { skip: kind !== "legacy" && "035a014 Node host baseline only" };
 const nativeOnly = { skip: kind !== "native" && "native T2 test-profile probe only" };
 let host;
@@ -106,13 +107,13 @@ test("health reports the version and a live engine", async () => {
   const { status, body } = await host.request("/health");
   assert.equal(status, 200);
   assert.equal(body.alive, true);
-  assert.equal(body.version, "0.5.0");
+  assert.equal(body.version, hostVersion);
 });
 
 test("json/version points at the browser endpoint", async () => {
   const { status, body } = await host.request("/json/version");
   assert.equal(status, 200);
-  assert.match(body.Browser, /^Kitesurf\/0\.5\.0$/);
+  assert.equal(body.Browser, `Kitesurf/${hostVersion}`);
   assert.equal(body["Protocol-Version"], "1.3");
   assert.equal(body.webSocketDebuggerUrl, `ws://127.0.0.1:${host.port}/devtools/browser`);
 });
@@ -148,7 +149,7 @@ test("the ready line uses the shared startup fields", () => {
 test("session exposes the shared discovery fields", async () => {
   const { status, body } = await host.request("/session");
   assert.equal(status, 200);
-  assert.equal(body.version, "0.5.0");
+  assert.equal(body.version, hostVersion);
   assert.equal(body.generation, host.generation);
   assert.equal(body.alive, true);
   assert.equal(typeof body.sessionId, "string");
@@ -333,7 +334,7 @@ test("the CDP bootstrap creates, attaches and evaluates", async () => {
   assert.equal(info.sessionId, session.body.sessionId);
   assert.equal(info.connectionMode, "browser");
   assert.equal(info.environment, "local");
-  assert.equal(info.buildVersion, "0.5.0");
+  assert.equal(info.buildVersion, hostVersion);
 });
 
 test("the Host header gate rejects a foreign origin", async () => {

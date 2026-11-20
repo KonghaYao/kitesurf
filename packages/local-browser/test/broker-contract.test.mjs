@@ -18,6 +18,7 @@ import { startBrowser } from "../src/server.mjs";
 import { required, startNativeHost, waitFor } from "./host-adapter.mjs";
 
 const kind = process.env.KITESURF_BROKER_KIND || "native";
+const expectedVersion = kind === "node" ? "0.5.0" : "0.5.2";
 const engine = resolve(import.meta.dirname, "../../engine");
 const dist = process.env.KITESURF_TEST_DIST || join(engine, "local_dist");
 const assets = process.env.KITESURF_TEST_ASSETS || join(engine, "public");
@@ -178,10 +179,10 @@ test("broker public contract", { timeout: 300_000 }, async (t) => {
   await t.test("health, session and discovery endpoints", async () => {
     const health = await request(host.port, "/health");
     assert.equal(health.status, 200);
-    assert.deepEqual(health.body, { alive: true, version: "0.5.0" });
+    assert.deepEqual(health.body, { alive: true, version: expectedVersion });
     const session = await request(host.port, "/session");
     assert.equal(session.status, 200);
-    assert.equal(session.body.version, "0.5.0");
+    assert.equal(session.body.version, expectedVersion);
     assert.ok(typeof session.body.sessionId === "string" && session.body.sessionId.length > 0);
     assert.ok(typeof session.body.generation === "string" && session.body.generation.length > 0);
     assert.equal(session.body.alive, true);
@@ -193,7 +194,7 @@ test("broker public contract", { timeout: 300_000 }, async (t) => {
     for (const route of ["/json/version", "/json/version/"]) {
       const version = await request(host.port, route);
       assert.equal(version.status, 200);
-      assert.equal(version.body.Browser, "Kitesurf/0.5.0");
+      assert.equal(version.body.Browser, `Kitesurf/${expectedVersion}`);
       assert.equal(version.body["Protocol-Version"], "1.3");
       assert.equal(
         version.body.webSocketDebuggerUrl,
