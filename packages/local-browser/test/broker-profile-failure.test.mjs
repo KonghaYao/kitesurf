@@ -9,13 +9,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { once } from "node:events";
-import {
-  mkdtempSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -47,7 +41,7 @@ function fixture(t) {
     response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     response.end(
       "<!doctype html><html><head><title>ks-profile-failure</title></head><body>" +
-        '<script>window.boot=true;</script></body></html>',
+        "<script>window.boot=true;</script></body></html>",
     );
   });
   server.listen(0, "127.0.0.1");
@@ -216,7 +210,11 @@ test("profile failure", { timeout: 300_000 }, async (t) => {
     "pause-save must hold the rejected save too",
   );
   setFaults(faults, ["reject-save"]);
-  const rejected = await waitForSave(observer, (event) => event.status === 422, "the rejected save");
+  const rejected = await waitForSave(
+    observer,
+    (event) => event.status === 422,
+    "the rejected save",
+  );
   const rejectedRevision = rejected.revision;
   assert.equal(rejectedRevision, failedRevision + 2);
 

@@ -52,7 +52,7 @@ cargo_toml_env_vars(
 
 rust_library(
     name = "kitesurf_local_host",
-    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
+    srcs = glob(["src/**/*.rs"], exclude = ["src/bundle.rs", "src/main.rs"]),
     crate_name = "kitesurf_local_host",
     crate_root = "src/lib.rs",
     edition = "2021",
@@ -71,10 +71,49 @@ rust_binary(
     visibility = ["//visibility:public"],
 )
 
+# The embedded crate needs generated inputs. Give its staged sources distinct paths so they
+# can coexist with the source checks' copies in the binary output tree.
+copy_file(
+    name = "embedded_main",
+    src = "src/main.rs",
+    out = "embedded/main.rs",
+)
+
+copy_file(
+    name = "embedded_bundle",
+    src = "src/bundle.rs",
+    out = "embedded/bundle.rs",
+)
+
+rust_binary(
+    name = "kitesurf",
+    srcs = [":embedded_bundle", ":embedded_main"],
+    compile_data = [":runtime_bundle"],
+    crate_features = ["embedded-runtime"],
+    crate_root = ":embedded_main",
+    edition = "2021",
+    rustc_env = {"KITESURF_RUNTIME_BUNDLE": "$(execpath :runtime_bundle)"},
+    rustc_env_files = [":cargo_env"],
+    # Keep LLVM optimization off the launcher with the embedded runtime's large static payload.
+    rustc_flags = ["-Copt-level=0"],
+    deps = [":kitesurf_local_host"] + all_crate_deps(package_name = "", normal = True),
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "bundle_test",
+    size = "small",
+    srcs = ["src/bundle.rs", "src/main.rs"],
+    crate_root = "src/main.rs",
+    edition = "2021",
+    rustc_env_files = [":cargo_env"],
+    deps = [":kitesurf_local_host"] + all_crate_deps(package_name = "", normal = True),
+)
+
 # 与发行二进制相同的源码，只多启用 test-faults；测试注入不进入发行产物。
 rust_library(
     name = "kitesurf_local_host_faults",
-    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]) + [
+    srcs = glob(["src/**/*.rs"], exclude = ["src/bundle.rs", "src/main.rs"]) + [
         "tests/actor_pressure.rs",
         "tests/broker_test.rs",
     ],
@@ -123,7 +162,8 @@ rust_test(
     edition = "2021",
     rustc_env_files = [":cargo_env"],
     deps = [":kitesurf_local_host"] + all_crate_deps(
-        package_name = "",        normal = True,
+        package_name = "",
+        normal = True,
         normal_dev = True,
     ),
 )
@@ -137,7 +177,8 @@ rust_test(
     edition = "2021",
     rustc_env_files = [":cargo_env"],
     deps = all_crate_deps(
-        package_name = "",        normal = True,
+        package_name = "",
+        normal = True,
         normal_dev = True,
     ),
 )
@@ -163,7 +204,8 @@ rust_test(
     edition = "2021",
     rustc_env_files = [":cargo_env"],
     deps = all_crate_deps(
-        package_name = "",        normal = True,
+        package_name = "",
+        normal = True,
         normal_dev = True,
     ),
 )
@@ -177,12 +219,14 @@ rust_test(
     env = {"FAKE_ENGINE": "$(rootpath :fake_engine)"},
     rustc_env_files = [":cargo_env"],
     deps = [":kitesurf_local_host"] + all_crate_deps(
-        package_name = "",        normal = True,
+        package_name = "",
+        normal = True,
         normal_dev = True,
     ),
 )
 
 rust_lint_tests(targets = [
+    ":bundle_test",
     ":codec_budget_test",
     ":raw_envelope_test",
     ":actor_pressure_test",
@@ -297,6 +341,54 @@ js_run_binary(
     progress_message = "Generating the native workerd config",
     tool = ":config_generator",
     visibility = ["//visibility:public"],
+)
+
+copy_to_directory(
+    name = "release_assets",
+    srcs = ["//packages/engine:assets"],
+    out = "release-assets",
+    root_paths = ["packages/engine/public"],
+    exclude_srcs_patterns = ["fonts/**"],
+    visibility = ["//packages/local-browser:__pkg__"],
+)
+
+js_run_binary(
+    name = "release_config",
+    srcs = [":cargo_env", ":release_assets", "//packages/engine:local_dist"],
+    out_dirs = ["release-config"],
+    args = [
+        "--release-version-env",
+        exec_path(":cargo_env"),
+        "--assets",
+        exec_path(":release_assets"),
+        "--dist",
+        exec_path("//packages/engine:local_dist"),
+        "--out",
+        bin_relative("packages/local-browser/native/release-config"),
+    ],
+    mnemonic = "NativeConfig",
+    tool = ":config_generator",
+    visibility = ["//packages/local-browser:__pkg__"],
+)
+
+js_binary(
+    name = "runtime_bundle_builder",
+    entry_point = "scripts/build-runtime-bundle.mjs",
+)
+
+js_run_binary(
+    name = "runtime_bundle",
+    srcs = [":workerd_bin", ":release_config", ":release_assets"],
+    outs = ["native-runtime.bin"],
+    args = [
+        exec_path(":workerd_bin"),
+        exec_path(":release_config"),
+        exec_path(":release_assets"),
+        bin_relative("packages/local-browser/native/native-runtime.bin"),
+    ],
+    mnemonic = "NativeRuntimeBundle",
+    tool = ":runtime_bundle_builder",
+    visibility = ["//packages/local-browser:__pkg__"],
 )
 
 node_test(

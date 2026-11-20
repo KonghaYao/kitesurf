@@ -188,7 +188,11 @@ export async function startNativeHost({
     stderr += chunk;
   });
   const exit = once(child, "close").then(([code, signal]) => {
-    if (!expectedFailure && (readEvents(observerPath).some((event) => event.kind === "engine-diagnostic") || /uncaught|internal[\s_-]+error/i.test(stderr))) {
+    if (
+      !expectedFailure &&
+      (readEvents(observerPath).some((event) => event.kind === "engine-diagnostic") ||
+        /uncaught|internal[\s_-]+error/i.test(stderr))
+    ) {
       process.exitCode = 1;
     }
     return { code, signal };
@@ -258,7 +262,9 @@ export async function startNativeHost({
           throw new Error(`host did not exit after ${signal}; stderr: ${stderr.slice(-4000)}`);
         }
         if (!expectedFailure) {
-          const fatal = readEvents(observerPath).some((event) => event.kind === "engine-diagnostic");
+          const fatal = readEvents(observerPath).some(
+            (event) => event.kind === "engine-diagnostic",
+          );
           if (fatal || /uncaught|internal[\s_-]+error/i.test(stderr)) {
             throw new Error("unexpected engine fatal diagnostic");
           }

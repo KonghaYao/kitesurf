@@ -100,10 +100,7 @@ async function connectRaw(port, query = "", path = "/devtools/browser") {
       }, description);
     },
     reply(id, description) {
-      return client.frame(
-        (frame) => frame.id === id && frame.method === undefined,
-        description,
-      );
+      return client.frame((frame) => frame.id === id && frame.method === undefined, description);
     },
     async close() {
       if (ws.readyState === WebSocket.CLOSED) return;
@@ -228,8 +225,7 @@ test("broker engine", { timeout: 300_000 }, async (t) => {
     controller.send({ id, method: "Target.createTarget", params: { url: "about:blank" } });
     const createdEvent = await controller.frame(
       (frame) =>
-        frame.method === "Target.targetCreated" &&
-        !known.has(frame.params?.targetInfo?.targetId),
+        frame.method === "Target.targetCreated" && !known.has(frame.params?.targetInfo?.targetId),
       "targetCreated for the new tab",
     );
     const result = await controller.reply(id, "createTarget reply");
@@ -293,11 +289,10 @@ test("broker engine", { timeout: 300_000 }, async (t) => {
     await controller.close();
     const page = await connectRaw(host.port, "?owner=alice", `/devtools/page/${targetId}`);
     t.after(() => page.close());
-    const reply = await call(
-      page,
-      "Runtime.evaluate",
-      { expression: "6 * 7", returnByValue: true },
-    );
+    const reply = await call(page, "Runtime.evaluate", {
+      expression: "6 * 7",
+      returnByValue: true,
+    });
     assert.equal(reply.result.result.value, 42);
     assert.equal(reply.sessionId, undefined);
     assert.equal(
@@ -308,7 +303,10 @@ test("broker engine", { timeout: 300_000 }, async (t) => {
     const listed = (await request(host.port, "/json/list")).body;
     const entry = listed.find((target) => target.id === targetId);
     assert.ok(entry);
-    assert.equal(entry.webSocketDebuggerUrl, `ws://127.0.0.1:${host.port}/devtools/page/${targetId}`);
+    assert.equal(
+      entry.webSocketDebuggerUrl,
+      `ws://127.0.0.1:${host.port}/devtools/page/${targetId}`,
+    );
     await page.close();
   });
 
@@ -325,6 +323,8 @@ test("broker engine", { timeout: 300_000 }, async (t) => {
     const close = await expired.closed;
     assert.equal(close.code, 1008);
     assert.equal(close.reason, "Target expired");
-    assert.ok(!(await request(host.port, "/json/list")).body.some((entry) => entry.id === targetId));
+    assert.ok(
+      !(await request(host.port, "/json/list")).body.some((entry) => entry.id === targetId),
+    );
   });
 });

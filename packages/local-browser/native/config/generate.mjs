@@ -220,27 +220,22 @@ function readOptions(dist) {
   };
 }
 
-/** @param {{ dist: string, assets: string, out: string }} paths
+/** @param {{ dist: string, assets: string, out: string, releaseVersion?: string }} paths
  * @returns {{ modules: number, assets: number, version: string }}
  */
-export function generate({ dist, assets, out }) {
+export function generate({ dist, assets, out, releaseVersion }) {
   const distRoot = resolve(dist);
   const assetsRoot = resolve(assets);
   const outRoot = resolve(out);
   const options = readOptions(distRoot);
+  if (releaseVersion) options.vars.KITESURF_VERSION = releaseVersion;
   const modules = collectModules(distRoot);
   const assetFiles = collectAssets(assetsRoot);
   rmSync(outRoot, { recursive: true, force: true });
   mkdirSync(join(outRoot, "modules"), { recursive: true });
   for (const module of modules)
     copyFileSync(join(distRoot, module.name), join(outRoot, "modules", module.name));
-  writeFileSync(join(outRoot, "modules", GC_WRAPPER), GC_WRAPPER_SOURCE);
   writeFileSync(join(outRoot, "modules.capnp"), emitModules(modules, false));
-  writeFileSync(join(outRoot, "modules-gc.capnp"), emitModules(modules, true));
-  writeFileSync(
-    join(outRoot, "modules.json"),
-    JSON.stringify({ entry: "index.js", modules }, null, 2) + "\n",
-  );
   writeFileSync(
     join(outRoot, "assets-manifest.json"),
     JSON.stringify({ version: 1, files: assetFiles }, null, 2) + "\n",
@@ -253,16 +248,31 @@ export function generate({ dist, assets, out }) {
     join(outRoot, "local-private.capnp"),
     emitConfig({ ...options, modulesConst: "modules.capnp", privateNetwork: true }),
   );
-  // GC 探针驱动 loopback fixture，因此其包装变体需要显式选择私有网络。
-  writeFileSync(
-    join(outRoot, "local-gc.capnp"),
-    emitConfig({ ...options, modulesConst: "modules-gc.capnp", privateNetwork: true }),
-  );
+  if (!releaseVersion) {
+    writeFileSync(join(outRoot, "modules", GC_WRAPPER), GC_WRAPPER_SOURCE);
+    writeFileSync(join(outRoot, "modules-gc.capnp"), emitModules(modules, true));
+    writeFileSync(
+      join(outRoot, "modules.json"),
+      JSON.stringify({ entry: "index.js", modules }, null, 2) + "\n",
+    );
+    // GC 探针驱动 loopback fixture，因此其包装变体需要显式选择私有网络。
+    writeFileSync(
+      join(outRoot, "local-gc.capnp"),
+      emitConfig({ ...options, modulesConst: "modules-gc.capnp", privateNetwork: true }),
+    );
+  }
   return {
     modules: modules.length,
     assets: assetFiles.length,
-    version: VERSION,
+    version: releaseVersion ?? VERSION,
   };
+}
+
+function readReleaseVersion(path) {
+  const version = /^CARGO_PKG_VERSION=([^\r\n]+)$/m.exec(readFileSync(path, "utf8"))?.[1];
+  if (!version || !/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(version))
+    throw new Error("Cargo environment has no usable CARGO_PKG_VERSION");
+  return version;
 }
 
 function parseArgs(argv) {
@@ -277,6 +287,8 @@ function parseArgs(argv) {
     if (argument === "--dist") options.dist = value();
     else if (argument === "--assets") options.assets = value();
     else if (argument === "--out") options.out = value();
+    else if (argument === "--release-version-env")
+      options.releaseVersion = readReleaseVersion(value());
     else throw new Error(`unknown option: ${argument}`);
   }
   if (!options.dist || !options.assets || !options.out)

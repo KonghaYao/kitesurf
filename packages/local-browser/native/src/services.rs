@@ -187,6 +187,9 @@ pub trait ProfileBackend: Send + Sync {
         &self,
         budget: &crate::transport::PayloadBudget,
     ) -> Result<LeasedProfileStatus, ProfileError>;
+    fn backup(&self, _destination: &Path) -> HostResult<PathBuf> {
+        Err("Online backup requires a SQLite profile".into())
+    }
     fn kind(&self) -> &'static str;
     fn display(&self) -> String;
 }
@@ -276,6 +279,16 @@ impl ProfileService {
             }
         }
         worker.await.map_err(|_| ProfileError::conflict())?
+    }
+
+    pub async fn backup(&self, destination: crate::cdp_raw::LeasedIdentity) -> HostResult<PathBuf> {
+        let guard = self.begin();
+        let backend = self.backend.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            backend.backup(Path::new(destination.as_str()))
+        })
+        .await?
     }
 
     /// 计数归阻塞闭包所有：调用方被取消时，数据库操作结束前计数不会归零。
@@ -456,6 +469,10 @@ impl ProfileBackend for SqliteProfile {
         })
     }
 
+    fn backup(&self, destination: &Path) -> HostResult<PathBuf> {
+        self.store.backup(destination)
+    }
+
     fn kind(&self) -> &'static str {
         "sqlite"
     }
@@ -553,6 +570,10 @@ impl ProfileBackend for FaultProfile {
         budget: &crate::transport::PayloadBudget,
     ) -> Result<LeasedProfileStatus, ProfileError> {
         self.inner.leased_status(budget)
+    }
+
+    fn backup(&self, destination: &Path) -> HostResult<PathBuf> {
+        self.inner.backup(destination)
     }
 
     fn kind(&self) -> &'static str {

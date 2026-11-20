@@ -6,7 +6,7 @@
 // 只覆盖两端都必须满足的协议；Rust 内部时序由 native:broker_test 证明。
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -125,10 +125,7 @@ async function client(port, query = "", path = "/devtools/browser") {
       }, description);
     },
     reply(id, description) {
-      return channel.frame(
-        (frame) => frame.id === id && frame.method === undefined,
-        description,
-      );
+      return channel.frame((frame) => frame.id === id && frame.method === undefined, description);
     },
     async close() {
       if (ws.readyState === WebSocket.CLOSED) return;
@@ -288,10 +285,7 @@ test("broker public contract", { timeout: 300_000 }, async (t) => {
     assert.deepEqual(same.body, { controller: "alice", controlEpoch: 2 });
     controller.send({ id: 3, method: "Browser.getVersion" });
     const changed = await controller.reply(3, "fenced controller");
-    assert.equal(
-      changed.error.message,
-      "Control has changed; reconnect and observe before acting",
-    );
+    assert.equal(changed.error.message, "Control has changed; reconnect and observe before acting");
     viewer.send({ id: 3, method: "Target.getTargets" });
     const survived = await viewer.reply(3, "viewer after takeover");
     assert.ok(Array.isArray(survived.result.targetInfos));
@@ -325,14 +319,25 @@ test("broker public contract", { timeout: 300_000 }, async (t) => {
     assert.equal(close.reason, "Target expired");
     await controller.close();
     await viewer.close();
-    if (kind === "native") {
-      const backup = await request(host.port, "/backup", {
-        method: "POST",
-        body: { path: "/tmp/unused.sqlite" },
-      });
-      assert.equal(backup.status, 501);
-    }
   });
+
+  await t.test(
+    "online backup preserves the destination and keeps the session running",
+    async () => {
+      const path = join(directory, "online-backup.sqlite");
+      const options = { method: "POST", body: { path } };
+      const backup = await request(host.port, "/backup", options);
+      assert.equal(backup.status, 200);
+      assert.equal(realpathSync(backup.body.path), realpathSync(path));
+      const bytes = readFileSync(path);
+      const conflict = await request(host.port, "/backup", options);
+      assert.equal(conflict.status, 409);
+      assert.deepEqual(readFileSync(path), bytes);
+      const session = await request(host.port, "/session");
+      assert.equal(session.status, 200);
+      assert.equal(session.body.alive, true);
+    },
+  );
 
   await t.test("close flushes before success and stops the host", async () => {
     const closed = await request(host.port, "/close", { method: "POST" });

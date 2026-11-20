@@ -2,246 +2,160 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 // https://opensource.org/licenses/Apache-2.0
 
-import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   copyFileSync,
-  existsSync,
+  cpSync,
+  createReadStream,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
-  realpathSync,
   renameSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { gzipSync } from "node:zlib";
-import { inject } from "postject";
+import { join, resolve } from "node:path";
+import { parseArgs } from "node:util";
 
 const here = import.meta.dirname;
 const repository = resolve(here, "../..");
 const workspace = process.env.BUILD_WORKSPACE_DIRECTORY || repository;
-const nodeBinary = realpathSync(process.env.JS_BINARY__NODE_BINARY || process.execPath);
-const nodeLicensePath = resolve(nodeBinary, "../../LICENSE");
-const options = {};
-for (let i = 2; i < process.argv.length; i += 2) {
-  const flag = process.argv[i];
-  if (
-    !["--out", "--dist", "--assets", "--portable", "--font-host"].includes(flag) ||
-    !process.argv[i + 1]
-  )
-    throw new Error(`Unknown or incomplete argument: ${flag}`);
-  options[flag.slice(2)] = resolve(process.argv[i + 1]);
-}
-if (Number(process.versions.node.split(".")[0]) !== 24)
-  throw new Error("Build with the pinned Node 24 toolchain");
-if (!["linux", "darwin"].includes(process.platform))
-  throw new Error("v0.5 packages Linux and macOS");
-const output = options.out || resolve(workspace, "dist/local-browser");
-const dist = options.dist || resolve(repository, "packages/engine/local_dist");
-const assets = options.assets || resolve(repository, "packages/engine/public");
-function copyReleaseFile(source, destination) {
-  if (existsSync(destination) && realpathSync(destination) === realpathSync(source))
-    throw new Error(`Release output aliases its source: ${destination}`);
-  mkdirSync(dirname(destination), { recursive: true });
-  rmSync(destination, { force: true });
-  const mode = statSync(source).mode & 0o111 ? 0o755 : 0o644;
-  writeFileSync(destination, readFileSync(source), { mode });
-}
-function copyReleaseTree(source, destination, skip = null, prefix = "") {
-  mkdirSync(destination, { recursive: true });
-  for (const entry of readdirSync(source)) {
-    const relative = prefix ? `${prefix}/${entry}` : entry;
-    if (skip?.(relative)) continue;
-    const from = join(source, entry);
-    const to = join(destination, entry);
-    if (statSync(from).isDirectory()) copyReleaseTree(from, to, skip, relative);
-    else copyReleaseFile(from, to);
-  }
-}
-const fontHostCandidates = [
-  process.env.KITESURF_FONT_HOST,
-  options["font-host"],
-  join(here, "font-host-bin", "kitesurf-font-host"),
-  join(here, "font-host", "kitesurf-font-host"),
-].filter(Boolean);
-const fontHost = fontHostCandidates.find((candidate) => existsSync(candidate));
-if (!fontHost) throw new Error("System font helper is missing from the package inputs");
-const resolvedFontHost = resolve(fontHost);
-const skipBundledFonts = (relative) => relative === "fonts" || relative.startsWith("fonts/");
-if (options.portable) {
-  mkdirSync(options.portable, { recursive: true });
-  copyReleaseTree(dist, join(options.portable, "engine"));
-  copyReleaseTree(assets, join(options.portable, "public"), skipBundledFonts);
-  copyReleaseFile(resolvedFontHost, join(options.portable, "font-host"));
-  process.exit(0);
-}
-if (!existsSync(nodeLicensePath))
-  throw new Error("Node distribution LICENSE is missing; package with the pinned Bazel toolchain");
-const temporary = mkdtempSync(join(tmpdir(), "kitesurf-package-"));
-const files = [];
-const links = [];
-const packages = new Map();
-const notices = [];
-const blobs = new Map();
+const [host, workerd, config, assets, bundle, ...args] = process.argv.slice(2);
+const { values } = parseArgs({
+  args,
+  options: { out: { type: "string" }, archive: { type: "string" }, tag: { type: "string" } },
+});
+const { version } = JSON.parse(readFileSync(join(here, "package.json"), "utf8"));
+const platform = `${process.platform}-${process.arch}`;
+if (!["linux-x64", "linux-arm64", "darwin-arm64"].includes(platform))
+  throw new Error(`Unsupported local browser platform: ${platform}`);
+if (!/^\d+\.\d+\.\d+$/.test(version) || (values.tag && values.tag !== `v${version}`))
+  throw new Error(`Release tag ${values.tag ?? "(unset)"} does not match version ${version}`);
 
-function addFile(source, destination) {
-  const content = readFileSync(source);
-  const digest = createHash("sha256").update(content).digest("hex");
-  const mode = statSync(source).mode & 0o111 ? 0o700 : 0o600;
-  const prior = blobs.get(`${digest}/${mode}`);
-  if (prior) {
-    links.push({ path: destination, target: prior });
+function verifyExecutable(path) {
+  const header = Buffer.alloc(20);
+  const fd = openSync(path, "r");
+  try {
+    if (readSync(fd, header, 0, header.length, 0) !== header.length)
+      throw new Error(`Incomplete executable header: ${path}`);
+  } finally {
+    closeSync(fd);
+  }
+  const native =
+    process.platform === "linux"
+      ? header.subarray(0, 6).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46, 2, 1])) &&
+        [2, 3].includes(header.readUInt16LE(16)) &&
+        header.readUInt16LE(18) === (process.arch === "x64" ? 62 : 183)
+      : header.readUInt32LE(0) === 0xfeedfacf &&
+        header.readUInt32LE(4) === 0x0100000c &&
+        header.readUInt32LE(12) === 2;
+  if (!native) throw new Error(`Wrong executable format or architecture for ${platform}: ${path}`);
+}
+
+function executableVersion(path) {
+  return execFileSync(resolve(path), ["--version"], {
+    encoding: "utf8",
+    env: { PATH: "" },
+    timeout: 30_000,
+  }).trim();
+}
+
+async function fileInfo(path) {
+  const hash = createHash("sha256");
+  for await (const bytes of createReadStream(path)) hash.update(bytes);
+  return { bytes: statSync(path).size, sha256: hash.digest("hex") };
+}
+
+async function treeInfo(path, prefix) {
+  const files = [];
+  for (const name of readdirSync(path).sort()) {
+    const child = join(path, name);
+    const relative = `${prefix}/${name}`;
+    if (statSync(child).isDirectory()) files.push(...(await treeInfo(child, relative)));
+    else files.push({ path: relative, ...(await fileInfo(child)) });
+  }
+  return files;
+}
+
+function copyReleaseEntry(source, destination) {
+  // Runfiles links are transparent when reading each file into the staging directory.
+  if (!statSync(source).isDirectory()) {
+    copyFileSync(source, destination);
     return;
   }
-  blobs.set(`${digest}/${mode}`, destination);
-  files.push({ path: destination, mode, content: content.toString("base64") });
+  mkdirSync(destination);
+  for (const name of readdirSync(source))
+    copyReleaseEntry(join(source, name), join(destination, name));
 }
 
-function addTree(source, destination, skip = null, prefix = "") {
-  for (const item of readdirSync(source, { withFileTypes: true }).sort((a, b) =>
-    a.name.localeCompare(b.name),
-  )) {
-    if (item.name === "node_modules" || item.name.endsWith(".map")) continue;
-    const relative = prefix ? `${prefix}/${item.name}` : item.name;
-    if (skip?.(relative)) continue;
-    const from = join(source, item.name);
-    const to = `${destination}/${item.name}`;
-    if (statSync(from).isDirectory()) addTree(from, to, skip, relative);
-    else addFile(from, to);
+async function archivePackage(directory, destination) {
+  mkdirSync(destination, { recursive: true });
+  const temporary = mkdtempSync(join(destination, ".browser-archive-"));
+  const name = `kitesurf-${version}-${platform}.tar.gz`;
+  const archive = join(temporary, name);
+  try {
+    execFileSync("tar", ["-czf", archive, "-C", directory, ...readdirSync(directory).sort()], {
+      stdio: "inherit",
+      env: { ...process.env, COPYFILE_DISABLE: "1" },
+    });
+    const { sha256 } = await fileInfo(archive);
+    writeFileSync(join(temporary, `${name}.sha256`), `${sha256}  ${name}\n`);
+    for (const file of [name, `${name}.sha256`])
+      renameSync(join(temporary, file), join(destination, file));
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
   }
 }
 
-function packageRoot(name, from) {
-  const require = createRequire(join(from, "package.json"));
-  for (const modules of require.resolve.paths(name) || []) {
-    const path = join(modules, name);
-    if (existsSync(join(path, "package.json"))) return realpathSync(path);
-  }
-  throw new Error(`Missing runtime dependency: ${name} from ${from}`);
-}
-
-function addPackage(name, from) {
-  const source = packageRoot(name, from);
-  if (packages.has(source)) return packages.get(source);
-  const metadata = JSON.parse(readFileSync(join(source, "package.json"), "utf8"));
-  const matches = (list, value) =>
-    !list ||
-    (!list.includes(`!${value}`) &&
-      (!list.some((v) => !v.startsWith("!")) || list.includes(value)));
-  if (!matches(metadata.os, process.platform) || !matches(metadata.cpu, process.arch)) return null;
-  const modules = `deps/${packages.size}/node_modules`;
-  const destination = `${modules}/${name}`;
-  packages.set(source, destination);
-  notices.push({
-    name: metadata.name,
-    version: metadata.version,
-    license: metadata.license,
-    source: metadata.repository,
-    path: destination,
-  });
-  addTree(source, destination);
-  const dependencies = { ...metadata.dependencies, ...metadata.optionalDependencies };
-  for (const child of Object.keys(dependencies).sort()) {
-    let childSource;
-    try {
-      childSource = packageRoot(child, source);
-    } catch (error) {
-      if (metadata.optionalDependencies?.[child]) continue;
-      throw error;
-    }
-    const childDestination = addPackage(child, source);
-    if (childDestination && childSource)
-      links.push({ path: `${modules}/${child}`, target: childDestination });
-  }
-  return destination;
-}
-
+const staged = mkdtempSync(join(tmpdir(), "kitesurf-release-"));
 try {
-  mkdirSync(output, { recursive: true });
-  for (const name of ["LICENSE", "NOTICE"])
-    copyReleaseFile(join(repository, name), join(output, name));
-  copyReleaseTree(join(repository, "licenses"), join(output, "licenses"));
-  copyReleaseFile(join(here, "README.md"), join(output, "README.md"));
-  copyReleaseFile(nodeLicensePath, join(output, "NODE-LICENSE.txt"));
-  addTree(join(here, "src"), "src");
-  addFile(join(here, "package.json"), "package.json");
-  addTree(dist, "engine");
-  addTree(assets, "public", skipBundledFonts);
-  addFile(resolvedFontHost, "font-host");
-  const metadata = JSON.parse(readFileSync(join(here, "package.json"), "utf8"));
-  for (const name of Object.keys(metadata.dependencies)) {
-    links.push({ path: `node_modules/${name}`, target: addPackage(name, here) });
-  }
-  const manifest = join(temporary, "runtime.gz");
-  writeFileSync(manifest, gzipSync(Buffer.from(JSON.stringify({ files, links })), { level: 9 }));
-  const cli = join(temporary, "cli.gz");
-  const cliPaths = new Set(["src/cli.mjs", "src/profile-store.mjs", "package.json"]);
-  writeFileSync(
-    cli,
-    gzipSync(
-      Buffer.from(
-        JSON.stringify({ files: files.filter((file) => cliPaths.has(file.path)), links: [] }),
-      ),
-    ),
-  );
-  files.length = 0;
-  links.length = 0;
-  blobs.clear();
-  globalThis.gc?.();
-  const blob = join(temporary, "sea.blob");
-  const config = join(temporary, "sea.json");
-  writeFileSync(
-    config,
-    JSON.stringify({
-      main: join(here, "src/bootstrap.cjs"),
-      output: blob,
-      disableExperimentalSEAWarning: true,
-      useSnapshot: false,
-      useCodeCache: false,
-      assets: { runtime: manifest, cli },
-    }),
-  );
-  execFileSync(nodeBinary, ["--experimental-sea-config", config], { stdio: "inherit" });
-  const executable = join(output, "kitesurf.partial");
-  copyFileSync(nodeBinary, executable);
+  const executable = join(staged, "kitesurf");
+  copyFileSync(host, executable);
   chmodSync(executable, 0o755);
-  if (process.platform === "darwin") execFileSync("codesign", ["--remove-signature", executable]);
-  await inject(executable, "NODE_SEA_BLOB", readFileSync(blob), {
-    sentinelFuse: "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2",
-    ...(process.platform === "darwin" ? { machoSegmentName: "NODE_SEA" } : {}),
-  });
-  if (process.platform === "darwin") execFileSync("codesign", ["--sign", "-", executable]);
-  const version = execFileSync(executable, ["--version"], { encoding: "utf8", timeout: 30_000 });
-  if (!version.includes(`kitesurf ${metadata.version}`))
-    throw new Error("Packaged executable version check failed");
+  verifyExecutable(executable);
+  verifyExecutable(workerd);
+  if (executableVersion(executable) !== `kitesurf ${version}`)
+    throw new Error("The native executable version does not match package metadata");
+  const workerdVersion = executableVersion(workerd).match(/^workerd (\S+)$/)?.[1];
+  if (!workerdVersion) throw new Error("Could not identify the bundled workerd version");
+
+  const binary = await fileInfo(executable);
   const inventory = {
-    version: metadata.version,
-    node: process.version,
-    platform: process.platform,
-    arch: process.arch,
-    packages: notices,
+    version,
+    platform,
+    systemFonts: process.platform === "linux" ? "Fontconfig" : "Core Text",
+    host: { path: "kitesurf", implementation: "Rust", license: "Apache-2.0", ...binary },
+    runtime: {
+      ...(await fileInfo(bundle)),
+      workerd: {
+        version: workerdVersion,
+        license: "Apache-2.0",
+        source: "https://github.com/cloudflare/workerd",
+        ...(await fileInfo(workerd)),
+      },
+      engine: await treeInfo(config, "config"),
+      assets: await treeInfo(assets, "assets"),
+    },
   };
-  writeFileSync(join(output, "DEPENDENCIES.json"), JSON.stringify(inventory, null, 2) + "\n");
-  const checksum = createHash("sha256").update(readFileSync(executable)).digest("hex");
-  const finalExecutable = join(output, "kitesurf");
-  renameSync(executable, finalExecutable);
-  writeFileSync(join(output, "SHA256SUMS"), `${checksum}  kitesurf\n`);
-  console.log(
-    JSON.stringify({
-      executable: finalExecutable,
-      bytes: statSync(finalExecutable).size,
-      sha256: checksum,
-      packages: notices.length,
-    }),
-  );
+  for (const name of ["LICENSE", "NOTICE", "licenses"])
+    copyReleaseEntry(join(repository, name), join(staged, name));
+  copyFileSync(join(here, "README.md"), join(staged, "README.md"));
+  writeFileSync(join(staged, "DEPENDENCIES.json"), `${JSON.stringify(inventory, null, 2)}\n`);
+  writeFileSync(join(staged, "SHA256SUMS"), `${binary.sha256}  kitesurf\n`);
+
+  const output = resolve(workspace, values.out || "dist/local-browser");
+  mkdirSync(output, { recursive: true });
+  cpSync(staged, output, { recursive: true });
+  if (values.archive) await archivePackage(staged, resolve(workspace, values.archive));
+  console.log(join(output, "kitesurf"));
 } finally {
-  rmSync(join(output, "kitesurf.partial"), { force: true });
-  rmSync(temporary, { recursive: true, force: true });
+  rmSync(staged, { recursive: true, force: true });
 }

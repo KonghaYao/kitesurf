@@ -7,7 +7,7 @@
 // fail-closed 检查；错误信息固定，不包含 state、cookie、owner 或 SQL 参数。
 
 use std::fs::File;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -215,28 +215,32 @@ impl ProfileStore {
         result
     }
 
-    /// 在同一持锁连接上 VACUUM INTO；目标先独占创建，失败只清理本次创建的文件。
+    /// Verify and sync the SQLite snapshot before publishing it without replacing a file.
     pub fn backup(&self, destination: &Path) -> HostResult<PathBuf> {
         let destination = resolve_destination(destination)?;
         ensure_secure_parent(&destination)?;
+        match std::fs::symlink_metadata(&destination) {
+            Ok(_) => return Err("backup destination already exists".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let parent = destination.parent().ok_or("backup path has no parent")?;
+        let draft = tempfile::Builder::new()
+            .prefix(".kitesurf-backup-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(parent)?;
+        let file = tempfile::NamedTempFile::new_in(draft.path())?;
+        let handle = file.as_file().metadata()?;
         let inner = self
             .inner
             .lock()
             .map_err(|_| "profile lock is poisoned".to_string())?;
-        let file = create_exclusive(&destination)?;
-        let handle = file.metadata()?;
-        let result = write_backup(&inner.connection, &destination, &handle, &self.path);
+        let result = write_backup(&inner.connection, file.path(), &handle, &self.path);
         drop(inner);
-        if let Err(error) = &result {
-            remove_created(
-                &destination,
-                FileIdentity {
-                    dev: handle.dev(),
-                    ino: handle.ino(),
-                },
-            );
-            return Err(format!("backup failed: {error}").into());
-        }
+        result.map_err(|error| format!("backup failed: {error}"))?;
+        file.as_file().sync_all()?;
+        file.persist_noclobber(&destination)
+            .map_err(|error| error.error)?;
         Ok(destination)
     }
 

@@ -7,6 +7,7 @@
 // 权限判断。客户端只通过有界帧通道和 oneshot 与管理操作通信；响应只回原客户端。
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use crate::cdp_raw::{
     self, DuplicatePolicy, LeasedIdentity, LeasedRaw, ParsePolicy, RawEnvelope, RawPresence,
@@ -22,7 +23,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::attachments::{AttachmentReservation, Attachments, QuarantineResult, Registration};
 use crate::observe::Observer;
-use crate::services::ProfileService;
+use crate::services::{LeasedProfileStatus, ProfileService};
 use crate::transport::{LeasedMessage, PayloadBudget, PayloadLease, Upstream, UpstreamEvent};
 
 impl Upstream {
@@ -338,7 +339,8 @@ enum BrokerCommand {
         reply: oneshot::Sender<Result<(String, u64), ControlError>>,
     },
     Flush {
-        reply: oneshot::Sender<Result<crate::services::LeasedProfileStatus, String>>,
+        operation: FlushOperation,
+        reply: FlushReply,
     },
     Close {
         kind: CloseKind,
@@ -359,11 +361,25 @@ enum BrokerCommand {
     ReceiveAck(LeasedRaw, oneshot::Sender<(bool, usize)>),
     #[cfg(all(test, feature = "test-faults"))]
     PressurePause(tests::pressure::Pause),
-    ProfileStatus {
+    ProfileBarrierComplete {
         token: u64,
-        result: Result<crate::services::LeasedProfileStatus, String>,
+        result: Result<FlushOutcome, String>,
     },
 }
+
+#[derive(Clone)]
+enum FlushOperation {
+    Status,
+    Backup(LeasedIdentity),
+}
+
+enum FlushOutcome {
+    Status(LeasedProfileStatus),
+    Backup(PathBuf),
+}
+
+type FlushReply = oneshot::Sender<Result<FlushOutcome, String>>;
+type CloseReply = oneshot::Sender<Result<(), String>>;
 
 pub enum ControlError {
     Conflict {
@@ -652,10 +668,26 @@ impl BrokerHandle {
             .unwrap_or_else(|_| Err(ControlError::Other("browser session is lost".into())))
     }
 
-    pub async fn flush(&self) -> Result<crate::services::LeasedProfileStatus, String> {
-        self.command(|reply| BrokerCommand::Flush { reply })
-            .await
-            .and_then(|result| result)
+    pub async fn flush(&self) -> Result<LeasedProfileStatus, String> {
+        match self.flush_operation(FlushOperation::Status).await? {
+            FlushOutcome::Status(status) => Ok(status),
+            FlushOutcome::Backup(_) => Err("Profile status unavailable".into()),
+        }
+    }
+
+    pub async fn backup(&self, destination: LeasedIdentity) -> Result<PathBuf, String> {
+        match self
+            .flush_operation(FlushOperation::Backup(destination))
+            .await?
+        {
+            FlushOutcome::Backup(path) => Ok(path),
+            FlushOutcome::Status(_) => Err("Profile backup failed".into()),
+        }
+    }
+
+    async fn flush_operation(&self, operation: FlushOperation) -> Result<FlushOutcome, String> {
+        self.command(|reply| BrokerCommand::Flush { operation, reply })
+            .await?
     }
 
     pub async fn close(
@@ -1151,7 +1183,9 @@ struct ActiveControl {
 }
 
 struct FlushState {
-    reply: Option<oneshot::Sender<Result<crate::services::LeasedProfileStatus, String>>>,
+    operation: FlushOperation,
+    reply: FlushReply,
+    host_close: Option<CloseReply>,
     stage: FlushStage,
     cutoff: u64,
     drain_until: Instant,
@@ -1160,7 +1194,7 @@ struct FlushState {
 enum FlushStage {
     Drain,
     Sent,
-    Status(u64),
+    Completing(u64),
 }
 
 struct CloseState {
@@ -1375,7 +1409,7 @@ impl Broker {
                     let _ = reply.send(Err(ControlError::Other("Browser is busy".to_string())));
                 }
             }
-            BrokerCommand::Flush { reply } => self.start_flush(reply),
+            BrokerCommand::Flush { operation, reply } => self.start_flush(operation, reply),
             BrokerCommand::Close {
                 kind,
                 client,
@@ -1393,7 +1427,9 @@ impl Broker {
                 });
             }
             BrokerCommand::Targets { reply } => self.request_targets(reply),
-            BrokerCommand::ProfileStatus { token, result } => self.profile_status(token, result),
+            BrokerCommand::ProfileBarrierComplete { token, result } => {
+                self.profile_barrier_complete(token, result)
+            }
         }
     }
 
@@ -4622,10 +4658,7 @@ impl Broker {
         !self.unknown.is_empty()
     }
 
-    fn start_flush(
-        &mut self,
-        reply: oneshot::Sender<Result<crate::services::LeasedProfileStatus, String>>,
-    ) {
+    fn start_flush(&mut self, operation: FlushOperation, reply: FlushReply) {
         if self.lifecycle == Lifecycle::Flushing {
             let _ = reply.send(Err("Browser is already flushing".to_string()));
             return;
@@ -4645,7 +4678,9 @@ impl Broker {
         self.lifecycle = Lifecycle::Flushing;
         let cutoff = self.admission_cutoff();
         self.flush = Some(FlushState {
-            reply: Some(reply),
+            operation,
+            reply,
+            host_close: None,
             stage: FlushStage::Drain,
             cutoff,
             drain_until: Instant::now() + self.internal_deadline,
@@ -4714,20 +4749,30 @@ impl Broker {
             self.fail_flush("Profile flush failed".to_string());
             return;
         }
+        let Some(flush) = self.flush.as_mut() else {
+            return;
+        };
         let token = self.next_token;
         self.next_token = self.next_token.saturating_add(1);
-        if let Some(flush) = self.flush.as_mut() {
-            flush.stage = FlushStage::Status(token);
-        }
+        flush.stage = FlushStage::Completing(token);
+        let operation = flush.operation.clone();
         let profile = self.profile.clone();
         let budget = self.upstream.handle.budget.clone();
         let commands = self.commands_tx.clone();
         tokio::spawn(async move {
-            let result = profile
-                .leased_status(budget)
-                .await
-                .map_err(|_| "Profile status unavailable".to_string());
-            let command = BrokerCommand::ProfileStatus { token, result };
+            let result = match operation {
+                FlushOperation::Status => profile
+                    .leased_status(budget)
+                    .await
+                    .map(FlushOutcome::Status)
+                    .map_err(|_| "Profile status unavailable".to_string()),
+                FlushOperation::Backup(destination) => profile
+                    .backup(destination)
+                    .await
+                    .map(FlushOutcome::Backup)
+                    .map_err(|_| "Profile backup failed".to_string()),
+            };
+            let command = BrokerCommand::ProfileBarrierComplete { token, result };
             #[cfg(all(test, feature = "test-faults"))]
             {
                 let gate = profile.outcome_gate.lock().unwrap().clone();
@@ -4740,39 +4785,36 @@ impl Broker {
         });
     }
 
-    fn profile_status(
-        &mut self,
-        token: u64,
-        result: Result<crate::services::LeasedProfileStatus, String>,
-    ) {
+    fn profile_barrier_complete(&mut self, token: u64, result: Result<FlushOutcome, String>) {
         let Some(flush) = self.flush.as_ref() else {
             return;
         };
-        if !matches!(flush.stage, FlushStage::Status(current) if current == token) {
+        if !matches!(flush.stage, FlushStage::Completing(current) if current == token) {
             return;
         }
-        let Some(mut flush) = self.flush.take() else {
-            return;
-        };
-        self.lifecycle = Lifecycle::Running;
-        if let Some(reply) = flush.reply.take() {
-            let _ = reply.send(result);
-        }
-        self.pump_after_change();
+        self.finish_flush(result);
     }
 
-    fn fail_flush(&mut self, message: String) {
-        let Some(mut flush) = self.flush.take() else {
+    fn finish_flush(&mut self, result: Result<FlushOutcome, String>) {
+        let Some(flush) = self.flush.take() else {
             return;
         };
         if self.lifecycle == Lifecycle::Flushing {
             self.lifecycle = Lifecycle::Running;
         }
-        self.observer.kind("flush-failed");
-        if let Some(reply) = flush.reply.take() {
-            let _ = reply.send(Err(message));
+        let _ = flush.reply.send(result);
+        if let Some(reply) = flush.host_close {
+            let _ = self.start_close(CloseKind::Host, None, None, None, Some(reply));
+        } else {
+            self.pump_after_change();
         }
-        self.pump_after_change();
+    }
+
+    fn fail_flush(&mut self, message: String) {
+        if self.flush.is_some() {
+            self.observer.kind("flush-failed");
+            self.finish_flush(Err(message));
+        }
     }
 
     fn start_close(
@@ -4797,6 +4839,15 @@ impl Broker {
             return reject(reply, "Browser session is lost");
         }
         if self.lifecycle == Lifecycle::Flushing {
+            // The running process can finish its profile barrier before handling a signal.
+            if let Some(flush) = self
+                .flush
+                .as_mut()
+                .filter(|flush| kind == CloseKind::Host && flush.host_close.is_none())
+            {
+                flush.host_close = reply;
+                return Ok(());
+            }
             return reject(reply, "Browser is flushing");
         }
         if self.close.is_some() {
@@ -5115,11 +5166,11 @@ impl Broker {
                 session,
             );
         }
-        if let Some(mut flush) = self.flush.take() {
-            if let Some(reply) = flush.reply.take() {
-                let _ = reply.send(Err(
-                    "Browser session ended; outcome may be unknown".to_string()
-                ));
+        if let Some(flush) = self.flush.take() {
+            let message = "Browser session ended; outcome may be unknown";
+            let _ = flush.reply.send(Err(message.to_string()));
+            if let Some(reply) = flush.host_close {
+                let _ = reply.send(Err(message.to_string()));
             }
         }
         if let Some(mut close) = self.close.take() {

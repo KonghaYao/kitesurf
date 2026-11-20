@@ -130,77 +130,70 @@ function storage(state, origin) {
   return entry ? Object.fromEntries(entry[1]) : {};
 }
 
-test(
-  "CDP changes reach SQLite and survive a host restart",
-  { timeout: 300_000 },
-  async (t) => {
-    const site = await fixture(t);
-    const directory = mkdtempSync(join(tmpdir(), "ks-profile-engine-"));
-    t.after(() => rmSync(directory, { recursive: true, force: true }));
-    const path = join(directory, "account.sqlite");
-    seedProfile(path, site.url);
-    assert.equal(readProfile(path).revision, 1);
+test("CDP changes reach SQLite and survive a host restart", { timeout: 300_000 }, async (t) => {
+  const site = await fixture(t);
+  const directory = mkdtempSync(join(tmpdir(), "ks-profile-engine-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "account.sqlite");
+  seedProfile(path, site.url);
+  assert.equal(readProfile(path).revision, 1);
 
-    const first = await startHost(t, path);
-    assert.equal(first.profile, realpathSync(path));
-    const session = await first.request("/session");
-    assert.equal(session.body.recovery, "profile-restored");
-    assert.equal(session.body.profile.revision, 1);
-    assert.equal(session.body.profile.format, 1);
-    assert.match(session.body.profile.id, /^[0-9a-f]{16}$/);
+  const first = await startHost(t, path);
+  assert.equal(first.profile, realpathSync(path));
+  const session = await first.request("/session");
+  assert.equal(session.body.recovery, "profile-restored");
+  assert.equal(session.body.profile.revision, 1);
+  assert.equal(session.body.profile.format, 1);
+  assert.match(session.body.profile.id, /^[0-9a-f]{16}$/);
 
-    const page = await openPage(t, first, `${site.url}/a`);
-    assert.equal(
-      await waitFor(
-        () => evaluate(page.cdp, page.sessionId, "localStorage.getItem('seed')"),
-        "the seeded localStorage value",
-      ),
-      "disk-value",
-    );
-    assert.match(await evaluate(page.cdp, page.sessionId, "document.cookie"), /seed=disk/);
-    assert.ok(!(await evaluate(page.cdp, page.sessionId, "document.cookie")).includes("sid="));
-    const cookies = await evaluate(
-      page.cdp,
-      page.sessionId,
-      "(() => { document.cookie='saved=disk; path=/'; localStorage.setItem('k','v'); return document.cookie; })()",
-    );
-    assert.match(cookies, /saved=disk/);
-    const flushed = await first.request("/flush", { method: "POST" });
-    assert.equal(flushed.status, 200);
-    assert.ok(flushed.body.revision >= 2);
-    await first.stop("SIGTERM", 20_000);
+  const page = await openPage(t, first, `${site.url}/a`);
+  assert.equal(
+    await waitFor(
+      () => evaluate(page.cdp, page.sessionId, "localStorage.getItem('seed')"),
+      "the seeded localStorage value",
+    ),
+    "disk-value",
+  );
+  assert.match(await evaluate(page.cdp, page.sessionId, "document.cookie"), /seed=disk/);
+  assert.ok(!(await evaluate(page.cdp, page.sessionId, "document.cookie")).includes("sid="));
+  const cookies = await evaluate(
+    page.cdp,
+    page.sessionId,
+    "(() => { document.cookie='saved=disk; path=/'; localStorage.setItem('k','v'); return document.cookie; })()",
+  );
+  assert.match(cookies, /saved=disk/);
+  const flushed = await first.request("/flush", { method: "POST" });
+  assert.equal(flushed.status, 200);
+  assert.ok(flushed.body.revision >= 2);
+  await first.stop("SIGTERM", 20_000);
 
-    const persisted = readProfile(path);
-    assert.ok(persisted.revision >= 2);
-    assert.equal(cookie(persisted.state, "seed").value, "disk");
-    assert.equal(cookie(persisted.state, "saved").value, "disk");
-    assert.equal(cookie(persisted.state, "sid").value, "http-only-disk");
-    assert.equal(cookie(persisted.state, "sid").httpOnly, true);
-    assert.equal(storage(persisted.state, site.url).seed, "disk-value");
-    assert.equal(storage(persisted.state, site.url).k, "v");
+  const persisted = readProfile(path);
+  assert.ok(persisted.revision >= 2);
+  assert.equal(cookie(persisted.state, "seed").value, "disk");
+  assert.equal(cookie(persisted.state, "saved").value, "disk");
+  assert.equal(cookie(persisted.state, "sid").value, "http-only-disk");
+  assert.equal(cookie(persisted.state, "sid").httpOnly, true);
+  assert.equal(storage(persisted.state, site.url).seed, "disk-value");
+  assert.equal(storage(persisted.state, site.url).k, "v");
 
-    const second = await startHost(t, path);
-    const restored = await second.request("/session");
-    assert.equal(restored.body.recovery, "profile-restored");
-    assert.equal(restored.body.profile.revision, persisted.revision);
-    const reopened = await openPage(t, second, `${site.url}/a`);
-    assert.equal(
-      await waitFor(
-        () => evaluate(reopened.cdp, reopened.sessionId, "localStorage.getItem('k')"),
-        "the restored localStorage value",
-      ),
-      "v",
-    );
-    assert.match(
-      await evaluate(reopened.cdp, reopened.sessionId, "document.cookie"),
-      /saved=disk/,
-    );
-    await second.stop("SIGTERM", 20_000);
-  },
-);
+  const second = await startHost(t, path);
+  const restored = await second.request("/session");
+  assert.equal(restored.body.recovery, "profile-restored");
+  assert.equal(restored.body.profile.revision, persisted.revision);
+  const reopened = await openPage(t, second, `${site.url}/a`);
+  assert.equal(
+    await waitFor(
+      () => evaluate(reopened.cdp, reopened.sessionId, "localStorage.getItem('k')"),
+      "the restored localStorage value",
+    ),
+    "v",
+  );
+  assert.match(await evaluate(reopened.cdp, reopened.sessionId, "document.cookie"), /saved=disk/);
+  await second.stop("SIGTERM", 20_000);
+});
 
 test(
-  "the CLI backup boots the engine with the saved cookies and storage",
+  "online CLI backup restores the running account's cookies and storage",
   { timeout: 300_000 },
   async (t) => {
     const site = await fixture(t);
@@ -228,6 +221,11 @@ test(
     assert.equal(JSON.parse(seeded.stdout).revision, 1);
 
     const first = await startHost(t, path);
+    const online = (command, ...args) =>
+      spawnSync(nativeHost, [command, "--port", String(first.port), ...args], {
+        encoding: "utf8",
+        timeout: 90_000,
+      });
     const page = await openPage(t, first, `${site.url}/a`);
     await waitFor(
       () => evaluate(page.cdp, page.sessionId, "localStorage.getItem('seed')"),
@@ -238,22 +236,41 @@ test(
       page.sessionId,
       "(() => { document.cookie='backup=yes; path=/'; localStorage.setItem('backup-key','backup-value'); })()",
     );
-    const flushed = await first.request("/flush", { method: "POST" });
-    assert.equal(flushed.status, 200);
-    await first.stop("SIGTERM", 20_000);
-
-    const backedUp = spawnSync(nativeHost, ["profile", "backup", path, "--output", backup], {
-      encoding: "utf8",
-    });
+    const backedUp = online("backup", "--output", backup);
     assert.equal(backedUp.status, 0, backedUp.stderr);
     assert.equal(JSON.parse(backedUp.stdout).path, realpathSync(backup));
     assert.equal(statSync(backup).mode & 0o777, 0o600);
     const backupBytes = readFileSync(backup);
-    const refused = spawnSync(nativeHost, ["profile", "backup", path, "--output", backup], {
-      encoding: "utf8",
-    });
+    const snapshot = readProfile(backup);
+    assert.equal(cookie(snapshot.state, "sid").value, "http-only-disk");
+    assert.equal(cookie(snapshot.state, "sid").httpOnly, true);
+    const refused = online("backup", "--output", backup);
     assert.notEqual(refused.status, 0);
     assert.deepEqual(readFileSync(backup), backupBytes, "backup never overwrites");
+
+    const running = online("status");
+    assert.equal(running.status, 0, running.stderr);
+    const runningSession = JSON.parse(running.stdout);
+    assert.equal(runningSession.alive, true);
+    assert.equal(runningSession.generation, first.generation);
+    assert.equal(runningSession.profile.path, realpathSync(path));
+    assert.ok(runningSession.profile.revision >= snapshot.revision);
+    await evaluate(page.cdp, page.sessionId, "localStorage.setItem('backup-key','after-backup')");
+    const flushed = online("flush");
+    assert.equal(flushed.status, 0, flushed.stderr);
+    assert.ok(JSON.parse(flushed.stdout).revision > snapshot.revision);
+
+    const stopped = online("stop");
+    assert.equal(stopped.status, 0, stopped.stderr);
+    assert.deepEqual(JSON.parse(stopped.stdout), { closed: true });
+    assert.deepEqual(await first.exit, { code: 0, signal: null });
+    const offline = spawnSync(
+      nativeHost,
+      ["profile", "backup", path, "--output", join(directory, "offline.sqlite")],
+      { encoding: "utf8" },
+    );
+    assert.equal(offline.status, 0, offline.stderr);
+    assert.ok(readProfile(JSON.parse(offline.stdout).path).revision > snapshot.revision);
 
     const restored = await startHost(t, backup);
     const session = await restored.request("/session");
@@ -262,16 +279,12 @@ test(
     const reopened = await openPage(t, restored, `${site.url}/a`);
     assert.equal(
       await waitFor(
-        () =>
-          evaluate(reopened.cdp, reopened.sessionId, "localStorage.getItem('backup-key')"),
+        () => evaluate(reopened.cdp, reopened.sessionId, "localStorage.getItem('backup-key')"),
         "the backup localStorage value",
       ),
       "backup-value",
     );
-    assert.match(
-      await evaluate(reopened.cdp, reopened.sessionId, "document.cookie"),
-      /backup=yes/,
-    );
+    assert.match(await evaluate(reopened.cdp, reopened.sessionId, "document.cookie"), /backup=yes/);
     await restored.stop("SIGTERM", 20_000);
   },
 );

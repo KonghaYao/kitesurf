@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fontique::{
-    Collection, CollectionOptions, FallbackKey, FontInfo, FontStyle, FontWeight, FontWidth,
-    GenericFamily, Language, Script, SourceKind,
+    Collection, CollectionOptions, FallbackKey, FamilyInfo, FontInfo, FontStyle, FontWeight,
+    FontWidth, GenericFamily, Language, Script, SourceKind,
 };
 use read_fonts::{FontRef, TableProvider};
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,7 @@ const MAX_TEXT_CODEPOINTS: usize = 256;
 const MAX_TEXT_BYTES: usize = 4096;
 const MAX_FAMILY_NAME_BYTES: usize = 256;
 const MAX_MATCH_FACES: usize = 4;
+const EMOJI_PROBE_SAMPLE: char = '\u{1F600}';
 const MAX_ISSUED_IDS: usize = 256;
 const ID_TTL: Duration = Duration::from_secs(10 * 60);
 const SFNT_HEADER_BYTES: usize = 12;
@@ -44,6 +45,7 @@ pub enum ErrorCode {
     UnsafeSource,
     InvalidFont,
     Io,
+    EntropyUnavailable,
     NoUsableFace,
 }
 
@@ -58,6 +60,7 @@ impl ErrorCode {
             Self::UnsafeSource => "unsafe_source",
             Self::InvalidFont => "invalid_font",
             Self::Io => "io",
+            Self::EntropyUnavailable => "entropy_unavailable",
             Self::NoUsableFace => "no_usable_face",
         }
     }
@@ -146,6 +149,13 @@ struct LoadedFace {
     path: PathBuf,
 }
 
+struct MatchCandidate {
+    family: FamilyInfo,
+    index: usize,
+    loaded: LoadedFace,
+    missing: u32,
+}
+
 struct FaceEntry {
     key: (PathBuf, u32),
     family: String,
@@ -217,7 +227,7 @@ impl FontHost {
             serif: self.has_generic(GenericFamily::Serif),
             mono: self.has_generic(GenericFamily::Monospace),
             system_ui: self.has_generic(GenericFamily::SystemUi),
-            emoji: self.has_generic(GenericFamily::Emoji),
+            emoji: self.has_emoji_sample(),
             families,
         }
     }
@@ -226,6 +236,16 @@ impl FontHost {
         let ids: Vec<_> = self.collection.generic_families(generic).collect();
         ids.into_iter()
             .any(|id| self.collection.family(id).is_some())
+    }
+
+    fn has_emoji_sample(&mut self) -> bool {
+        // Fontconfig can substitute a text family for the emoji generic.
+        let request = MatchRequest {
+            family: Some("emoji".to_string()),
+            ..Default::default()
+        };
+        self.select_face(&request, &[EMOJI_PROBE_SAMPLE])
+            .is_ok_and(|(candidate, _, _)| candidate.is_some_and(|face| face.missing == 0))
     }
 
     pub fn stats(&mut self) -> StatsResponse {
@@ -251,21 +271,49 @@ impl FontHost {
         validate_match_request(request)?;
         self.purge_expired();
         self.matches += 1;
-        let (families, is_emoji) = self.candidate_families(request)?;
         let text = request.text.as_deref().unwrap_or("");
         let text_chars: Vec<char> = text.chars().collect();
+        let (best, last_reason, is_emoji) = self.select_face(request, &text_chars)?;
+        if let Some(candidate) = best {
+            let summary = self.issue_face(
+                &candidate.family.fonts()[candidate.index],
+                candidate.family.name(),
+                candidate.loaded,
+                is_emoji,
+                candidate.missing,
+            )?;
+            return Ok(MatchResponse {
+                covered: summary.covered,
+                missing: summary.missing,
+                reason: (!summary.covered).then_some("missing_coverage"),
+                faces: vec![summary],
+            });
+        }
+        Ok(MatchResponse {
+            faces: Vec::new(),
+            covered: false,
+            missing: text_chars.len() as u32,
+            reason: Some(last_reason.as_str()),
+        })
+    }
+
+    fn select_face(
+        &mut self,
+        request: &MatchRequest,
+        text_chars: &[char],
+    ) -> HostResult<(Option<MatchCandidate>, ErrorCode, bool)> {
+        let (families, is_emoji) = self.candidate_families(request)?;
         let style = parse_style(request.style.as_deref())?;
         let weight = FontWeight::new(request.weight.unwrap_or(400.0).clamp(1.0, 1000.0));
         let width = FontWidth::from_ratio(1.0);
-        let mut fallback_face: Option<(FaceSummary, bool, u32)> = None;
+        let mut best: Option<MatchCandidate> = None;
         let mut last_reason = ErrorCode::NoUsableFace;
 
-        for family_id in families {
+        'families: for family_id in families {
             let Some(family) = self.collection.family(family_id) else {
                 continue;
             };
-            let family_name = family.name().to_string();
-            if is_last_resort(&family_name) || family_name.len() > MAX_FAMILY_NAME_BYTES {
+            if is_last_resort(family.name()) || family.name().len() > MAX_FAMILY_NAME_BYTES {
                 continue;
             }
             let default_index = family.match_index(width, style, weight, true);
@@ -289,41 +337,25 @@ impl FontHost {
                         continue;
                     }
                 };
-                let missing = count_missing(&loaded.bytes, &text_chars);
-                let covered = missing == 0;
-                let summary = self.issue_face(info, &family_name, loaded, is_emoji);
-                if covered || text_chars.is_empty() {
-                    return Ok(MatchResponse {
-                        faces: vec![summary],
-                        covered,
+                let missing = count_missing(&loaded.bytes, text_chars);
+                if best
+                    .as_ref()
+                    .is_none_or(|candidate| missing < candidate.missing)
+                {
+                    best = Some(MatchCandidate {
+                        family: family.clone(),
+                        index,
+                        loaded,
                         missing,
-                        reason: if covered {
-                            None
-                        } else {
-                            Some("missing_coverage")
-                        },
                     });
                 }
-                if fallback_face.is_none() {
-                    fallback_face = Some((summary, covered, missing));
+                if missing == 0 {
+                    break 'families;
                 }
             }
         }
 
-        if let Some((summary, covered, missing)) = fallback_face {
-            return Ok(MatchResponse {
-                faces: vec![summary],
-                covered,
-                missing,
-                reason: Some("missing_coverage"),
-            });
-        }
-        Ok(MatchResponse {
-            faces: Vec::new(),
-            covered: false,
-            missing: text_chars.len() as u32,
-            reason: Some(last_reason.as_str()),
-        })
+        Ok((best, last_reason, is_emoji))
     }
 
     pub fn face_bytes(&mut self, id: &str) -> HostResult<Arc<Vec<u8>>> {
@@ -425,22 +457,29 @@ impl FontHost {
         family_name: &str,
         loaded: LoadedFace,
         is_emoji: bool,
-    ) -> FaceSummary {
+        missing: u32,
+    ) -> HostResult<FaceSummary> {
         let key = (loaded.path, info.index());
         let bytes = Arc::new(loaded.bytes);
         self.use_counter += 1;
         let last_used = self.use_counter;
         if let Some(existing) = self.by_key.get(&key).cloned() {
-            if self.faces.contains_key(&existing) {
-                if let Some(entry) = self.faces.get_mut(&existing) {
-                    entry.last_used = last_used;
+            let unchanged = self.faces.get_mut(&existing).is_some_and(|entry| {
+                if entry.source_len != loaded.source_len || entry.source_hash != loaded.source_hash
+                {
+                    return false;
                 }
-                self.cache_face(&existing, bytes.clone());
+                entry.last_used = last_used;
+                true
+            });
+            if unchanged {
+                self.cache_face(&existing, bytes);
                 let entry = self.faces.get(&existing).expect("issued font id");
-                return summary_for(&existing, entry, entry.output_len, true, 0);
+                return Ok(summary_for(&existing, entry, missing));
             }
+            self.remove_face(&existing);
         }
-        let id = new_id();
+        let id = new_id(system_entropy)?;
         let entry = FaceEntry {
             key: key.clone(),
             family: family_name.to_string(),
@@ -461,7 +500,7 @@ impl FontHost {
         self.cache_face(&id, bytes);
         self.enforce_id_limit();
         let entry = self.faces.get(&id).expect("inserted font id");
-        summary_for(&id, entry, entry.output_len, true, 0)
+        Ok(summary_for(&id, entry, missing))
     }
 
     fn cache_face(&mut self, id: &str, bytes: Arc<Vec<u8>>) {
@@ -555,22 +594,16 @@ impl FontHost {
     }
 }
 
-fn summary_for(
-    id: &str,
-    entry: &FaceEntry,
-    bytes: usize,
-    covered: bool,
-    missing: u32,
-) -> FaceSummary {
+fn summary_for(id: &str, entry: &FaceEntry, missing: u32) -> FaceSummary {
     FaceSummary {
         id: id.to_string(),
         family: entry.family.clone(),
         weight: entry.weight,
         style: style_name(entry.style),
         width: entry.width,
-        covered,
+        covered: missing == 0,
         missing,
-        bytes,
+        bytes: entry.output_len,
     }
 }
 
@@ -801,19 +834,37 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn new_id() -> String {
-    let mut bytes = [0u8; 16];
-    let filled = std::fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .is_ok();
-    if !filled {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64);
-        bytes[..8].copy_from_slice(&now.to_le_bytes());
-        bytes[8..].copy_from_slice(&std::process::id().to_le_bytes());
+#[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
+fn system_entropy(bytes: &mut [u8; 16]) -> std::io::Result<()> {
+    // SAFETY: getentropy writes at most bytes.len() bytes to this live buffer.
+    let result = unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")))]
+fn system_entropy(bytes: &mut [u8; 16]) -> std::io::Result<()> {
+    std::fs::File::open("/dev/urandom")?.read_exact(bytes)
+}
+
+fn new_id(mut fill: impl FnMut(&mut [u8; 16]) -> std::io::Result<()>) -> HostResult<String> {
+    let mut bytes = [0u8; 16];
+    loop {
+        match fill(&mut bytes) {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                return Err(HostError::new(
+                    ErrorCode::EntropyUnavailable,
+                    "system entropy is unavailable",
+                ))
+            }
+        }
+    }
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
@@ -948,6 +999,12 @@ fn extract_face(
     let total: usize = records.iter().map(|record| record.len).sum();
     let needs_rebuild = is_collection || (is_emoji && total > MAX_FACE_BYTES);
     if !needs_rebuild && !has_sbix {
+        if bytes.len() > MAX_FACE_BYTES {
+            return Err(HostError::new(
+                ErrorCode::FaceTooLarge,
+                "font face exceeds the size budget",
+            ));
+        }
         validate_face(bytes)?;
         return Ok(bytes.to_vec());
     }
@@ -1266,6 +1323,13 @@ mod tests {
             len: MAX_FACE_BYTES,
         }];
         assert!(output_size(&records, None).unwrap() > MAX_FACE_BYTES);
+
+        let mut face = NOTO_SANS.to_vec();
+        face.resize(MAX_FACE_BYTES + 1, 0);
+        assert_eq!(
+            extract_face(&face, 0, false, &mut 0).unwrap_err().code,
+            ErrorCode::FaceTooLarge
+        );
     }
 
     #[test]
@@ -1356,29 +1420,159 @@ mod tests {
     }
 
     #[test]
+    fn font_ids_retry_interrupts_and_require_entropy() {
+        use std::io::ErrorKind;
+
+        let mut calls = 0;
+        let id = new_id(|bytes| {
+            calls += 1;
+            if calls == 1 {
+                return Err(ErrorKind::Interrupted.into());
+            }
+            system_entropy(bytes)
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert!(validate_id(&id).is_ok());
+        assert_ne!(id, new_id(system_entropy).unwrap());
+        assert_eq!(
+            new_id(|_| Err(ErrorKind::Unsupported.into()))
+                .unwrap_err()
+                .code,
+            ErrorCode::EntropyUnavailable
+        );
+    }
+
+    #[test]
+    fn reports_request_coverage_for_only_the_best_face() {
+        const NOTO_SANS_ARABIC: &[u8] =
+            include_bytes!("../../../engine/public/fonts/NotoSansArabic.ttf");
+        let dir = std::env::temp_dir().join(format!(
+            "ks-font-host-match-{}",
+            new_id(system_entropy).unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("sans.ttf"), NOTO_SANS).unwrap();
+        std::fs::write(dir.join("arabic.ttf"), NOTO_SANS_ARABIC).unwrap();
+        EXTRA_FONT_ROOT.with(|root| *root.borrow_mut() = std::fs::canonicalize(&dir).ok());
+
+        let mut host = FontHost::new();
+        host.collection = Collection::new(CollectionOptions {
+            shared: false,
+            system_fonts: false,
+        });
+        host.collection.load_fonts_from_paths([&dir]);
+        let sans = host.collection.family_id("Noto Sans").unwrap();
+        let arabic = host.collection.family_id("Noto Sans Arabic").unwrap();
+        host.collection
+            .set_generic_families(GenericFamily::SansSerif, [sans, arabic].into_iter());
+        host.collection
+            .set_generic_families(GenericFamily::Emoji, std::iter::once(sans));
+        assert_eq!(count_missing(NOTO_SANS, &[EMOJI_PROBE_SAMPLE]), 1);
+        assert!(
+            !host.probe().emoji,
+            "a generic fallback can miss the emoji sample"
+        );
+        assert_eq!(host.stats().faces, 0);
+
+        let mut request = MatchRequest {
+            family: Some("sans-serif".to_string()),
+            text: Some("Aاب".to_string()),
+            ..Default::default()
+        };
+        let partial = host.match_faces(&request).unwrap();
+        assert_eq!(partial.faces.len(), 1);
+        let face = &partial.faces[0];
+        assert_eq!(
+            (face.covered, face.missing),
+            (partial.covered, partial.missing)
+        );
+        assert_eq!((partial.covered, partial.missing), (false, 1));
+        assert_eq!(partial.reason, Some("missing_coverage"));
+        assert_eq!(face.family, "Noto Sans Arabic");
+        assert_eq!(host.stats().faces, 1);
+        let bytes = host.face_bytes(&face.id).unwrap();
+        assert_eq!(bytes.len(), face.bytes);
+        assert_eq!(count_missing(&bytes, &['A', 'ا', 'ب']), 1);
+
+        request.text = Some("اب".to_string());
+        let complete = host.match_faces(&request).unwrap();
+        assert_eq!((complete.covered, complete.missing), (true, 0));
+        assert_eq!(complete.reason, None);
+        assert_eq!(complete.faces[0].id, face.id);
+        assert_eq!(
+            (complete.faces[0].covered, complete.faces[0].missing),
+            (true, 0)
+        );
+        assert_eq!(host.stats().faces, 1);
+
+        request.text = Some("Aا".to_string());
+        let tied = host.match_faces(&request).unwrap();
+        assert_eq!((tied.covered, tied.missing), (false, 1));
+        assert_eq!(tied.faces[0].family, "Noto Sans");
+
+        std::fs::write(dir.join("arabic.ttf"), NOTO_SANS).unwrap();
+        host.collection
+            .set_generic_families(GenericFamily::SansSerif, std::iter::once(arabic));
+        request.text = Some("اب".to_string());
+        let replaced = host.match_faces(&request).unwrap();
+        let replacement = &replaced.faces[0];
+        assert_eq!((replacement.covered, replacement.missing), (false, 2));
+        assert_ne!(replacement.id, face.id);
+        assert_eq!(
+            host.face_bytes(&replacement.id).unwrap().as_slice(),
+            NOTO_SANS
+        );
+
+        EXTRA_FONT_ROOT.with(|root| *root.borrow_mut() = None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn real_cjk_and_emoji_faces_are_bounded() {
         let mut host = FontHost::new();
         let probe = host.probe();
+        let require_emoji = std::env::var("KITESURF_REQUIRE_EMOJI").as_deref() == Ok("1");
+        assert!(
+            probe.emoji || !require_emoji,
+            "expected a system emoji face"
+        );
         if probe.emoji {
             let request = MatchRequest {
                 family: Some("emoji".to_string()),
-                text: Some("\u{1F600}".to_string()),
+                text: Some(EMOJI_PROBE_SAMPLE.to_string()),
                 ..Default::default()
             };
             let response = host.match_faces(&request).unwrap();
-            if let Some(face) = response.faces.first() {
-                assert!(response.covered, "emoji face must cover the sample");
-                assert!(face.bytes <= MAX_FACE_BYTES);
-                let bytes = host.face_bytes(&face.id).unwrap();
-                let (_, records) = parse_tables(&bytes, 0).unwrap();
-                assert!(records.iter().any(|record| &record.tag == b"sbix"));
-                eprintln!(
-                    "emoji family={} bytes={} limited={}",
-                    face.family,
-                    bytes.len(),
-                    host.stats().limited_emoji
-                );
+            assert!(response.covered, "emoji face must cover the sample");
+            let face = response.faces.first().expect("probed system emoji face");
+            assert!(face.bytes <= MAX_FACE_BYTES);
+            let bytes = host.face_bytes(&face.id).unwrap();
+            assert_eq!(bytes.len(), face.bytes);
+            assert!(matches!(&bytes[..4], [0, 1, 0, 0] | b"OTTO"));
+            assert_eq!(count_missing(&bytes, &[EMOJI_PROBE_SAMPLE]), 0);
+            let entry = &host.faces[&face.id];
+            let (source, _) = read_source(&entry.key.0).unwrap();
+            let (_, source_tables) = parse_tables(&source, entry.face_index).unwrap();
+            let (_, face_tables) = parse_tables(&bytes, 0).unwrap();
+            let color_tags = [b"sbix", b"CBDT", b"CBLC", b"COLR", b"CPAL", b"SVG "];
+            let mut color_tables = source_tables
+                .iter()
+                .filter(|record| color_tags.contains(&&record.tag))
+                .peekable();
+            assert!(
+                !require_emoji || color_tables.peek().is_some(),
+                "expected a color system emoji face"
+            );
+            for expected in color_tables {
+                assert!(face_tables.iter().any(|record| record.tag == expected.tag));
             }
+            eprintln!(
+                "emoji family={} bytes={} limited={}",
+                face.family,
+                bytes.len(),
+                host.stats().limited_emoji
+            );
         }
         let request = MatchRequest {
             family: Some("script".to_string()),

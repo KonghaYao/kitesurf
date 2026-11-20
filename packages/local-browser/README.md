@@ -1,11 +1,13 @@
-# Kitesurf local browser 0.5.0
+# Kitesurf local browser 0.5.1
 
 A local Kitesurf browser for agents, with one SQLite profile and one live browser session.
-The release executable includes Node 24, workerd, the browser engine and its fonts. It needs
-no Cloudflare account, cloud deployment, Node installation or separate workerd installation.
-On startup it expands its bundled runtime into a private temporary directory and starts workerd
-as a child process. This is a single-file distribution, not a single-process browser.
-Linux requires glibc 2.35 or later. Native macOS arm64 builds are provided by the release workflow.
+The native Rust executable embeds workerd, engine modules and browser assets. It extracts the
+runtime into a private temporary directory and starts workerd as a child process. The Rust host
+owns the SQLite profile, the CDP connection and the system font service. A standalone copy of
+`kitesurf` is enough to start the browser on a supported machine with installed fonts.
+
+The release targets Linux x64, Linux arm64, and macOS arm64. On Linux the release builds target
+glibc 2.35 or later and use Fontconfig. On macOS the browser uses Core Text.
 
 ## Start and connect
 
@@ -88,16 +90,45 @@ Install pnpm 9.15.4 and Bazelisk, then run from the repository root:
 
 ```sh
 pnpm install --frozen-lockfile
-bazel run //packages/local-browser:package
-bazel test //packages/local-browser:profile_test //packages/local-browser:browser_test
+bazel run -c opt //packages/local-browser:package
+bazel test -c opt //packages/local-browser:binary_test \
+  --test_env=KITESURF_TEST_BINARY="$PWD/dist/local-browser/kitesurf"
 pnpm run check
 ```
 
-The executable appears at `dist/local-browser/kitesurf`, alongside licenses, a dependency
-inventory and SHA-256 checksum. The GitHub Actions browser release workflow builds from source
-for Linux x64/arm64 and macOS arm64. A `v0.5.*` tag prepares a draft GitHub release. Manual runs
-produce downloadable artifacts. No Cloudflare secrets or infrastructure are required. The
-upstream terminal client has a separate `cli-v*` release trigger.
+The directory `dist/local-browser` contains `kitesurf`, the licenses, a component inventory
+and `SHA256SUMS`. Pass `-- --archive "$PWD/dist"` to also create a versioned `.tar.gz` and its
+archive checksum. The browser release workflow builds from source on each platform and tests
+the executable extracted from the archive with an empty `PATH`. A matching `v0.5.*` tag
+prepares a draft GitHub release. Manual runs upload the archives as workflow artifacts.
+The upstream terminal client has a separate `cli-v*` release trigger.
+
+The repository keeps the Node host as a compatibility test reference. The v0.5.0 release
+contains the historical Node SEA executable.
+
+Run the 61-minute idle test against the native release binary with an extended Bazel timeout.
+The test disconnects CDP and checks the live page after reconnecting, without a heartbeat.
+
+```sh
+bazel test -c opt //packages/local-browser:native_soak_test --test_timeout=4200 --nocache_test_results
+```
+
+Use `//packages/local-browser:soak_test` with the same timeout to run the Node host baseline.
+
+## System fonts
+
+The browser needs a usable sans-serif font to start. On Debian and Ubuntu,
+`sudo apt install fontconfig fonts-dejavu-core` supplies the baseline. Install `fonts-noto-cjk`
+for CJK coverage and `fonts-noto-color-emoji` for color emoji. A page can still load its own
+fonts through CSS `@font-face`.
+
+Run the native rendering test with CJK coverage required after installing a CJK font.
+
+```sh
+bazel test //packages/local-browser:native_system_fonts_test --test_env=KITESURF_REQUIRE_CJK=1
+```
+
+The release workflow requires CJK coverage on both Linux architectures.
 
 ## Boundaries
 

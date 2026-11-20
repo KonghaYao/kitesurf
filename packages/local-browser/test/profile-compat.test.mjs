@@ -188,7 +188,13 @@ function fullState(token) {
       },
     ],
     localStorage: [
-      ["https://example.com", [["token", token], ["__proto__", "safe"]]],
+      [
+        "https://example.com",
+        [
+          ["token", token],
+          ["__proto__", "safe"],
+        ],
+      ],
       ["http://127.0.0.1:8080", [["empty", ""]]],
     ],
     extra: { keep: true },
@@ -400,7 +406,12 @@ test("state limits match Node at the cookie and per-origin quota boundaries", (t
   const replies = run([
     { command: "open", path, create: true },
     { command: "acquire", owner: "owner" },
-    { command: "save", owner: "owner", revision: "1", state: JSON.stringify({ cookies, localStorage: [] }) },
+    {
+      command: "save",
+      owner: "owner",
+      revision: "1",
+      state: JSON.stringify({ cookies, localStorage: [] }),
+    },
     { command: "save", owner: "owner", revision: "1", state: JSON.stringify(oversized) },
     { command: "save", owner: "owner", revision: "1", state: JSON.stringify(fullState("ok")) },
     { command: "close" },

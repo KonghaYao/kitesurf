@@ -8,50 +8,53 @@ Chrome or a browser container. It speaks the
 [Chrome DevTools Protocol (CDP)](https://chromedevtools.github.io/devtools-protocol/),
 so CDP clients such as Puppeteer and Playwright can drive it.
 
-This fork adds a standalone **local browser**: one executable with embedded
-workerd, Node, the engine and fonts, a SQLite account profile, and pages that
-stay alive when a CDP client disconnects. It needs no Cloudflare account and no
-cloud deployment.
+This fork adds a standalone **local browser** with a Rust host, embedded workerd
+and engine, and a persistent SQLite account profile. The browser uses installed
+system fonts and keeps pages alive when a CDP client disconnects. The executable
+runs locally and starts its bundled workerd as a child process.
 
-## Download and run the local browser
+## Run the native local browser
 
-The shortest install uses [mise](https://mise.jdx.dev/), which selects the right
-archive for the current platform:
-
-```bash
-mise use -g github:KonghaYao/kitesurf@0.5.0
-kitesurf serve
-```
-
-Use `mise use -g github:KonghaYao/kitesurf@latest` to pick up later releases.
-Without mise, download the platform archive directly. Linux builds require glibc
-2.35 or later. The example uses macOS; on Linux, replace `darwin-arm64` with
-`linux-x64` or `linux-arm64`:
+Build the executable from the repository root:
 
 ```bash
-curl -LO https://github.com/KonghaYao/kitesurf/releases/download/v0.5.0/kitesurf-0.5.0-darwin-arm64.tar.gz
-shasum -a 256 -c kitesurf-0.5.0-darwin-arm64.tar.gz.sha256
-tar -xzf kitesurf-0.5.0-darwin-arm64.tar.gz
-./kitesurf serve
-```
-
-On Linux, verify the archive with `sha256sum -c` instead of `shasum -a 256 -c`.
-
-The browser listens on `ws://127.0.0.1:8787/devtools/browser`. Use `./kitesurf
-status`, `flush`, `backup`, `stop`, and `profile create` to manage the running
-browser and its profile. See
-[local browser usage and builds](packages/local-browser/README.md) for profiles,
-reconnect behavior, control ownership, and build details.
-
-To build the standalone browser from source instead, run:
-
-```bash
-bazel run //packages/local-browser:package
+pnpm install --frozen-lockfile
+bazel run -c opt //packages/local-browser:package
 ./dist/local-browser/kitesurf serve
 ```
 
-The output includes the executable, licenses, a dependency inventory, and its
-SHA-256 checksum.
+On Linux, install Fontconfig and at least one sans-serif font. On macOS the browser
+uses Core Text. CDP clients connect to the browser at
+`ws://127.0.0.1:8787/devtools/browser`. See the
+[local browser guide](packages/local-browser/README.md) for profile management,
+reconnect behavior, control ownership, and build details.
+
+## Install a release archive
+
+The v0.5.1 release workflow prepares native packages for Linux x64, Linux arm64
+and macOS arm64. After the draft is published, install with
+[mise](https://mise.jdx.dev/):
+
+```bash
+mise use -g github:KonghaYao/kitesurf@0.5.1
+kitesurf serve
+```
+
+To install manually on macOS, download the archive and its checksum:
+
+```bash
+archive=kitesurf-0.5.1-darwin-arm64.tar.gz
+release=https://github.com/KonghaYao/kitesurf/releases/download/v0.5.1
+curl -fLO "$release/$archive"
+curl -fLO "$release/$archive.sha256"
+shasum -a 256 -c "$archive.sha256"
+tar -xzf "$archive"
+./kitesurf serve
+```
+
+On Linux, use `linux-x64` or `linux-arm64` in the archive name and
+`sha256sum -c` to verify it. The published v0.5.0 archive contains the earlier
+Node SEA local browser.
 
 ## CDP protocol
 
@@ -385,12 +388,11 @@ workspace can depend on this repository as a module.
 
 ## Releases
 
-Pushing a tag that matches `v0.5.*` runs the local browser release workflow. It
-checks the source, builds the standalone executable for Linux x64, Linux arm64
-and macOS arm64, verifies each binary, and creates a draft GitHub release with
-`.tar.gz` archives and `.sha256` checksums. Publish the draft before sharing the
-download links. A manual workflow run builds the artifacts without creating a
-release.
+Pushing a `v0.5.*` tag matching the local browser version runs the release workflow.
+It builds a Rust executable for Linux x64, Linux arm64 and macOS arm64, then tests
+the executable extracted from each archive. The draft release includes each
+`.tar.gz` and its `.sha256` checksum. Manual runs upload the same archives as
+workflow artifacts.
 
 The Rust terminal client keeps its own `cli-v*` tag trigger.
 

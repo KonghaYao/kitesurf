@@ -167,12 +167,13 @@ export async function handleWebSocket(
   let screencastFrameBytesSent = 0;
   let screencastAcksReceived = 0;
   let wsClosing = false;
+  let browserCloseSent = false;
   let memAtClose: ReturnType<typeof engineMemoryBreakdown> | null = null;
 
-  const send = (payload: unknown) => {
+  const send = (payload: unknown): boolean => {
     if (wsClosing) {
       sendFailCount++;
-      return;
+      return false;
     }
     try {
       const str = JSON.stringify(payload);
@@ -194,6 +195,7 @@ export async function handleWebSocket(
       server.send(str);
       sendCount++;
       sendBytesTotal += str.length;
+      return true;
     } catch (err) {
       sendFailCount++;
       const msg =
@@ -206,6 +208,7 @@ export async function handleWebSocket(
         `[kitesurf-ws] send failed (#${sendFailCount}, ` +
           `sendCount=${sendCount}, totalBytes=${sendBytesTotal}): ${msg}`,
       );
+      return false;
     }
   };
 
@@ -436,12 +439,13 @@ export async function handleWebSocket(
         if (debug && !NOISY_CDP_METHODS.has(req.method)) {
           console.log("[cdp ->]", req.id, req.method, "ok");
         }
-        send(response);
+        const sent = send(response);
         // Chrome exits after it answers Browser.close, which drops the socket. Clients behind
         // a proxy wait for that drop, so `browser.close()` hangs unless the engine closes too.
         if (req.method === "Browser.close" && !("error" in response)) {
           try {
             server.close(1000, "Browser.close");
+            browserCloseSent = sent;
           } catch {}
         }
       } catch (err) {
@@ -523,6 +527,11 @@ export async function handleWebSocket(
       error?: { name?: string; message?: string; stack?: string };
     };
     const msg = e.error?.message ?? e.message ?? "";
+    // workerd can report transport loss before it dispatches the requested close event.
+    if (browserCloseSent && msg === "Network connection lost.") {
+      teardownConnection();
+      return;
+    }
     const postClose = wsClosing && msg.includes("Network connection lost");
     if (!wsClosing) {
       emitSessionEnd(analytics, {

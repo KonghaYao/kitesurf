@@ -6,7 +6,7 @@
 // target 注册系统字体，且作者 @font-face 仍从远端页面来源获取并绘制。
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import {
   existsSync,
@@ -18,20 +18,14 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { PNG } from "pngjs";
 
 import { connect, navigate, until } from "./helpers.mjs";
-import {
-  eventsOfKind,
-  readEvents,
-  required,
-  startNativeHost,
-  waitFor,
-} from "./host-adapter.mjs";
+import { eventsOfKind, readEvents, required, startNativeHost, waitFor } from "./host-adapter.mjs";
 
 const nativeHost = required("KITESURF_NATIVE_HOST");
 const workerd = required("KITESURF_WORKERD");
@@ -328,27 +322,177 @@ async function faceFamiliesFor(cdp, targetId) {
   return faceFamilies(dump);
 }
 
+const HAN_GLYPHS = ["世", "中", "文", "界"];
+
+function fontconfigHasHanGlyphs() {
+  if (process.platform !== "linux") return false;
+  const charset = HAN_GLYPHS.map((glyph) => glyph.codePointAt(0).toString(16)).join(" ");
+  const result = spawnSync("fc-list", [`:charset=${charset}`, "-f", "%{file}\n"], {
+    encoding: "utf8",
+    timeout: 5_000,
+  });
+  return result.status === 0 && /\.(ttf|otf|ttc|otc)$/im.test(result.stdout);
+}
+
+async function matchHanGlyphs(socketPath) {
+  const payload = JSON.stringify({
+    family: "script",
+    script: "Hani",
+    locale: "zh-CN",
+    text: HAN_GLYPHS.join(""),
+  });
+  const request = httpRequest({
+    socketPath,
+    path: "/match",
+    method: "POST",
+    signal: AbortSignal.timeout(30_000),
+    headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) },
+  });
+  const response = once(request, "response");
+  request.end(payload);
+  const [result] = await response;
+  const chunks = [];
+  for await (const chunk of result) chunks.push(chunk);
+  assert.equal(result.statusCode, 200, "native font match response");
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+function glyphMask(png, cell) {
+  const pixels = [];
+  let colorful = 0;
+  let left = png.width;
+  let top = png.height;
+  for (let y = cell.y; y < cell.y + cell.height; y++) {
+    for (let x = cell.x; x < cell.x + cell.width; x++) {
+      const index = (y * png.width + x) * 4;
+      const r = png.data[index];
+      const g = png.data[index + 1];
+      const b = png.data[index + 2];
+      if (Math.max(r, g, b) - Math.min(r, g, b) > 48) colorful++;
+      if (r >= 160) continue;
+      left = Math.min(left, x);
+      top = Math.min(top, y);
+      pixels.push([x, y]);
+    }
+  }
+  return {
+    ink: pixels.length,
+    shape: pixels.map(([x, y]) => `${x - left},${y - top}`).join(" "),
+    colorful,
+  };
+}
+
 test(
-  "each target keeps its own system font registration",
+  "native screenshots show distinct Han glyphs when system CJK coverage is available",
   { timeout: 180_000 },
   async (t) => {
     const host = await startHost(t);
-    const site = await fixtureSite(t);
     const cdp = await connect(host.port);
     t.after(() => cdp.disconnect());
-    const first = await open(cdp, `${site.url}/a`);
-    const second = await open(cdp, `${site.url}/b`);
-    await until(async () => hasDiagnostic(cdp, first.targetId, "system core"), "first core");
-    await until(async () => hasDiagnostic(cdp, second.targetId, "system core"), "second core");
-    const initialFirst = new Set(await faceFamiliesFor(cdp, first.targetId));
-    const initialSecond = new Set(await faceFamiliesFor(cdp, second.targetId));
-    const secondOnly = [...initialSecond].filter((family) => !initialFirst.has(family));
+    const page = await open(cdp);
+    const requireEmoji = process.env.KITESURF_REQUIRE_EMOJI === "1";
+    // Repeat the first Han glyph and include two unassigned characters as missing-glyph controls.
+    const glyphs = [...HAN_GLYPHS, HAN_GLYPHS[0], "\u0378", "\u0380"];
+    if (requireEmoji) glyphs.push("😀");
+    await setContent(
+      cdp,
+      page.sessionId,
+      `<!doctype html><html lang="zh-CN"><style>
+        html,body{margin:0;background:#fff;color:#111}
+        span{display:inline-block;width:80px;height:80px;font:52px/80px sans-serif;vertical-align:top}
+        </style><body>${glyphs.map((glyph, index) => `<span id="glyph-${index}">${glyph}</span>`).join("")}</body></html>`,
+    );
+    const cjkDiagnostic = await waitFor(async () => {
+      const lines = await diagnostics(cdp, page.targetId);
+      return lines.find((line) => /^(system CJK|missing coverage:) script=Hani /.test(line));
+    }, "system Han fallback selection");
+
+    const match = await matchHanGlyphs(join(host.runDir(), "fonts.sock"));
+    if (!match.covered && process.env.KITESURF_REQUIRE_CJK !== "1" && !fontconfigHasHanGlyphs()) {
+      t.skip(`No usable system face covers ${HAN_GLYPHS.join("")} (${match.reason})`);
+      return;
+    }
+    assert.equal(
+      match.covered,
+      true,
+      `font host must cover the Han sample: ${JSON.stringify(match)}`,
+    );
+    const family = /^system CJK script=Hani locale=zh-CN family=(.+) bytes=\d+$/.exec(
+      cjkDiagnostic,
+    )?.[1];
+    assert.ok(family, cjkDiagnostic);
     assert.ok(
-      secondOnly.length > 0,
-      `the serif target's extra families=${JSON.stringify(secondOnly)}; first=${JSON.stringify([...initialFirst])}; second=${JSON.stringify([...initialSecond])}`,
+      (await faceFamiliesFor(cdp, page.targetId)).includes(family),
+      `${family} was registered`,
+    );
+    if (requireEmoji) {
+      const emoji = await waitFor(async () => {
+        const lines = await diagnostics(cdp, page.targetId);
+        return lines.find((line) => /^(system emoji|missing coverage: emoji) /.test(line));
+      }, "system emoji fallback selection");
+      assert.ok(emoji.startsWith("system emoji family="), emoji);
+    }
+
+    const cells = await Promise.all(
+      glyphs.map((_, index) => rect(cdp, page.sessionId, `glyph-${index}`)),
+    );
+    const png = await screenshot(cdp, page.sessionId);
+    const masks = cells.map((cell) => {
+      assert.ok(Object.values(cell).every(Number.isInteger), "pixel-aligned glyph cell");
+      assert.equal(cell.width, 80);
+      assert.equal(cell.height, 80);
+      assert.ok(
+        cell.x >= 0 &&
+          cell.y >= 0 &&
+          cell.x + cell.width <= png.width &&
+          cell.y + cell.height <= png.height,
+      );
+      return glyphMask(png, cell);
+    });
+    const han = masks.slice(0, HAN_GLYPHS.length);
+    const [repeat, firstMissing, secondMissing, emoji] = masks.slice(HAN_GLYPHS.length);
+    const missing = [firstMissing, secondMissing];
+    assert.equal(han[0].shape, repeat.shape, "the repeated glyph must have the same bitmap");
+    assert.equal(
+      new Set(han.map(({ shape }) => shape)).size,
+      HAN_GLYPHS.length,
+      "distinct Han glyphs",
+    );
+    for (const [index, { ink: dark, shape }] of han.entries()) {
+      const char = HAN_GLYPHS[index];
+      assert.ok(dark > 40, `${char} has enough visible glyph ink (${dark} pixels)`);
+      assert.ok(
+        missing.every((control) => control.shape !== shape),
+        `${char} is not a missing glyph`,
+      );
+    }
+    if (requireEmoji) {
+      assert.ok(emoji.colorful > 20, `the emoji glyph has color (${emoji.colorful} pixels)`);
+      t.diagnostic(`System emoji color ink: ${emoji.colorful} pixels`);
+    }
+    t.diagnostic(
+      `System Han face ${family}, ${HAN_GLYPHS.join("")} ink: ${han.map(({ ink }) => ink).join(", ")}`,
     );
   },
 );
+
+test("each target keeps its own system font registration", { timeout: 180_000 }, async (t) => {
+  const host = await startHost(t);
+  const site = await fixtureSite(t);
+  const cdp = await connect(host.port);
+  t.after(() => cdp.disconnect());
+  const first = await open(cdp, `${site.url}/a`);
+  const second = await open(cdp, `${site.url}/b`);
+  await until(async () => hasDiagnostic(cdp, first.targetId, "system core"), "first core");
+  await until(async () => hasDiagnostic(cdp, second.targetId, "system core"), "second core");
+  const initialFirst = new Set(await faceFamiliesFor(cdp, first.targetId));
+  const initialSecond = new Set(await faceFamiliesFor(cdp, second.targetId));
+  const secondOnly = [...initialSecond].filter((family) => !initialFirst.has(family));
+  assert.ok(
+    secondOnly.length > 0,
+    `the serif target's extra families=${JSON.stringify(secondOnly)}; first=${JSON.stringify([...initialFirst])}; second=${JSON.stringify([...initialSecond])}`,
+  );
+});
 
 test(
   "navigation and a renderer rebuild re-register only their own system fonts",
@@ -363,13 +507,10 @@ test(
     const initialFirst = new Set(await faceFamiliesFor(cdp, first.targetId));
 
     await navigate(cdp, first.sessionId, `${site.url}/c`);
-    await until(
-      async () => {
-        const current = await faceFamiliesFor(cdp, first.targetId);
-        return current.some((family) => !initialFirst.has(family));
-      },
-      "the navigated page's mono family",
-    );
+    await until(async () => {
+      const current = await faceFamiliesFor(cdp, first.targetId);
+      return current.some((family) => !initialFirst.has(family));
+    }, "the navigated page's mono family");
     const navigatedFirst = new Set(await faceFamiliesFor(cdp, first.targetId));
     const navigatedOnly = [...navigatedFirst].filter((family) => !initialFirst.has(family));
     assert.ok(navigatedOnly.length > 0);

@@ -1,6 +1,6 @@
 [package]
 name = "kitesurf-local-host"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
@@ -17,8 +17,9 @@ name = "broker_test"
 path = "src/lib.rs"
 required-features = ["test-faults"]
 
-# 仅 test-faults 变体启用；发行二进制不编译该路径。
 [features]
+embedded-runtime = []
+# 仅 test-faults 变体启用；发行二进制不编译该路径。
 test-faults = []
 
 [[bin]]

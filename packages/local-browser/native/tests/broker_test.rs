@@ -5026,14 +5026,27 @@ async fn flush_drains_writes_and_reports_profile_status() {
     assert_eq!(reply["id"], 2);
 }
 
-struct GatedStatus {
+struct GatedProfile {
     inner: Arc<dyn crate::services::ProfileBackend>,
     entered: tokio::sync::Notify,
     resume: std::sync::Mutex<bool>,
     gate: std::sync::Condvar,
 }
 
-impl crate::services::ProfileBackend for GatedStatus {
+impl GatedProfile {
+    fn wait(&self) {
+        self.entered.notify_one();
+        let guard = self.resume.lock().unwrap();
+        let (guard, waited) = self
+            .gate
+            .wait_timeout_while(guard, WAIT, |resume| !*resume)
+            .unwrap();
+        assert!(!waited.timed_out(), "profile test gate timed out");
+        drop(guard);
+    }
+}
+
+impl crate::services::ProfileBackend for GatedProfile {
     fn load(
         &self,
         owner: &[u16],
@@ -5056,15 +5069,12 @@ impl crate::services::ProfileBackend for GatedStatus {
         budget: &crate::transport::PayloadBudget,
     ) -> Result<crate::services::LeasedProfileStatus, crate::profile::ProfileError> {
         let status = self.inner.leased_status(budget)?;
-        self.entered.notify_one();
-        let guard = self.resume.lock().unwrap();
-        let (guard, waited) = self
-            .gate
-            .wait_timeout_while(guard, WAIT, |resume| !*resume)
-            .unwrap();
-        assert!(!waited.timed_out(), "status test gate timed out");
-        drop(guard);
+        self.wait();
         Ok(status)
+    }
+    fn backup(&self, destination: &std::path::Path) -> crate::HostResult<std::path::PathBuf> {
+        self.wait();
+        self.inner.backup(destination)
     }
     fn kind(&self) -> &'static str {
         self.inner.kind()
@@ -5089,7 +5099,7 @@ async fn typed_status_callbacks_cancel_lost_and_exhaustion_release_both_profiles
                 Arc::new(MemoryProfile::new("http://fixture.invalid").unwrap())
             };
             let expected = inner.status().unwrap();
-            let gated = Arc::new(GatedStatus {
+            let gated = Arc::new(GatedProfile {
                 inner,
                 entered: tokio::sync::Notify::new(),
                 resume: std::sync::Mutex::new(false),
@@ -5262,10 +5272,14 @@ async fn typed_profile_http_status_flush_fields_and_exhaustion_stay_compatible()
 }
 
 async fn status_http(port: u16, flush: bool) -> (String, Value) {
+    profile_http(port, if flush { "POST /flush" } else { "GET /session" }, "").await
+}
+
+async fn profile_http(port: u16, route: &str, body: &str) -> (String, Value) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let route = if flush { "POST /flush" } else { "GET /session" };
-    stream.write_all(format!("{route} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let length = body.len();
+    stream.write_all(format!("{route} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}").as_bytes()).await.unwrap();
     let mut bytes = Vec::new();
     timeout(WAIT, stream.read_to_end(&mut bytes))
         .await
@@ -5277,6 +5291,128 @@ async fn status_http(port: u16, flush: bool) -> (String, Value) {
         head.lines().next().unwrap().to_owned(),
         serde_json::from_str(body).unwrap(),
     )
+}
+
+#[tokio::test]
+async fn http_backup_waits_for_engine_and_sqlite_then_allows_host_shutdown() {
+    use crate::relay::{HostServer, SessionInfo};
+    use crate::services::{ProfileBackend, SqliteProfile};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("live.sqlite");
+    let destination = directory.path().join("snapshot.sqlite");
+    let owner: Vec<u16> = "http://fixture.invalid".encode_utf16().collect();
+    let database = Arc::new(SqliteProfile::open(&path, true).unwrap());
+    database.load(&owner).unwrap();
+    let gated = Arc::new(GatedProfile {
+        inner: database.clone(),
+        entered: tokio::sync::Notify::new(),
+        resume: std::sync::Mutex::new(false),
+        gate: std::sync::Condvar::new(),
+    });
+    let profile = Arc::new(ProfileService::new(gated.clone()));
+    let mut engine = fake_engine().await;
+    let broker = broker_with_profile(&engine, profile.clone(), WAIT, WAIT).await;
+    let budget = broker.payload_budget();
+    let raw = crate::cdp_raw::LeasedRaw::literal("{}", &budget).unwrap();
+    let session = SessionInfo::from_raw(&raw, &budget, "test").unwrap();
+    let host = HostServer::bind(
+        0,
+        broker.clone(),
+        session,
+        "generation".into(),
+        "recovery".into(),
+        profile,
+        Arc::new(Observer::disabled()),
+    )
+    .unwrap();
+    let port = host.port();
+    let body = json!({ "path": destination }).to_string();
+    let (status, _) = profile_http(port, "POST /backup", r#"{"path":7}"#).await;
+    assert_eq!(status, "HTTP/1.1 400 Bad Request");
+
+    let rejected = {
+        let body = body.clone();
+        tokio::spawn(async move { profile_http(port, "POST /backup", &body).await })
+    };
+    let flush = next_method(&mut engine, "Kitesurf.flushProfile").await;
+    engine.push(json!({
+        "id": request_id(&flush),
+        "error": { "code": -32000, "message": "sensitive save detail" }
+    }));
+    assert_eq!(
+        rejected.await.unwrap(),
+        (
+            "HTTP/1.1 409 Conflict".to_string(),
+            json!({"error":"Profile flush failed"})
+        )
+    );
+    assert!(!destination.exists());
+
+    let mut controller = connect(&broker, Endpoint::Browser, Role::Controller, "alice").await;
+    send(
+        &controller,
+        &broker,
+        r#"{"id":1,"method":"Page.navigate","params":{"url":"about:blank"}}"#,
+    )
+    .await;
+    let write = next_method(&mut engine, "Page.navigate").await;
+    let request = {
+        let body = body.clone();
+        tokio::spawn(async move { profile_http(port, "POST /backup", &body).await })
+    };
+    expect_no_request(&mut engine).await;
+    engine.reply(request_id(&write), json!({}));
+    let _ = next_frame(&mut controller).await;
+    let flush = next_method(&mut engine, "Kitesurf.flushProfile").await;
+    let state =
+        r#"{"cookies":[],"localStorage":[["http://fixture.invalid",[["account","pending"]]]]}"#;
+    database
+        .save(
+            &owner,
+            &crate::profile_state::parse("1").unwrap(),
+            Some(&crate::profile_state::parse(state).unwrap()),
+        )
+        .unwrap();
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    timeout(WAIT, gated.entered.notified()).await.unwrap();
+    let (conflict, failure) = profile_http(port, "POST /backup", &body).await;
+    assert_eq!(conflict, "HTTP/1.1 409 Conflict");
+    assert_eq!(failure, json!({"error":"Browser is already flushing"}));
+    let (conflict, failure) = profile_http(port, "POST /close", "").await;
+    assert_eq!(conflict, "HTTP/1.1 409 Conflict");
+    assert_eq!(failure, json!({"error":"Browser is flushing"}));
+    assert!(!destination.exists());
+    let mut shutdown = Box::pin(broker.close(CloseKind::Host, None, None, None));
+    assert!(shutdown.as_mut().now_or_never().is_none());
+    assert!(broker.session().await.unwrap().alive);
+    expect_no_request(&mut engine).await;
+
+    *gated.resume.lock().unwrap() = true;
+    gated.gate.notify_all();
+    assert_eq!(
+        request.await.unwrap(),
+        (
+            "HTTP/1.1 200 OK".to_string(),
+            json!({"path": std::fs::canonicalize(&destination).unwrap()})
+        )
+    );
+    let restored = SqliteProfile::open(&destination, false)
+        .unwrap()
+        .load(&owner)
+        .unwrap();
+    assert_eq!(restored.revision, 1);
+    assert_eq!(restored.state_text, state);
+    let flush = next_method(&mut engine, "Kitesurf.flushProfile").await;
+    engine.reply(request_id(&flush), json!({ "saved": true }));
+    let close = next_method(&mut engine, "Browser.close").await;
+    engine.reply(request_id(&close), json!({}));
+    timeout(WAIT, shutdown).await.unwrap().unwrap();
+    assert_eq!(next_close(&mut controller).await.0, 1000);
+    broker.writer_gone(controller.id);
+    assert!(timeout(WAIT, broker.wait_terminal()).await.unwrap());
+    host.stop().await;
+    engine.kill();
 }
 
 #[tokio::test]

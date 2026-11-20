@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -43,6 +44,7 @@ use crate::HostResult;
 
 const MAX_CONNECTIONS: usize = 128;
 const MAX_BODY_BYTES: usize = 64 * 1024;
+const MAX_BACKUP_PATH_BYTES: usize = 4096;
 const CLIENT_QUEUE: usize = 64;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const BODY_DEADLINE: Duration = Duration::from_secs(5);
@@ -349,10 +351,7 @@ async fn handle_request(
             Ok(()) => json_response(StatusCode::OK, r#"{"closed":true}"#),
             Err(message) => error_response(StatusCode::CONFLICT, &message),
         },
-        (Method::POST, "/backup") => error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "Online profile backup is not available",
-        ),
+        (Method::POST, "/backup") => backup(&context, request).await,
         (Method::GET, "/") => json_response(
             StatusCode::OK,
             json!({
@@ -365,6 +364,31 @@ async fn handle_request(
             .to_string(),
         ),
         _ => error_response(StatusCode::NOT_FOUND, "Not found"),
+    }
+}
+
+async fn backup(context: &HostContext, request: Request<Incoming>) -> Response<Full<Bytes>> {
+    let body = match json_body(request).await {
+        Ok(body) => body,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+    };
+    let Some(path) = body.get("path").and_then(Value::as_str).filter(|path| {
+        !path.is_empty()
+            && path.len() <= MAX_BACKUP_PATH_BYTES
+            && !path.contains('\0')
+            && Path::new(path).file_name().is_some()
+    }) else {
+        return error_response(StatusCode::BAD_REQUEST, "A backup output path is required");
+    };
+    let Ok(destination) =
+        crate::cdp_raw::LeasedIdentity::literal(path, &context.broker.payload_budget())
+    else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "Payload budget exhausted");
+    };
+    drop(body);
+    match context.broker.backup(destination).await {
+        Ok(path) => budgeted_json(context, &json!({ "path": path })),
+        Err(message) => error_response(StatusCode::CONFLICT, &message),
     }
 }
 

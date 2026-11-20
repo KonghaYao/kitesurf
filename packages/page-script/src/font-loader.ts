@@ -22,6 +22,7 @@ import {
   upgradeFontFace,
   finishFontUpgrade,
 } from "./wasm-glue.js";
+import { FetchSlots } from "./fetch-slots.ts";
 import { NativePromise } from "./native-scheduling.ts";
 import { startupFontDefer, startupPixelFree, startupSystemFonts } from "./startup-probe.ts";
 
@@ -477,6 +478,8 @@ function computeFontWants(html?: string): {
 }
 
 const SYSTEM_FONT_ENDPOINT = "http://kitesurf-fonts/system";
+// The local helper processes one request at a time, and large faces share a read budget.
+const systemFontSlots = new FetchSlots(1, 1);
 const SYSTEM_FACE_CACHE_MAX = 64 * 1024 * 1024;
 const SYSTEM_FACE_MAX = 24 * 1024 * 1024;
 const systemFaceCache = new Map<string, Uint8Array>();
@@ -527,6 +530,29 @@ function parseDocumentLocale(html?: string): string {
   return (match?.[1] ?? match?.[2] ?? match?.[3] ?? "").trim().slice(0, 32);
 }
 
+async function fetchSystemFont<T>(
+  path: string,
+  label: string,
+  read: (response: Response) => Promise<T>,
+): Promise<T> {
+  await systemFontSlots.acquire(SYSTEM_FONT_ENDPOINT);
+  try {
+    let response: Response;
+    try {
+      response = await fetch(SYSTEM_FONT_ENDPOINT + path);
+    } catch (error) {
+      throw new Error(`[kitesurf-fonts] ${label} failed: ${String(error)}`);
+    }
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      throw new Error(`[kitesurf-fonts] ${label}: HTTP ${response.status}`);
+    }
+    return await read(response);
+  } finally {
+    systemFontSlots.release(SYSTEM_FONT_ENDPOINT);
+  }
+}
+
 async function systemMatch(
   family: string,
   options: {
@@ -545,16 +571,12 @@ async function systemMatch(
   if (options.script) params.set("script", options.script);
   if (options.locale) params.set("locale", options.locale);
   if (options.text) params.set("text", options.text.slice(0, 4096));
-  const label = `${family}/${options.script ?? ""}/${options.locale ?? ""}`;
-  let response: Response;
-  try {
-    response = await fetch(`${SYSTEM_FONT_ENDPOINT}/match?${params}`);
-  } catch (error) {
-    throw new Error(`[kitesurf-fonts] system match ${label} failed: ${String(error)}`);
-  }
-  if (!response.ok)
-    throw new Error(`[kitesurf-fonts] system match ${label}: HTTP ${response.status}`);
-  const body = (await response.json()) as SystemMatch;
+  const label = `system match ${family}/${options.script ?? ""}/${options.locale ?? ""}`;
+  const body = await fetchSystemFont(
+    `/match?${params}`,
+    label,
+    (response) => response.json() as Promise<SystemMatch>,
+  );
   return body && typeof body === "object" ? body : {};
 }
 
@@ -570,9 +592,10 @@ async function systemFetchFace(id: string): Promise<Uint8Array> {
   if (existing) return existing;
   const pending = (async () => {
     try {
-      const response = await fetch(`${SYSTEM_FONT_ENDPOINT}/face?id=${id}`);
-      if (!response.ok) throw new Error(`[kitesurf-fonts] system face: HTTP ${response.status}`);
-      const bytes = new Uint8Array(await response.arrayBuffer());
+      const buffer = await fetchSystemFont(`/face?id=${id}`, "system face", (response) =>
+        response.arrayBuffer(),
+      );
+      const bytes = new Uint8Array(buffer);
       if (bytes.byteLength === 0 || bytes.byteLength > SYSTEM_FACE_MAX)
         throw new Error("[kitesurf-fonts] system face size is not allowed");
       if (bytes.byteLength <= SYSTEM_FACE_CACHE_MAX) {
@@ -643,6 +666,14 @@ function warnSystemMissing(kind: string, match: SystemMatch): void {
   const message = `missing coverage: ${kind} reason=${reason} missing=${missing}`;
   noteSystemDiagnostic(message);
   console.warn(`[kitesurf-fonts] ${message}`);
+}
+
+function systemFallbackMatch(kind: string, match: SystemMatch) {
+  // A face that misses the representative sample can still render other characters.
+  const face = firstFace(match);
+  const covered = face !== null && match.covered === true;
+  if (!covered) warnSystemMissing(kind, match);
+  return { face, covered };
 }
 
 async function ensureSystemRole(
@@ -749,13 +780,11 @@ async function ensureSystemEmoji(): Promise<void> {
   if (systemEmojiPromise) return systemEmojiPromise;
   systemEmojiPromise = (async () => {
     const match = await systemMatch("emoji", { weight: 400, style: "normal", text: "\u{1F600}" });
-    const face = firstFace(match);
-    if (!face) {
-      warnSystemMissing("emoji", match);
-      return;
-    }
+    const { face, covered } = systemFallbackMatch("emoji", match);
+    if (!face) return;
     systemFamilies.emoji = face.family;
     await registerSystemFace(face, { emoji: true });
+    if (!covered) return;
     noteSystemDiagnostic(`system emoji family=${safeFamilyName(face.family)} bytes=${face.bytes}`);
     console.log(
       `[kitesurf-fonts] registered system emoji ${safeFamilyName(face.family)} (${face.bytes} bytes)`,
@@ -821,12 +850,13 @@ function ensureSystemCjkRequest(request: CjkRequest): Promise<void> {
         style: "normal",
         text: request.text,
       });
-      const face = firstFace(match);
-      if (!face) {
-        warnSystemMissing(`script=${request.script} locale=${request.locale || "-"}`, match);
-        return;
-      }
+      const { face, covered } = systemFallbackMatch(
+        `script=${request.script} locale=${request.locale || "-"}`,
+        match,
+      );
+      if (!face) return;
       await registerSystemFace(face, { scripts: ["Hani", "Hira", "Kana", "Hang"] });
+      if (!covered) return;
       noteSystemDiagnostic(
         `system CJK script=${request.script} locale=${request.locale || "-"} family=${safeFamilyName(face.family)} bytes=${face.bytes}`,
       );
@@ -875,12 +905,10 @@ async function ensureSystemScript(scriptFont: ScriptFont): Promise<void> {
       style: "normal",
       text: SCRIPT_SAMPLES[scriptFont.tag] ?? "",
     });
-    const face = firstFace(match);
-    if (!face) {
-      warnSystemMissing(`script=${scriptFont.tag}`, match);
-      return;
-    }
+    const { face, covered } = systemFallbackMatch(`script=${scriptFont.tag}`, match);
+    if (!face) return;
     await registerSystemFace(face, { scripts: [scriptFont.tag] });
+    if (!covered) return;
     noteSystemDiagnostic(
       `system script=${scriptFont.tag} family=${safeFamilyName(face.family)} bytes=${face.bytes}`,
     );

@@ -291,8 +291,12 @@ test(
       stub,
       `#!/usr/bin/env node
 const { readFileSync, readSync, writeSync } = require("node:fs");
+const { dirname, join } = require("node:path");
 const font = readFileSync(process.env.KS_TEST_FONT);
+const monoFont = readFileSync(join(dirname(process.env.KS_TEST_FONT), "NotoSansMono.ttf"));
 const sans = { id: "a".repeat(32), family: "Stub Sans", weight: 400, style: "normal", width: 1, covered: true, missing: 0, bytes: font.length };
+const mono = { ...sans, id: "b".repeat(32), family: "Stub Mono", bytes: monoFont.length };
+const delay = new Int32Array(new SharedArrayBuffer(4));
 const read = () => {
   const length = Buffer.alloc(4);
   if (readSync(0, length) !== 4) return null;
@@ -318,10 +322,22 @@ for (;;) {
     write({ ok: true, probe: { sans: process.env.KS_STUB_NO_SANS !== "1", serif: true, mono: true, system_ui: true, emoji: false, families: 1 } });
   } else if (request.op === "match" && request.family === "sans") {
     write({ ok: true, match: { faces: [sans], covered: true, missing: 0 } });
+  } else if (request.op === "match" && request.family === "system-ui") {
+    write({ ok: false, code: "no_usable_face" });
   } else if (request.op === "match") {
-    write({ ok: true, match: { faces: [], covered: false, missing: 1, reason: "missing_coverage" } });
+    // Keep the helper busy while the page sends its optional font requests.
+    Atomics.wait(delay, 0, 0, 100);
+    if (request.family === "mono") {
+      write({ ok: true, match: { faces: [mono], covered: true, missing: 0 } });
+      continue;
+    }
+    const faces = request.family === "emoji" || ["Hani", "Arab"].includes(request.script)
+      ? [{ ...sans, covered: false, missing: 1 }]
+      : [];
+    write({ ok: true, match: { faces, covered: false, missing: 1, reason: "missing_coverage" } });
   } else if (request.op === "face") {
-    write({ ok: true, id: request.id, bytes: font.length }, font);
+    const bytes = request.id === mono.id ? monoFont : font;
+    write({ ok: true, id: request.id, bytes: bytes.length }, bytes);
   } else if (request.op === "stats") {
     write({ ok: true, stats: { faces: 1, cached_faces: 1, cached_bytes: font.length, matches: 1, served: 1, cache_hits: 1, cache_misses: 0, limited_emoji: 0, rejected: 0 } });
   } else {
@@ -333,7 +349,8 @@ for (;;) {
     chmodSync(stub, 0o755);
     const server = await fixture(`<!doctype html><html lang="zh-CN"><body>
       <script>window.boot = true;</script>
-      <p style="font-family:sans-serif">中文 مرحبا 😀</p>
+      <p style="font-family:sans-serif">中文 مرحبا שלום 😀</p>
+      <p style="font-family:serif">serif</p><pre>mono</pre>
     </body></html>`);
     process.env.KS_TEST_FONT = notoSans;
     let browser;
@@ -356,18 +373,28 @@ for (;;) {
     });
     cdp = await connect(browser.port);
     const page = await openPage(cdp, `${server.url}/stub`);
-    await until(
-      () =>
-        diagnostics(cdp, page.targetId).then(
-          (lines) =>
-            lines.some((line) => line.includes("missing coverage: script=Hani")) &&
-            lines.some((line) => line.includes("missing coverage: script=Arab")) &&
-            lines.some((line) => line.includes("missing coverage: emoji")),
-        ),
-      "missing coverage diagnostics",
-    );
+    const expectations = [
+      ["system CJK script=Hani", "script=Hani locale=zh-CN"],
+      ["system script=Arab", "script=Arab"],
+      ["system script=Hebr", "script=Hebr"],
+      ["system emoji", "emoji"],
+    ].map(([success, kind]) => ({
+      success,
+      missing: `missing coverage: ${kind} reason=missing_coverage missing=1`,
+    }));
+    const found = await diagnostics(cdp, page.targetId);
+    for (const { success, missing } of expectations) {
+      assert.ok(found.includes(missing), `expected ${missing}, got ${found.join("; ")}`);
+      assert.ok(
+        found.every((line) => !line.startsWith(success)),
+        `unexpected ${success} success`,
+      );
+    }
+    const serifMissing = "missing coverage: serif reason=missing_coverage missing=1";
+    assert.ok(found.includes(serifMissing), `expected ${serifMissing}, got ${found.join("; ")}`);
     const names = await familyNames(cdp, page.sessionId);
     assert.ok(names.includes("Stub Sans"), `stub sans face must register, got ${names}`);
+    assert.ok(names.includes("Stub Mono"), `stub mono face must register, got ${names}`);
     await cdp.send("Browser.close");
     await browser.done;
     cdp = undefined;

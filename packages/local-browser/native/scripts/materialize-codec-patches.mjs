@@ -5,7 +5,16 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,7 +32,8 @@ mkdirSync(out, { recursive: true });
 // 只消费已有 registry archive；缺失时由 Cargo/Bazel 获取固定版本，不访问其他源码。
 for (const crate of manifest.crates) {
   const key = `${crate.name}-${crate.version}`;
-  const archive = readdirSync(cache).map((registry) => join(cache, registry, `${key}.crate`))
+  const archive = readdirSync(cache)
+    .map((registry) => join(cache, registry, `${key}.crate`))
     .find((candidate) => existsSync(candidate));
   if (!archive) throw new Error(`missing registry archive: ${key}`);
   if (createHash("sha256").update(readFileSync(archive)).digest("hex") !== crate.sha256) {

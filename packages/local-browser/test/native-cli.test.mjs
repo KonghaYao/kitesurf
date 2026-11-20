@@ -11,7 +11,7 @@ import { once } from "node:events";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -20,6 +20,7 @@ import { readEvents, required, startNativeHost } from "./host-adapter.mjs";
 const nativeHost = required("KITESURF_NATIVE_HOST");
 process.env.KITESURF_NATIVE_HOST = nativeHost;
 const scenario = process.env.KITESURF_CLI_SCENARIO;
+const expectedVersion = "0.5.1";
 
 function spawnCli(args, timeout = 60_000) {
   const child = spawn(nativeHost, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -156,7 +157,7 @@ function hermeticTests() {
 
     const version = await runCli(["--version"]);
     assert.equal(version.code, 0);
-    assert.equal(version.stdout, "kitesurf 0.5.0\n");
+    assert.equal(version.stdout, `kitesurf ${expectedVersion}\n`);
     assert.equal(version.stderr, "");
 
     const controlHelp = await runCli(["control", "--help"]);
@@ -166,7 +167,7 @@ function hermeticTests() {
 
     const controlVersion = await runCli(["control", "--version"]);
     assert.equal(controlVersion.code, 0);
-    assert.equal(controlVersion.stdout, "kitesurf 0.5.0\n");
+    assert.equal(controlVersion.stdout, `kitesurf ${expectedVersion}\n`);
     assert.equal(controlVersion.stderr, "");
   });
 
@@ -182,9 +183,9 @@ function hermeticTests() {
       const topLevelHelp = await runCli(["--help"]);
       assert.equal(topLevelHelp.code, 0);
       const help = topLevelHelp.stdout;
-      assert.match(help, /^Kitesurf native local host 0\.5\.0\n/);
+      assert.ok(help.startsWith(`Kitesurf native local host ${expectedVersion}\n`));
       assert.match(help, /kitesurf-native control --owner NAME \[--takeover\] \[--port 8787\]\n/);
-      const version = "kitesurf 0.5.0\n";
+      const versionLine = `kitesurf ${expectedVersion}\n`;
       const cases = [
         ["--owner", "--help", "--port", port],
         ["--owner", "--version", "--port", port],
@@ -195,7 +196,7 @@ function hermeticTests() {
         ["--owner", "alice", "--version", "--help"],
       ];
       for (const args of cases) {
-        const expected = args.includes("--version") ? version : help;
+        const expected = args.includes("--version") ? versionLine : help;
         const result = await runCli(["control", ...args]);
         const observed = fixture.seen.map(({ method, url, body }) => ({ method, url, body }));
         assert.equal(result.killed, false);
@@ -206,6 +207,40 @@ function hermeticTests() {
       assert.equal(fixture.seen.length, 0, "help/version must not reach the host");
     },
   );
+
+  test("management commands send the expected loopback requests", async (t) => {
+    const fixture = await listen(t, (record) => {
+      record.response.writeHead(200, { "content-type": "application/json" });
+      record.response.end(JSON.stringify({ route: record.url }));
+    });
+    const destination = join("account snapshots", "用户.sqlite");
+    const cases = [
+      { args: ["status"], method: "GET", route: "/session" },
+      { args: ["flush"], method: "POST", route: "/flush" },
+      { args: ["stop"], method: "POST", route: "/close" },
+      { args: ["backup", "--output", destination], method: "POST", route: "/backup" },
+    ];
+    for (const { args, route } of cases) {
+      const result = await runCli([...args, "--port", String(fixture.port)]);
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(result.stderr, "");
+      assert.equal(result.stdout, `${JSON.stringify({ route })}\n`);
+    }
+    assert.deepEqual(
+      fixture.seen.map(({ method, url }) => ({ method, route: url })),
+      cases.map(({ method, route }) => ({ method, route })),
+    );
+    for (const record of fixture.seen) {
+      assert.equal(record.headers.host, `127.0.0.1:${fixture.port}`);
+    }
+    assert.deepEqual(
+      fixture.seen.slice(0, 3).map(({ body }) => body),
+      ["", "", ""],
+    );
+    const backup = fixture.seen[3];
+    assert.match(backup.headers["content-type"], /^application\/json/);
+    assert.deepEqual(JSON.parse(backup.body), { path: resolve(destination) });
+  });
 
   test("control sends one POST with takeover false by default", { timeout: 30_000 }, async (t) => {
     const response = { controller: "alice", controlEpoch: 2 };
@@ -276,6 +311,7 @@ function hermeticTests() {
       throw new Error("invalid arguments must not reach the host");
     });
     const cases = [
+      [["backup", "--port", String(fixture.port)], "kitesurf: backup requires --output FILE\n"],
       [["control"], "kitesurf: control requires --owner NAME\n"],
       [["control", "--port", String(fixture.port)], "kitesurf: control requires --owner NAME\n"],
       [["control", "--owner"], "kitesurf: --owner requires a value\n"],

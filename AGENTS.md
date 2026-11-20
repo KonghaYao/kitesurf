@@ -46,8 +46,9 @@ A pnpm monorepo. One line per package; read the code for details.
   `packages/engine/public/rbi/`. The scene protocol is documented in `packages/engine/src/rbi.ts`.
 - `packages/kitesurf-cli/`: the complete Rust terminal client, including Browser Run and OAuth
   through public APIs, with its own Cargo workspace and lockfile.
-- `packages/local-browser/`: local Node/workerd host, SQLite profile, CDP connection ownership
-  and single-executable packaging. The local engine entry is `engine/src/local/index.ts`.
+- `packages/local-browser/`: local Rust/workerd host, SQLite profile, CDP connection ownership
+  and single-executable packaging. The Node host supplies the compatibility baseline in tests.
+  The local engine entry is `engine/src/local/index.ts`.
 - `packages/engine/test/fixtures-worker/`: the fixtures Worker that serves `/__fixtures/*` in dev
   and tests only.
 - `scripts/`: development and CI tooling, including the WPT runners, the lint rules and the

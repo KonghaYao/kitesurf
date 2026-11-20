@@ -9,10 +9,12 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -20,7 +22,7 @@ import {
 import { createServer, request as httpRequest } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { PNG } from "pngjs";
 
@@ -43,7 +45,7 @@ const assetsManifest = join(configDir, "assets-manifest.json");
 process.env.KITESURF_NATIVE_HOST = nativeHost;
 
 function config(name) {
-  return join(configDir, name);
+  return resolve(configDir, name);
 }
 
 async function hostFor(
@@ -361,9 +363,7 @@ test(
     assert.ok(flushed.body.saves >= 1);
     const save = await waitFor(
       () =>
-        events(host, "profile").find(
-          (event) => event.operation === "save" && event.status === 200,
-        ),
+        events(host, "profile").find((event) => event.operation === "save" && event.status === 200),
       "the profile save",
     );
     assert.equal(save.operation, "save");
@@ -375,41 +375,101 @@ test(
   },
 );
 
+function gcFixtureConfig(t, retirementTimes) {
+  const directory = mkdtempSync(join(tmpdir(), "ks-native-gc-"));
+  const modules = join(directory, "modules");
+  mkdirSync(modules);
+  for (const file of readdirSync(join(configDir, "modules"))) {
+    if (file === "__ks_gc_wrapper.js") continue;
+    copyFileSync(join(configDir, "modules", file), join(modules, file));
+  }
+  for (const file of ["local-gc.capnp", "modules-gc.capnp"]) {
+    copyFileSync(config(file), join(directory, file));
+  }
+  // The engine reads gc and then the clock synchronously. Only that clock read is fixed.
+  // The wrapper calls the workerd V8 gc and reports the result after it returns.
+  writeFileSync(
+    join(modules, "__ks_gc_wrapper.js"),
+    `import worker from "./index.js";
+export * from "./index.js";
+const get = Reflect.get;
+const now = Date.now;
+const retirementTimes = ${JSON.stringify([null, null, ...retirementTimes])};
+let attempt = 0;
+Reflect.get = function (target, key, ...args) {
+  const gc = get(target, key, ...args);
+  if (target !== globalThis || key !== "gc" || typeof gc !== "function") return gc;
+  const fixedAt = retirementTimes[attempt++];
+  if (fixedAt != null) {
+    const fixtureNow = () => {
+      Date.now = now;
+      return fixedAt;
+    };
+    Date.now = fixtureNow;
+    queueMicrotask(() => {
+      if (Date.now === fixtureNow) Date.now = now;
+    });
+  }
+  return function (...args) {
+    const start = now();
+    const at = fixedAt ?? start;
+    const result = Reflect.apply(gc, this, args);
+    console.log("[ks-gc] " + JSON.stringify({ at, done: at + Math.max(0, now() - start) }));
+    return result;
+  };
+};
+export default worker;
+`,
+  );
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  return join(directory, "local-gc.capnp");
+}
+
 test(
   "retired isolates are collected through the real gc, at most once a second",
   { timeout: 180_000 },
   async (t) => {
-    const host = await hostFor(t, { capnp: "local-gc.capnp" });
+    const start = Date.now() + 24 * 60 * 60 * 1_000;
+    const retirementTimes = [start, start + 999, start + 1_000];
+    const host = await hostFor(t, { capnp: gcFixtureConfig(t, retirementTimes) });
     const site = await fixture(t);
     const cdp = await connect(host.port);
     t.after(() => cdp.disconnect());
     const page = await open(cdp, `${site.url}/a`);
+    assert.equal(await evaluate(cdp, page.sessionId, "typeof globalThis.gc"), "undefined");
     const collected = () => events(host, "gc");
     assert.equal(collected().length, 0);
-    // 导航会退役旧的 PageScript isolate；引擎随后立即回收。
     await navigate(cdp, page.sessionId, `${site.url}/b`);
-    const first = await waitFor(() => collected()[0], "the first retire collection");
-    assert.ok(first.done >= first.at);
-    // 一秒窗口内的第二次退役不会再次回收。
+    const first = await waitFor(() => collected()[0], "the first real-clock collection");
+    await waitFor(() => Date.now() >= first.at + 1_000, "the next real-clock window");
     await navigate(cdp, page.sessionId, `${site.url}/c`);
-    await delay(400);
-    assert.equal(collected().length, 1, "a second retire inside the window is throttled");
-    await delay(1_200);
-    assert.deepEqual(await evaluate(cdp, page.sessionId, WORKER_CYCLE), {
-      echo: "ping",
-      isScope: true,
-    });
-    await waitFor(() => collected().length >= 2, "the post-window retire collection");
-    const stamps = collected().map((event) => event.at);
-    for (let index = 1; index < stamps.length; index++) {
-      assert.ok(
-        stamps[index] - stamps[index - 1] >= 950,
-        `gc gap ${stamps[index] - stamps[index - 1]}`,
-      );
+    const second = await waitFor(() => collected()[1], "the next real-clock collection");
+    assert.ok(second.at - first.at >= 1_000, `real gc gap ${second.at - first.at}`);
+
+    const targets = [];
+    for (const at of retirementTimes) {
+      const target = await open(cdp);
+      await setContent(cdp, target.sessionId, `<p>${at}</p>`);
+      targets.push(target.targetId);
     }
-    for (const event of collected()) assert.ok(event.done >= event.at);
-    const stats = await cdp.send("Kitesurf.getMemoryStats", {}, page.sessionId);
-    assert.ok(stats.isolatesKilled >= 3, `isolatesKilled ${stats.isolatesKilled}`);
+    assert.deepEqual(collected(), [first, second]);
+    const before = await cdp.send("Kitesurf.getMemoryStats");
+    assert.ok(before.isolatesKilled >= 2, "navigation retires its spare isolates");
+    for (const targetId of targets) {
+      assert.deepEqual(await cdp.send("Target.closeTarget", { targetId }), { success: true });
+    }
+    const result = await waitFor(() => {
+      const observed = collected();
+      return observed.length >= 4 ? observed : null;
+    }, "collections at the start and end of the throttle window");
+    assert.deepEqual(
+      result.map(({ at }) => at),
+      [first.at, second.at, retirementTimes[0], retirementTimes[2]],
+    );
+    for (const event of result) assert.ok(event.done >= event.at);
+    const after = await cdp.send("Kitesurf.getMemoryStats");
+    assert.equal(after.isolatesKilled - before.isolatesKilled, targets.length);
+    assert.deepEqual(collected(), result);
   },
 );
 

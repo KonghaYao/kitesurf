@@ -595,6 +595,26 @@ fn check_budget(budget: &PayloadBudget) {
     assert!(heap.peak <= high.0 + high.1);
 }
 
+const PRESSURE_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+const PRESSURE_CLIENT_DEADLINE: Duration = Duration::from_secs(2);
+
+async fn loopback_with_backpressure() -> (TcpStream, TcpStream) {
+    use tokio::net::TcpSocket;
+
+    // Limit both ends before the handshake. Loopback autotuning can otherwise buffer
+    // the entire 8 MiB reply on some kernels even while the peer is not reading.
+    const BUFFER_BYTES: u32 = 256 * 1024;
+    let listener = TcpSocket::new_v4().unwrap();
+    listener.set_send_buffer_size(BUFFER_BYTES).unwrap();
+    listener.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = listener.listen(1).unwrap();
+    let peer = TcpSocket::new_v4().unwrap();
+    peer.set_recv_buffer_size(BUFFER_BYTES).unwrap();
+    let peer = peer.connect(listener.local_addr().unwrap()).await.unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    (stream, peer)
+}
+
 struct PressureSocket {
     socket: crate::transport::BudgetedSocket<TcpStream>,
     peer: TcpStream,
@@ -602,11 +622,7 @@ struct PressureSocket {
 
 impl PressureSocket {
     async fn new(budget: &PayloadBudget) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let peer = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (stream, _) = listener.accept().await.unwrap();
+        let (stream, peer) = loopback_with_backpressure().await;
         let codec = budget
             .try_acquire(crate::transport::CODEC_BYTES, true)
             .unwrap();
@@ -672,6 +688,12 @@ impl PressureSocket {
         let ClientCommand::Text(text, lease) = command else {
             panic!("text output required")
         };
+        assert!(
+            text.len() >= PRESSURE_PAYLOAD_BYTES,
+            "fixture expected a full reply, got {} bytes: {:?}",
+            text.len(),
+            text.get(..text.len().min(160))
+        );
         let bytes = text.capacity();
         std::pin::Pin::new(&mut self.socket)
             .start_send(crate::transport::LeasedMessage {
@@ -759,11 +781,7 @@ struct HttpStall {
 impl HttpStall {
     async fn start(bytes: bytes::Bytes) -> Self {
         use tokio::io::AsyncWriteExt;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (stream, _) = listener.accept().await.unwrap();
+        let (stream, mut peer) = loopback_with_backpressure().await;
         let blocked = Arc::new(Notify::new());
         let io = HttpIo {
             stream,
@@ -854,7 +872,7 @@ async fn combined_window(branch: Branch, padding: &str, path: std::path::PathBuf
         upstream,
         profile.clone(),
         observer,
-        Duration::from_millis(100),
+        PRESSURE_CLIENT_DEADLINE,
         Duration::from_secs(30),
     );
     let budget = broker.payload_budget();
@@ -885,7 +903,16 @@ async fn combined_window(branch: Branch, padding: &str, path: std::path::PathBuf
     )
     .await;
     let unknown = next_request(&mut engine).await;
-    assert!(message(&next_frame(&mut viewer).await).contains("outcome may be unknown"));
+    // Keep the withheld reply long enough to expire; large real replies need their full deadline.
+    let expired = match timeout(PRESSURE_CLIENT_DEADLINE + WAIT, viewer.frames.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        ClientCommand::Text(text, _lease) => serde_json::from_str(&text).unwrap(),
+        _ => panic!("the unanswered request must return a timeout reply"),
+    };
+    assert!(message(&expired).contains("outcome may be unknown"));
     assert_eq!(broker.budget_snapshot().await.2, 1);
     allocations::phase(allocations::PHASE_SLOW);
     output_reply(&mut engine, &broker, &slow, 2, padding).await;
@@ -1138,7 +1165,7 @@ fn actor_cancel_keeps_unknown_until_late_reply() {
 }
 
 fn run_combined(branch: Branch) {
-    let padding = "x".repeat(8 * 1024 * 1024);
+    let padding = "x".repeat(PRESSURE_PAYLOAD_BYTES);
     let path = std::path::PathBuf::from("/状态/".repeat(8192));
     let id = "synthetic".repeat(8192);
     allocations::reset();
@@ -1264,7 +1291,7 @@ async fn flush_window(cancel: bool) {
         upstream,
         profile.clone(),
         observer,
-        Duration::from_secs(2),
+        PRESSURE_CLIENT_DEADLINE,
         Duration::from_secs(30),
     );
     let budget = broker.payload_budget();
@@ -1273,7 +1300,7 @@ async fn flush_window(cancel: bool) {
     socket.partial().await;
     let padding = {
         let _fixture = allocations::Scope::suspend();
-        "f".repeat(8 * 1024 * 1024)
+        "f".repeat(PRESSURE_PAYLOAD_BYTES)
     };
     output_reply(&mut engine, &broker, &slow, 20, &padding).await;
     socket.hold_output(&mut slow).await;

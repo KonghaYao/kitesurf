@@ -147,7 +147,7 @@ test("a Rust COMMIT survives SIGKILL and Node retries it byte for byte", async (
 test("Node COMMIT then a killed Rust writer reopens and retries", async (t) => {
   const { path } = fixture(t);
   const first = { cookies: [], localStorage: [], x: SAMPLE };
-  const firstOracle = validateState(first);
+  validateState(first);
   const second = { cookies: [], localStorage: [], x: -SAMPLE };
   const secondOracle = validateState(second);
 

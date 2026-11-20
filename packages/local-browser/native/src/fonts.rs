@@ -299,10 +299,11 @@ impl FontService {
             .spawn(move || run_worker(factory, receiver, ready))
             .map_err(|error| format!("cannot start the system font worker: {error}"))?;
         match tokio::time::timeout(limits.startup, ready_rx).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(()))) | Ok(Err(_)) => {
-                let _ = worker.join();
-                return Err(STARTUP_FAILURE.into());
+            Ok(result) => {
+                if let Err(message) = result.unwrap_or(Err(STARTUP_FAILURE)) {
+                    let _ = worker.join();
+                    return Err(message.into());
+                }
             }
             // 平台调用不可中断；超时后线程可能仍在运行，但启动已失败而不是成功。
             Err(_) => return Err(STARTUP_FAILURE.into()),
@@ -574,14 +575,11 @@ impl AsyncWrite for FontStream {
 fn run_worker(
     factory: Box<dyn FnOnce() -> Box<dyn FontBackend> + Send>,
     mut commands: mpsc::Receiver<FontCommand>,
-    ready: oneshot::Sender<Result<(), ()>>,
+    ready: oneshot::Sender<Result<(), &'static str>>,
 ) {
     let mut backend = factory();
-    if validate_startup(&mut *backend).is_err() {
-        let _ = ready.send(Err(()));
-        return;
-    }
-    if ready.send(Ok(())).is_err() {
+    let readiness = validate_startup(&mut *backend);
+    if ready.send(readiness).is_err() || readiness.is_err() {
         return;
     }
     while let Some(command) = commands.blocking_recv() {
@@ -604,7 +602,7 @@ fn run_worker(
     }
 }
 
-fn validate_startup(backend: &mut dyn FontBackend) -> Result<(), ()> {
+fn validate_startup(backend: &mut dyn FontBackend) -> Result<(), &'static str> {
     let request = MatchRequest {
         family: Some("sans-serif".to_string()),
         text: Some(STARTUP_SAMPLE.to_string()),
@@ -612,17 +610,23 @@ fn validate_startup(backend: &mut dyn FontBackend) -> Result<(), ()> {
         style: Some("normal".to_string()),
         ..MatchRequest::default()
     };
-    let response = backend.match_faces(&request).map_err(|_| ())?;
+    let response = backend.match_faces(&request).map_err(|error| {
+        if error.code == ErrorCode::EntropyUnavailable {
+            error.message
+        } else {
+            STARTUP_FAILURE
+        }
+    })?;
     if !response.covered {
-        return Err(());
+        return Err(STARTUP_FAILURE);
     }
-    let face: &FaceSummary = response.faces.first().ok_or(())?;
+    let face: &FaceSummary = response.faces.first().ok_or(STARTUP_FAILURE)?;
     if face.bytes == 0 || face.bytes > MAX_FACE_BYTES {
-        return Err(());
+        return Err(STARTUP_FAILURE);
     }
-    let bytes = backend.face_bytes(&face.id).map_err(|_| ())?;
+    let bytes = backend.face_bytes(&face.id).map_err(|_| STARTUP_FAILURE)?;
     if bytes.is_empty() || bytes.len() > MAX_FACE_BYTES {
-        return Err(());
+        return Err(STARTUP_FAILURE);
     }
     Ok(())
 }
@@ -1281,10 +1285,13 @@ mod tests {
         }
     }
 
-    struct MissingBackend;
+    struct MissingBackend(Option<HostError>);
 
     impl FontBackend for MissingBackend {
         fn match_faces(&mut self, _request: &MatchRequest) -> Result<MatchResponse, HostError> {
+            if let Some(error) = &self.0 {
+                return Err(error.clone());
+            }
             Ok(MatchResponse {
                 faces: Vec::new(),
                 covered: false,
@@ -1903,7 +1910,7 @@ mod tests {
     async fn startup_failure_is_fixed_and_leaves_no_socket() {
         let missing = FontService::start_with(
             tempfile::tempdir().expect("dir").path(),
-            Box::new(|| -> Box<dyn FontBackend> { Box::new(MissingBackend) }),
+            Box::new(|| -> Box<dyn FontBackend> { Box::new(MissingBackend(None)) }),
             limits(1, Duration::from_secs(1)),
         )
         .await;
@@ -1924,6 +1931,28 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.to_string(), STARTUP_FAILURE);
+        assert!(!directory.path().join("fonts.sock").exists());
+    }
+
+    #[tokio::test]
+    async fn startup_reports_unavailable_entropy_without_binding_a_socket() {
+        let directory = tempfile::tempdir().expect("dir");
+        let result = FontService::start_with(
+            directory.path(),
+            Box::new(|| -> Box<dyn FontBackend> {
+                Box::new(MissingBackend(Some(HostError::new(
+                    ErrorCode::EntropyUnavailable,
+                    "system entropy is unavailable",
+                ))))
+            }),
+            limits(1, Duration::from_secs(1)),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("unavailable entropy must fail startup"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "system entropy is unavailable");
         assert!(!directory.path().join("fonts.sock").exists());
     }
 

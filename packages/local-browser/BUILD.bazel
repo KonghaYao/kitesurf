@@ -26,11 +26,35 @@ node_test(
 )
 
 node_test(
+    name = "native_soak_test",
+    size = "enormous",
+    timeout = "eternal",
+    tags = ["manual"],
+    args = ["test/soak.test.mjs"],
+    data = [
+        ":node_modules/ws",
+        "//packages/local-browser/native:kitesurf",
+        "test/helpers.mjs",
+        "test/host-adapter.mjs",
+        "test/soak.test.mjs",
+    ],
+    env = {
+        "KITESURF_TEST_BINARY": "$(rootpath //packages/local-browser/native:kitesurf)",
+    },
+)
+
+node_test(
     name = "binary_test",
     size = "large",
     timeout = "long",
+    tags = ["manual"],
     args = ["test/binary.test.mjs"],
-    data = [":runtime", "//:node_modules/pngjs"] + glob(["test/*.mjs"]),
+    data = [
+        ":node_modules/ws",
+        "//:node_modules/pngjs",
+        "test/binary.test.mjs",
+        "test/helpers.mjs",
+    ],
 )
 
 node_test(
@@ -335,32 +359,25 @@ copy_file(
 )
 
 js_binary(
-    name = "package_from_dist",
-    node_options = ["--expose-gc"],
-    entry_point = "build.mjs",
-    data = [
-        ":runtime",
-        ":node_modules/postject",
-        "README.md",
-        "//:release_licenses",
-        "//packages/local-browser/font-host:kitesurf-font-host",
-    ] + glob(["src/*.cjs"]),
-    patch_node_fs = False,
-)
-
-js_binary(
     name = "package",
-    node_options = ["--expose-gc"],
-    entry_point = "build.mjs",
+    args = [
+        "$(rootpath //packages/local-browser/native:kitesurf)",
+        "$(rootpath //packages/local-browser/native:workerd_bin)",
+        "$(rootpath //packages/local-browser/native:release_config)",
+        "$(rootpath //packages/local-browser/native:release_assets)",
+        "$(rootpath //packages/local-browser/native:runtime_bundle)",
+    ],
     data = [
-        ":runtime",
-        ":node_modules/postject",
-        "README.md",
         "//:release_licenses",
-        "//packages/engine:local_dist",
-        "//packages/engine:assets",
-        "//packages/local-browser/font-host:kitesurf-font-host",
-    ] + glob(["src/*.cjs"]),
+        "//packages/local-browser/native:kitesurf",
+        "//packages/local-browser/native:release_assets",
+        "//packages/local-browser/native:release_config",
+        "//packages/local-browser/native:runtime_bundle",
+        "//packages/local-browser/native:workerd_bin",
+        "README.md",
+        "package.json",
+    ],
+    entry_point = "build.mjs",
     patch_node_fs = False,
 )
 

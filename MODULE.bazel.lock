@@ -1176,8 +1176,8 @@
           "FILE:@@//packages/kitesurf-cli/Cargo.toml 0930d028d1037963e6f884602147b260beefc9ffda4d4653e19f7311e9c07298",
           "FILE:@@//packages/local-browser/font-host/Cargo.lock 338e2e76e7fe6c73f16bca9baa7ca7c4d81056dd4f041c24f4f2339b66b3a5ed",
           "FILE:@@//packages/local-browser/font-host/Cargo.toml 2b80f902e9be9a24a361bc3e10fd636465ede06b7c721a5294a5975a9aa3fd74",
-          "FILE:@@+cargo_workspaces+cargo_ws_native//Cargo.lock d8d0a5b3010070e0bd29bdddd436dd312381e585532e4050a44c402dcb2c5d4d",
-          "FILE:@@+cargo_workspaces+cargo_ws_native//Cargo.toml b18259bc54a8df3b83cdc0c12228211eded6863196cd04c65570a8563cbc6442",
+          "FILE:@@+cargo_workspaces+cargo_ws_native//Cargo.lock 7a77742f91776ba10344449aab96ab81d05caf1cd5757f657d5f98b5efabdf90",
+          "FILE:@@+cargo_workspaces+cargo_ws_native//Cargo.toml 08cf484c65a338bf88fbdb3bfe4d9ac487622211f523772a4db6dd07fff81884",
           "FILE:@@+cargo_workspaces+cargo_ws_native//patched.json 61a507e5cf7e10c406826cc0df85bfdc1fe2258a145a086c5297e51ea4c4c392",
           "FILE:@@//scripts/lint/rust-check/Cargo.lock 4d560f072c7029a0f8b10ec52facb832f95b6339d3763411549b6ad7d3f05829",
           "FILE:@@//scripts/lint/rust-check/Cargo.toml 953bbd47cd83b590c5d4f3b9203f9057d2c30ba810bface4c41f59d5381d8e5e"
