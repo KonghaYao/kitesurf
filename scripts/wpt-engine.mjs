@@ -6,7 +6,8 @@
 
 import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -66,13 +67,25 @@ export async function prepare(dist = DEFAULT_DIST, config = resolve(ENGINE_DIR, 
     dirname(wranglerPackage),
     JSON.parse(readFileSync(wranglerPackage, "utf8")).bin.wrangler,
   );
+  // Wrangler writes debug logs and probes its global config dir under HOME,
+  // which Bazel sandboxes do not allow; give it a writable temporary HOME.
+  const wranglerHome = resolve(tmpdir(), "wrangler-home");
+  mkdirSync(resolve(wranglerHome, ".config"), { recursive: true });
+  mkdirSync(resolve(wranglerHome, "Library", "Preferences"), { recursive: true });
+  const logDir = resolve(wranglerHome, "logs");
+  mkdirSync(logDir, { recursive: true });
   execFileSync(
     process.execPath,
     [wrangler, "deploy", "--dry-run", "--config", config, "--outdir", dist],
     {
       cwd: dirname(config),
       stdio: ["ignore", "inherit", "inherit"],
-      env: { ...process.env, WRANGLER_SEND_METRICS: "false" },
+      env: {
+        ...process.env,
+        HOME: wranglerHome,
+        WRANGLER_SEND_METRICS: "false",
+        WRANGLER_LOG_PATH: logDir,
+      },
     },
   );
   rmSync(resolve(dist, "README.md"), { force: true });
