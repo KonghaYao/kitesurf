@@ -120,7 +120,7 @@ test("collectAssets hashes nested files and records their served paths", (t) => 
   assert.equal(top.sha256, createHash("sha256").update("hello").digest("hex"));
 });
 
-test("emitConfig selects the public or private network and keeps bindings explicit", () => {
+test("emitConfig selects the network scope, system roots and explicit bindings", () => {
   const options = {
     compatibilityDate: "2026-09-11",
     compatibilityFlags: ["nodejs_compat"],
@@ -135,7 +135,11 @@ test("emitConfig selects the public or private network and keeps bindings explic
     privateNetwork: false,
   });
   assert.ok(publicConfig.includes('using M = import "modules.capnp";'));
-  assert.ok(publicConfig.includes('(name = "internet", network = (allow = ["public"]))'));
+  assert.ok(
+    publicConfig.includes(
+      '(name = "internet", network = (allow = ["public"], tlsOptions = (trustBrowserCas = true)))',
+    ),
+  );
   assert.ok(!publicConfig.includes("KITESURF_ALLOW_PRIVATE_NETWORK"));
   assert.ok(publicConfig.includes('(name = "LOADER", workerLoader = ())'));
   assert.ok(publicConfig.includes('(name = "LOCAL_PROFILE", service = "profile")'));
@@ -150,7 +154,7 @@ test("emitConfig selects the public or private network and keeps bindings explic
   });
   assert.ok(
     privateConfig.includes(
-      '(name = "internet", network = (allow = ["public", "private", "local"]))',
+      '(name = "internet", network = (allow = ["public", "private", "local"], tlsOptions = (trustBrowserCas = true)))',
     ),
   );
   assert.ok(privateConfig.includes('(name = "KITESURF_ALLOW_PRIVATE_NETWORK", text = "1")'));
@@ -212,6 +216,7 @@ test("generate writes modules, manifests and three configs, replacing stale outp
   for (const name of ["local-public.capnp", "local-private.capnp", "local-gc.capnp"]) {
     const config = readFileSync(join(out, name), "utf8");
     assert.match(config, /KITESURF_SYSTEM_FONTS", text = "1"/, `${name} selects system fonts`);
+    assert.match(config, /tlsOptions = \(trustBrowserCas = true\)/, `${name} trusts system roots`);
     assert.match(config, /\(name = "LOCAL_FONTS", service = "fonts"\)/, name);
     assert.match(config, /\(name = "fonts", external = \(http = \(\)\)\)/, name);
   }

@@ -82,7 +82,8 @@ multi-tenant authorization service. The control endpoint binds to loopback and c
 
 Internet access uses the existing Kitesurf network stack. Page access to loopback/private
 networks is blocked by default; enable it intentionally with `--allow-private-network` for local
-sites. Existing cookie and origin policies remain in effect.
+sites. Existing cookie and origin policies remain in effect. Outbound requests go directly: the
+bundled workerd does not read the system proxy configuration.
 
 ## Build and release
 

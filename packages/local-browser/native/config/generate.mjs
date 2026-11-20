@@ -163,6 +163,8 @@ export function emitConfig(options) {
   ];
   if (privateNetwork) bindings.push(`      (name = "KITESURF_ALLOW_PRIVATE_NETWORK", text = "1"),`);
   const flags = compatibilityFlags.map((flag) => capnpString(flag)).join(", ");
+  // A network service without tlsOptions has no TLS client, so every HTTPS fetch fails with a
+  // workerd internal error. Trust the system roots, as a browser does.
   return [
     'using Workerd = import "/workerd/workerd.capnp";',
     `using M = import "${modulesConst}";`,
@@ -181,7 +183,7 @@ export function emitConfig(options) {
     '    (name = "profile", external = (http = ())),',
     '    (name = "assets", external = (http = ())),',
     '    (name = "fonts", external = (http = ())),',
-    `    (name = "internet", network = (allow = ${network})),`,
+    `    (name = "internet", network = (allow = ${network}, tlsOptions = (trustBrowserCas = true))),`,
     "  ],",
     '  sockets = [(name = "engine", http = (), service = "main")],',
     '  v8Flags = ["--expose-gc"],',
