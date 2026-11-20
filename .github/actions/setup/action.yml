@@ -49,8 +49,11 @@ runs:
             printf 'cache-restore-keys<<EOF\nbazelflare-repo-%s-\nEOF\n' "$RUNNER_OS"
             printf 'cache-paths<<EOF\n~/.cache/bazel-repo\nEOF\n'
           else
-            echo "cache-key=bazel-$RUNNER_OS-$LOCKS-$GITHUB_SHA"
-            printf 'cache-restore-keys<<EOF\nbazel-%s-%s-\nbazel-%s-\nEOF\n' "$RUNNER_OS" "$LOCKS" "$RUNNER_OS"
+            # The release matrix runs x64 and arm64 Linux on the same OS label, so the cache key
+            # must name the architecture or both jobs would restore and save the same entry.
+            echo "cache-key=bazel-$RUNNER_OS-$RUNNER_ARCH-$LOCKS-$GITHUB_SHA"
+            printf 'cache-restore-keys<<EOF\nbazel-%s-%s-%s-\nbazel-%s-%s-\nbazel-%s-\nEOF\n' \
+              "$RUNNER_OS" "$RUNNER_ARCH" "$LOCKS" "$RUNNER_OS" "$RUNNER_ARCH" "$RUNNER_OS"
             printf 'cache-paths<<EOF\n~/.cache/bazel-disk\n~/.cache/bazel-repo\nEOF\n'
           fi
         } >> "$GITHUB_OUTPUT"

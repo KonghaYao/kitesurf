@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# A moved tag must not keep building the old commit. Only artifacts from the current run matter.
+concurrency:
+  group: release-browser-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   package:
     strategy:
@@ -24,7 +29,10 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
+      - id: setup
+        uses: ./.github/actions/setup
+        with:
+          bazel-cache: "true"
       - run: pnpm install --frozen-lockfile
       - name: Bound memory use on standard runners
         shell: bash
@@ -35,6 +43,7 @@ jobs:
           common --lockfile_mode=error
           common --jobs=1
           common --local_test_jobs=1
+          common --experimental_disk_cache_gc_max_size=2G
           build -c opt
           EOF
       - name: Install Linux system fonts
@@ -98,6 +107,16 @@ jobs:
             dist/*.tar.gz
             dist/*.sha256
           if-no-files-found: error
+      # Restore happens in setup; save the build tree here so the next release reuses it. A hit is
+      # already complete and cannot be overwritten. Save after a failure too: finished actions are
+      # still valid cache entries.
+      - if: >-
+          !cancelled() && steps.setup.outputs.bazel-cache-key != ''
+          && steps.setup.outputs.bazel-cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.setup.outputs.bazel-cache-paths }}
+          key: ${{ steps.setup.outputs.bazel-cache-key }}
 
   release:
     if: github.event_name == 'push'
