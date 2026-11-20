@@ -549,11 +549,13 @@ fn spawn_control_reader(file: File, sender: mpsc::UnboundedSender<ControlMessage
     });
 }
 
-// A workerd internal error line starts with a workerd/ source location and names the JSG
-// context. Page and engine logs may contain arbitrary "uncaught" text, so only this line is
-// fatal; a request-level failure must not end the browser session.
-const INTERNAL_ERROR_LINE_PREFIX: &[u8] = b"workerd/";
+// A workerd internal error prints a workerd/ error line and a stack line naming the JSG context
+// and wdErrId. Page and engine logs may contain arbitrary "uncaught" text, so only these lines
+// are fatal; a request-level failure must not end the browser session.
+const INTERNAL_ERROR_SOURCE_PREFIX: &[u8] = b"workerd/";
+const INTERNAL_ERROR_STACK_PREFIX: &[u8] = b"stack:";
 const INTERNAL_ERROR_MARK: &[u8] = b"sentryErrorContext = jsgInternalError";
+const INTERNAL_ERROR_ID: &[u8] = b"wdErrId = ";
 
 struct OutputScanner {
     line: Vec<u8>,
@@ -583,11 +585,16 @@ impl OutputScanner {
     }
 
     fn is_internal_error(&self) -> bool {
-        self.line.starts_with(INTERNAL_ERROR_LINE_PREFIX)
-            && self
-                .line
-                .windows(INTERNAL_ERROR_MARK.len())
-                .any(|window| window == INTERNAL_ERROR_MARK)
+        let contains = |needle: &[u8]| {
+            self.line
+                .windows(needle.len())
+                .any(|window| window == needle)
+        };
+        if !contains(INTERNAL_ERROR_MARK) {
+            return false;
+        }
+        self.line.starts_with(INTERNAL_ERROR_SOURCE_PREFIX)
+            || (self.line.starts_with(INTERNAL_ERROR_STACK_PREFIX) && contains(INTERNAL_ERROR_ID))
     }
 
     fn finish(
@@ -708,7 +715,7 @@ mod output_tests {
         feed(
             &mut scanner,
             &diagnostics,
-            b"sentryErrorContext = jsgInternalError",
+            b"stack: sentryErrorContext = jsgInternalError",
         );
         assert_eq!(diagnostics.internal.load(Ordering::Relaxed), 0);
         assert_eq!(*diagnostics.fatal.borrow(), None);
@@ -716,7 +723,12 @@ mod output_tests {
         feed(
             &mut scanner,
             &diagnostics,
-            b"workerd/jsg/util.c++:391: error: e = x; sentryErrorContext = jsgInternalError; wdErrId = id",
+            b"workerd/jsg/util.c++:391: error: e = x",
+        );
+        feed(
+            &mut scanner,
+            &diagnostics,
+            b"stack: 1 2 3; sentryErrorContext = jsgInternalError; wdErrId = id",
         );
         assert_eq!(diagnostics.internal.load(Ordering::Relaxed), 1);
         assert_eq!(

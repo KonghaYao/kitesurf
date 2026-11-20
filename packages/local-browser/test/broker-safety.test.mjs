@@ -105,13 +105,14 @@ function inject() {
     process.stdout.write('uncaught page console test internal error ' + payload + '\\n');
     return;
   }
-  const marker = 'workerd/jsg/util.c++:391: error: e = x; sentryErrorContext = jsgInternalError; wdErrId = synthetic';
-  process.stderr.write('[ks-gc] {"at":1,"done":2,"extra":"' + payload + '"} ' + marker + ' ' + payload + '\\n');
-  process.stdout.write(marker + ' ' + payload + '\\n');
+  const source = 'workerd/jsg/util.c++:391: error: e = x';
+  const stack = 'stack: 1 2 3; sentryErrorContext = jsgInternalError; wdErrId = synthetic';
+  process.stderr.write('[ks-gc] {"at":1,"done":2,"extra":"' + payload + '"} ' + source + ' ' + payload + '\\n');
+  process.stdout.write(source + '\\n' + stack + ' ' + payload + '\\n');
 }
 function drain() {
   const target = phase.endsWith('-stdout') ? process.stdout : process.stderr;
-  const bytes = Buffer.from('workerd/jsg/util.c++:1: error: e = x; sentryErrorContext = jsgInternalError ' + payload + ' ' + 'x'.repeat(4000));
+  const bytes = Buffer.from('workerd/jsg/util.c++:1: error: e = x\\nstack: 1 2 3; sentryErrorContext = jsgInternalError; wdErrId = id ' + payload + ' ' + 'x'.repeat(4000));
   for (let offset = 0; offset < bytes.length; offset += 7) target.write(bytes.subarray(offset, offset + 7));
 }
 const child = spawn(${JSON.stringify(workerd)}, process.argv.slice(2), {stdio:['ignore','pipe','pipe',3]});
