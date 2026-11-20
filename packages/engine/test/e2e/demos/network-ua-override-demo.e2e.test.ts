@@ -44,5 +44,10 @@ test("network-ua-override-demo", async ({ page }) => {
     typeof gen3.doc["user-agent"] === "string" && gen3.doc["user-agent"].includes("Mozilla/5.0"),
     "doc fetch UA back to default",
   ).toBeTruthy();
-  expect(gen3.nav, "navigator.userAgent back to default").toBe("Kitesurf/dev");
+  const discovery = await page.evaluate(async () => {
+    const response = await fetch("/json/version");
+    return (await response.json()).Browser;
+  });
+  expect(discovery, "discovery product token").toMatch(/^Kitesurf\//);
+  expect(gen3.nav, "navigator.userAgent matches discovery").toBe(discovery);
 });

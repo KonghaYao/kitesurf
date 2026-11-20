@@ -9,7 +9,7 @@
   ],
   "vars": {
     "KITESURF_ENV": "local",
-    "KITESURF_VERSION": "0.5.0",
+    "KITESURF_VERSION": "0.5.2",
     "KITESURF_RESOURCE_DRAIN_QUIET_TURNS": "5",
   },
   "worker_loaders": [{ "binding": "LOADER" }],
