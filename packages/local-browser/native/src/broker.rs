@@ -1550,6 +1550,9 @@ impl Broker {
                     if self.page_controller_taken(target_id) {
                         return Err(PAGE_SESSION_CONTROL_MESSAGE.to_string());
                     }
+                    if self.attachments.page_target_claimed_by_other(target_id) {
+                        return Err(FOREIGN_TARGET_MESSAGE.to_string());
+                    }
                 }
             }
         }
@@ -1631,6 +1634,10 @@ impl Broker {
                     self.active_controller = Some(id);
                 }
                 Endpoint::Page { target_id } => {
+                    // 主 target 在连接建立时即归属该页面，先于它的 attach 回复。
+                    if !self.attachments.claim_primary(target_id) {
+                        return false;
+                    }
                     self.page_sessions.insert(
                         target_id.clone(),
                         PageSession {
@@ -2434,8 +2441,16 @@ impl Broker {
 
     /// 控制者断开后 page session 没有活动控制权；target 归属仍由 attachments 持有。
     fn release_page_session(&mut self, client: ClientId) {
-        self.page_sessions
-            .retain(|_, session| session.controller != client);
+        let pages = self
+            .page_sessions
+            .iter()
+            .filter(|(_, session)| session.controller == client)
+            .map(|(page, _)| page.clone())
+            .collect::<Vec<_>>();
+        for page in pages {
+            self.page_sessions.remove(&page);
+            self.attachments.release_primary(&page);
+        }
     }
 
     /// 关闭且 pending/unknown、管理操作、retirement、attachment 引用全部清空才可回收。
@@ -5678,7 +5693,9 @@ impl Broker {
         self.unknown.clear();
         self.client_pending = 0;
         self.internal_pending = 0;
-        self.page_sessions.clear();
+        for page in std::mem::take(&mut self.page_sessions).into_keys() {
+            self.attachments.release_primary(&page);
+        }
         for (client, external, session) in failures {
             self.send_error(
                 client,

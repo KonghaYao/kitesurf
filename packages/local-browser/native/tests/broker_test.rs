@@ -1443,6 +1443,157 @@ async fn cross_page_session_attach_is_rejected_before_upstream() {
     assert!(!broker.wait_terminal().await);
 }
 
+// 主 target 在控制连接建立时就归属该页面，不依赖它的 attach 回复先后。
+#[tokio::test]
+async fn page_session_owns_its_primary_target_before_attach_completes() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["params"]["targetId"], "page-a");
+    let alice_attach = request_id(&attach);
+    let mut bob = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-b".into(),
+        },
+        Role::Controller,
+        "bob",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-b"}));
+    // alice 的 attach 回复仍未到达，bob 也不能取得这个主 target。
+    send(
+        &bob,
+        &broker,
+        r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"page-a","flatten":true}}"#,
+    )
+    .await;
+    let rejected = next_frame(&mut bob).await;
+    assert_eq!(rejected["id"], 1);
+    assert!(
+        message(&rejected).contains("another page session"),
+        "{}",
+        message(&rejected)
+    );
+    expect_no_request(&mut engine).await;
+    // 原会话仍能完成接入并操作自己的页面。
+    engine.reply(alice_attach, json!({"sessionId":"session-a"}));
+    send(&alice, &broker, r#"{"id":2,"method":"Page.enable"}"#).await;
+    let enable = next_request(&mut engine).await;
+    assert_eq!(enable["sessionId"], "session-a");
+    engine.reply(request_id(&enable), json!({}));
+    assert_eq!(next_frame(&mut alice).await["id"], 2);
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+// 控制连接断开并收回上游 session 后，主 target 回到可登记状态。
+#[tokio::test]
+async fn page_session_releases_primary_target_after_disconnect() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+    send(&alice, &broker, r#"{"id":1,"method":"Page.enable"}"#).await;
+    let enable = next_request(&mut engine).await;
+    engine.reply(request_id(&enable), json!({}));
+    assert_eq!(next_frame(&mut alice).await["id"], 1);
+    broker.closed(alice.id);
+    let detach = next_method(&mut engine, "Target.detachFromTarget").await;
+    assert_eq!(detach["params"]["sessionId"], "session-a");
+    engine.reply(request_id(&detach), json!({}));
+    // 另一个 page session 可以重新登记这个 target。
+    let mut bob = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-b".into(),
+        },
+        Role::Controller,
+        "bob",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-b"}));
+    send(
+        &bob,
+        &broker,
+        r#"{"id":2,"method":"Target.attachToTarget","params":{"targetId":"page-a","flatten":true}}"#,
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["params"]["targetId"], "page-a");
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a2"}));
+    assert_eq!(next_frame(&mut bob).await["id"], 2);
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+// 控制连接断开后归还主 target，新的控制连接可以重新接入同一页面。
+#[tokio::test]
+async fn page_session_primary_target_is_released_for_reconnect() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+    // attach 回复结算后才算接入完成，之后断开才需要收回上游 session。
+    send(&alice, &broker, r#"{"id":1,"method":"Page.enable"}"#).await;
+    let enable = next_request(&mut engine).await;
+    assert_eq!(enable["sessionId"], "session-a");
+    engine.reply(request_id(&enable), json!({}));
+    assert_eq!(next_frame(&mut alice).await["id"], 1);
+    broker.closed(alice.id);
+    let detach = next_method(&mut engine, "Target.detachFromTarget").await;
+    assert_eq!(detach["params"]["sessionId"], "session-a");
+    engine.reply(request_id(&detach), json!({}));
+    let mut again = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["params"]["targetId"], "page-a");
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a2"}));
+    send(&again, &broker, r#"{"id":1,"method":"Page.enable"}"#).await;
+    let enable = next_request(&mut engine).await;
+    assert_eq!(enable["sessionId"], "session-a2");
+    engine.reply(request_id(&enable), json!({}));
+    assert_eq!(next_frame(&mut again).await["id"], 1);
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
 // 目标列表与事件只包含本 page session；实例级发现仍只发给 Browser 端点。
 #[tokio::test]
 async fn page_session_target_list_and_events_are_scoped() {

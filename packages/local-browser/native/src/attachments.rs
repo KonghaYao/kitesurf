@@ -86,6 +86,8 @@ pub enum QuarantineResult {
 struct PageClaim {
     page: String,
     attachments: usize,
+    /// 主 target 在其控制连接建立时即归属该页面，不依赖 attach 回复的先后。
+    primary: bool,
 }
 
 #[derive(Default)]
@@ -235,6 +237,7 @@ impl Attachments {
                         PageClaim {
                             page: page.to_string(),
                             attachments: 1,
+                            primary: false,
                         },
                     );
                 }
@@ -433,12 +436,56 @@ impl Attachments {
             .is_none_or(|owner| owner == page)
     }
 
+    /// 控制连接建立时先登记主 target；已被其他页面登记时拒绝。
+    pub fn claim_primary(&mut self, target: &str) -> bool {
+        match self.claims.get_mut(target) {
+            Some(claim) => {
+                if claim.page != target {
+                    return false;
+                }
+                claim.primary = true;
+                true
+            }
+            None => {
+                self.claims.insert(
+                    target.to_string(),
+                    PageClaim {
+                        page: target.to_string(),
+                        attachments: 0,
+                        primary: true,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// 控制连接结束后归还主 target；仍有 attachment 时保留到最后一个释放。
+    pub fn release_primary(&mut self, page: &str) {
+        let Some(claim) = self.claims.get_mut(page) else {
+            return;
+        };
+        if !claim.primary {
+            return;
+        }
+        claim.primary = false;
+        if claim.attachments == 0 {
+            self.claims.remove(page);
+        }
+    }
+
+    /// 以该 target 为主页面的连接能否接入；其他页面已登记时会被拒绝。
+    pub fn page_target_claimed_by_other(&self, target: &str) -> bool {
+        self.page_of_target(target)
+            .is_some_and(|owner| owner != target)
+    }
+
     fn release_claim(&mut self, target: &str) {
         let Some(claim) = self.claims.get_mut(target) else {
             return;
         };
         claim.attachments = claim.attachments.saturating_sub(1);
-        if claim.attachments == 0 {
+        if claim.attachments == 0 && !claim.primary {
             self.claims.remove(target);
         }
     }

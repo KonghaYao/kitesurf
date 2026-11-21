@@ -83,9 +83,12 @@ multi-tenant authorization service. The control endpoint binds to loopback and c
 Several page sessions can be controlled at the same time on their own
 `ws://127.0.0.1:8787/devtools/page/{targetId}` connections. A page session's ID is its primary
 target ID; one target belongs to one page session, and a second controller for the same page is
-rejected. The `/devtools/browser` endpoint keeps the single-controller rule above and still sees
-every target and its discovery events. Provision pages through that endpoint first
-(`Target.createTarget`), then connect one page session per target.
+rejected. A page session's primary target is bound as soon as its controller connects, so another
+session cannot attach it while the controller's first attach is still in flight. The
+`/devtools/browser` endpoint keeps the single-controller rule above and still sees every target and
+its discovery events. Provision pages through that endpoint first (`Target.createTarget`), then
+connect one page session per target; any other target is bound to the first page session that
+attaches to it.
 
 Page connections operate only their own target and CDP sessions. Instance-level methods such as
 `Browser.close`, `Target.createTarget`, `Target.createBrowserContext`,
@@ -97,7 +100,8 @@ session's targets, and other sessions' target and attach events are not delivere
 `Target.setAutoAttach` on a page connection stays scoped to that session and does not change the
 instance-wide auto-attach owner. All page sessions share the instance's single SQLite profile, so
 they see the same cookies and same-origin localStorage; use separate profiles for independent
-accounts. Viewer and DevTools connections to `/devtools/page/{targetId}` are unchanged.
+accounts. Viewer connections to `/devtools/page/{targetId}` keep their existing attach and frame
+behavior.
 
 Internet access uses the existing Kitesurf network stack. Page access to loopback/private
 networks is blocked by default; enable it intentionally with `--allow-private-network` for local
