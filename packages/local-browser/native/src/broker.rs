@@ -2242,12 +2242,11 @@ impl Broker {
             return Err("Invalid CDP request");
         }
         // 未列入 allowlist 或缺少 targetId 的 Kitesurf 方法会落到实例级默认页面/渲染器。
-        if method.starts_with("Kitesurf.") {
-            if !PAGE_SCOPED_KITESURF_METHODS.contains(&method)
-                || request.observed.string("targetId").is_none()
-            {
-                return Err(PAGE_SESSION_DENIED_MESSAGE);
-            }
+        if method.starts_with("Kitesurf.")
+            && (!PAGE_SCOPED_KITESURF_METHODS.contains(&method)
+                || request.observed.string("targetId").is_none())
+        {
+            return Err(PAGE_SESSION_DENIED_MESSAGE);
         }
         // 用参数寻址上游 session 的方法同样不能跨 page session。
         if let Some(session) = request.observed.string("sessionId") {
@@ -2947,10 +2946,7 @@ impl Broker {
         };
         let mut target_buffer = [0; 4096];
         let mut opener_buffer = [0; 4096];
-        loop {
-            let Ok(Some(info)) = array.next(&mut scratch) else {
-                break;
-            };
+        while let Ok(Some(info)) = array.next(&mut scratch) {
             let target = info
                 .field("targetId", &mut scratch)
                 .map(|node| node.identity_text(&mut target_buffer, &mut scratch))
