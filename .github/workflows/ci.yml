@@ -32,6 +32,13 @@ jobs:
           bazel-cache: "true"
           bazelflare: ${{ github.repository == 'cloudflare/kitesurf' && 'true' || 'false' }}
       - run: pnpm install --frozen-lockfile
+      - name: Install Linux system fonts
+        if: runner.os == 'Linux'
+        run: |
+          getconf GNU_LIBC_VERSION
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            fontconfig fonts-dejavu-core fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji
       - run: bazel test --keep_going --test_output=errors //:check //:rust_lint //packages/core:host_tests //packages/engine:vitest
       - run: pnpm run build
       - name: Fail on generated drift
@@ -67,7 +74,7 @@ jobs:
         uses: ./.github/actions/setup
         with:
           bazel-cache: "true"
-          bazelflare: "true"
+          bazelflare: ${{ github.repository == 'cloudflare/kitesurf' && 'true' || 'false' }}
           pnpm-cache: "false"
       # Each test file is its own action on a bazelflare executor. The suite needs more memory than
       # a hosted runner has, so a fork's pull request skips it and main runs it once it merges.
@@ -93,7 +100,7 @@ jobs:
         uses: ./.github/actions/setup
         with:
           bazel-cache: "true"
-          bazelflare: "true"
+          bazelflare: ${{ github.repository == 'cloudflare/kitesurf' && 'true' || 'false' }}
           pnpm-cache: "false"
       # Each spec boots an engine on a bazelflare executor, whose image holds the pinned Playwright
       # checkout. A fork's pull request has no bazelflare, so main runs the lane once it merges.
@@ -119,7 +126,7 @@ jobs:
         uses: ./.github/actions/setup
         with:
           bazel-cache: "true"
-          bazelflare: "true"
+          bazelflare: ${{ github.repository == 'cloudflare/kitesurf' && 'true' || 'false' }}
           pnpm-cache: "false"
       # The buckets run on bazelflare's WPT executors, whose image holds the pinned corpus. A fork's
       # pull request has no bazelflare, so main runs the gate once it merges.

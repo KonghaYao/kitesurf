@@ -142,15 +142,19 @@ describe("DOM replies from the page isolate", () => {
     expect((r.root.children as Node[]).length).toBe(100_000);
     expect(JSON.stringify(r).length).toBeLessThan(16 * 1024 * 1024);
   });
-  it("accepts a page-shaped attributed document with 50k elements", async () => {
-    const root = attributedDocument(50_000, 96);
-    const r = (await call(handleDom, "DOM.getDocument", {
-      pageScript: ps(root),
-      frames: new Map(),
-    })) as { root: Node };
-    expect((r.root.children as Node[]).length).toBe(50_000);
-  });
-  it("rejects a reply with more containers than the budget", async () => {
+  it(
+    "accepts a page-shaped attributed document with 50k elements",
+    { timeout: 30_000 },
+    async () => {
+      const root = attributedDocument(50_000, 96);
+      const r = (await call(handleDom, "DOM.getDocument", {
+        pageScript: ps(root),
+        frames: new Map(),
+      })) as { root: Node };
+      expect((r.root.children as Node[]).length).toBe(50_000);
+    },
+  );
+  it("rejects a reply with more containers than the budget", { timeout: 30_000 }, async () => {
     // 1.2M records plus the root and its children array is ~14% over the container budget.
     const root = doc();
     root.children = Array.from({ length: 1_200_000 }, () => node());

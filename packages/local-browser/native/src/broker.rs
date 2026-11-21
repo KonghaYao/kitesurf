@@ -136,6 +136,72 @@ const TICK: Duration = Duration::from_millis(50);
 const FRAME_CAPACITY: usize = 8;
 const COMMAND_CAPACITY: usize = 256;
 
+const PAGE_SESSION_CONTROL_MESSAGE: &str = "Another controller owns this page session";
+const PAGE_SESSION_DENIED_MESSAGE: &str =
+    "This method is not available on a page-session connection";
+const FOREIGN_TARGET_MESSAGE: &str = "Target belongs to another page session";
+const FOREIGN_SESSION_MESSAGE: &str = "Session is not part of this page session";
+const PAGE_SESSION_UNOWNED_MESSAGE: &str = "Target is not part of this page session";
+/// page 端点只能承载顶层 page；frame/popup 必须先由父会话 attach。
+const PAGE_ENDPOINT_TARGET_MESSAGE: &str =
+    "Only a top-level page target can back a page connection";
+/// 实例级或无法限定到会话的方法；page session 只操作自己的 target 与 CDP session。
+/// Browser.getVersion 是只读发现字段，DevTools 页面连接仍可使用。Page 的预导航脚本表挂在
+/// 共享 BrowserState 上，page 连接写入会影响其他页面的下次导航。
+const PAGE_SESSION_DENIED_METHODS: &[&str] = &[
+    "Browser.close",
+    "Browser.crash",
+    "Browser.setDownloadBehavior",
+    "Browser.grantPermissions",
+    "Browser.resetPermissions",
+    "Kitesurf.flushProfile",
+    "Network.clearBrowserCache",
+    "Network.clearBrowserCookies",
+    "Page.addScriptToEvaluateOnNewDocument",
+    "Page.removeScriptToEvaluateOnNewDocument",
+    "Security.setIgnoreCertificateErrors",
+    "Storage.clearCookies",
+    "Storage.clearDataForOrigin",
+    "Storage.clearTrustTokens",
+    "Target.attachToBrowserTarget",
+    "Target.createBrowserContext",
+    "Target.createTarget",
+    "Target.disposeBrowserContext",
+    "Target.getBrowserContexts",
+    "Target.setAutoAttach",
+    "Target.setDiscoverTargets",
+    "Target.setRemoteLocations",
+];
+
+/// 引擎的实例级 target ID；page session 不能 attach，也不能按它读取实例状态。
+const INSTANCE_TARGET_IDS: &[&str] = &["browser", "kitesurf-page-renderer", "kitesurf-engine"];
+
+/// Kitesurf 方法只有显式携带本会话 targetId 时才可按页转发；其余 Kitesurf.* 属实例级。
+/// 引擎在不带 targetId 时会读取或改写第一张页面/共享渲染器状态，不能透传。
+const PAGE_SCOPED_KITESURF_METHODS: &[&str] = &[
+    "Kitesurf.setLayoutMode",
+    "Kitesurf.getLayoutMode",
+    "Kitesurf.startSceneStream",
+    "Kitesurf.stopSceneStream",
+    "Kitesurf.sceneFrameAck",
+    "Kitesurf.getSceneResources",
+    "Kitesurf.getNavigatePhases",
+    "Kitesurf.hasPendingCriticalResources",
+    "Kitesurf.getPageState",
+    "Kitesurf.setControlValue",
+    "Kitesurf.markPaintDamage",
+    "Kitesurf.getPaintDamageSince",
+    "Kitesurf.getMemoryStats",
+    "Kitesurf.recordScene",
+    "Kitesurf.getScreencastStatus",
+    "Kitesurf.getRbiResources",
+    "Kitesurf.getFontFaces",
+    "Kitesurf.getMemprofDump",
+    "Kitesurf.resetMemprof",
+    "Kitesurf.boaForceCollect",
+    "Kitesurf.getSceneStats",
+];
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     Controller,
@@ -200,6 +266,12 @@ struct Received {
     outer: Option<RawSpan>,
     session: Option<RawSpan>,
     target: Option<RawSpan>,
+    /// 引擎目标信息里的 openerId/openerFrameId；用于绑定 frame/popup 归属。
+    opener: Option<RawSpan>,
+    /// targetInfo.type 是否为 page；None 表示事件没有 targetInfo。
+    page_target: Option<bool>,
+    /// 无 targetInfo 的 Target.targetDestroyed：清除该 target 的父链。
+    destroyed: bool,
     attached: Option<LeasedIdentity>,
 }
 
@@ -237,16 +309,33 @@ impl Received {
         } else {
             None
         };
-        let target = if method == Some(EventMethod::Attached) {
-            string(
-                params
-                    .and_then(|node| node.field("targetInfo", &mut scratch))
-                    .and_then(|node| node.field("targetId", &mut scratch)),
-                &mut scratch,
-            )?
-        } else {
-            None
+        // attach 与发现事件都携带 targetInfo；targetDestroyed 只有 params.targetId。
+        let target_info = matches!(method, Some(EventMethod::Attached | EventMethod::Discovery))
+            .then(|| params.and_then(|node| node.field("targetInfo", &mut scratch)))
+            .flatten();
+        let target = match method {
+            Some(EventMethod::Attached | EventMethod::Discovery) => match target_info {
+                Some(info) => string(info.field("targetId", &mut scratch), &mut scratch)?,
+                None => string(
+                    params.and_then(|node| node.field("targetId", &mut scratch)),
+                    &mut scratch,
+                )?,
+            },
+            _ => None,
         };
+        let opener = match (method, target_info) {
+            (Some(EventMethod::Attached | EventMethod::Discovery), Some(info)) => {
+                let opener = info
+                    .field("openerId", &mut scratch)
+                    .or_else(|| info.field("openerFrameId", &mut scratch));
+                string(opener, &mut scratch)?
+            }
+            _ => None,
+        };
+        let page_target = target_info
+            .and_then(|info| info.field("type", &mut scratch))
+            .map(|node| node.equals("page", &mut scratch));
+        let destroyed = method == Some(EventMethod::Discovery) && target_info.is_none();
         let attached = None;
         Ok(Self {
             raw,
@@ -254,6 +343,9 @@ impl Received {
             outer,
             session,
             target,
+            opener,
+            page_target,
+            destroyed,
             attached,
         })
     }
@@ -355,6 +447,7 @@ enum BrokerCommand {
     Targets {
         reply: oneshot::Sender<Result<LeasedTargets, String>>,
     },
+    TargetsForPage(String, oneshot::Sender<Result<LeasedTargets, String>>),
     #[cfg(all(test, feature = "test-faults"))]
     BudgetSnapshot(oneshot::Sender<(usize, usize, usize, usize)>),
     #[cfg(all(test, feature = "test-faults"))]
@@ -513,6 +606,8 @@ impl BrokerHandle {
             controller: None,
             control_epoch: 1,
             active_controller: None,
+            page_sessions: HashMap::new(),
+            next_page_epoch: 1,
             control_queue: VecDeque::new(),
             next_admission_seq: 1,
             control_active: None,
@@ -728,6 +823,13 @@ impl BrokerHandle {
 
     pub async fn targets(&self) -> Result<LeasedTargets, String> {
         self.command(|reply| BrokerCommand::Targets { reply })
+            .await
+            .and_then(|result| result)
+    }
+
+    /// 会话范围内的发现：主 target、已 attach 的 target 及其引擎报告的子 frame/popup。
+    pub async fn targets_for_page(&self, page: String) -> Result<LeasedTargets, String> {
+        self.command(|reply| BrokerCommand::TargetsForPage(page, reply))
             .await
             .and_then(|result| result)
     }
@@ -1016,6 +1118,8 @@ struct Client {
     role: Role,
     epoch: u64,
     endpoint: Endpoint,
+    /// page session ID（Endpoint::Page 的主 targetId）；Browser 连接为 None。
+    page: Option<String>,
     primary: Option<LeasedIdentity>,
     page_ready: bool,
     page_queue: VecDeque<Request>,
@@ -1059,6 +1163,17 @@ enum PendingKind {
     Flush,
     Close,
     Targets(oneshot::Sender<Result<LeasedTargets, String>>),
+    /// page session 的 Target.getTargets：在 broker 内过滤上游全量结果。
+    TargetsForClient {
+        page: String,
+    },
+    /// 会话范围内的发现请求（HTTP 入口）；过滤后返回持有的 targetInfos。
+    ScopedTargets {
+        page: String,
+        reply: oneshot::Sender<Result<LeasedTargets, String>>,
+    },
+    /// 拒绝跨 session attach 后收回上游 session；只等结算，不登记 attachment。
+    ScopeDetach,
     RetirementAuto {
         id: u64,
     },
@@ -1229,6 +1344,12 @@ struct ControlEntry {
     reply: ControlWaiter,
 }
 
+/// 一个 page session 的控制者与权限代次；target 集合由 attachments 的 claims 持有。
+struct PageSession {
+    controller: ClientId,
+    epoch: u64,
+}
+
 struct Broker {
     upstream: Upstream,
     frames: mpsc::Receiver<(ClientId, String, PayloadLease)>,
@@ -1255,6 +1376,8 @@ struct Broker {
     controller: Option<String>,
     control_epoch: u64,
     active_controller: Option<ClientId>,
+    page_sessions: HashMap<String, PageSession>,
+    next_page_epoch: u64,
     control_queue: VecDeque<ControlEntry>,
     next_admission_seq: u64,
     control_active: Option<ActiveControl>,
@@ -1427,6 +1550,9 @@ impl Broker {
                 });
             }
             BrokerCommand::Targets { reply } => self.request_targets(reply),
+            BrokerCommand::TargetsForPage(page, reply) => {
+                self.request_targets_for_page(page, reply)
+            }
             BrokerCommand::ProfileBarrierComplete { token, result } => {
                 self.profile_barrier_complete(token, result)
             }
@@ -1464,19 +1590,34 @@ impl Broker {
         if self.clients.len() >= MAX_CLIENTS || self.reservations.len() >= MAX_RESERVED {
             return Err("Too many browser connections".to_string());
         }
+        if let Endpoint::Page { target_id } = &request.endpoint {
+            if let Some(message) = self.page_endpoint_error(target_id) {
+                return Err(message.to_string());
+            }
+        }
         if request.role == Role::Controller {
-            if self.control_active.is_some() {
-                return Err("Control change is in progress".to_string());
-            }
-            if let Some(controller) = &self.controller {
-                if controller != &request.owner {
-                    return Err(
-                        "Another controller owns the browser; explicitly take control".to_string(),
-                    );
+            match &request.endpoint {
+                Endpoint::Browser => {
+                    if self.control_active.is_some() {
+                        return Err("Control change is in progress".to_string());
+                    }
+                    if let Some(controller) = &self.controller {
+                        if controller != &request.owner {
+                            return Err(
+                                "Another controller owns the browser; explicitly take control"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    if self.active_controller.is_some() {
+                        return Err("Controller is already connected".to_string());
+                    }
                 }
-            }
-            if self.active_controller.is_some() {
-                return Err("Controller is already connected".to_string());
+                Endpoint::Page { target_id } => {
+                    if self.page_controller_taken(target_id) {
+                        return Err(PAGE_SESSION_CONTROL_MESSAGE.to_string());
+                    }
+                }
             }
         }
         let id = self.next_client;
@@ -1489,6 +1630,29 @@ impl Broker {
         };
         self.reservations.insert(id, reservation.clone());
         Ok(reservation)
+    }
+
+    /// page 端点主目标只能是未归属（或同页）的顶层 page；实例与子目标一律拒绝。
+    fn page_endpoint_error(&self, target_id: &str) -> Option<&'static str> {
+        if INSTANCE_TARGET_IDS.contains(&target_id)
+            || self.attachments.is_not_top_level_page(target_id)
+        {
+            return Some(PAGE_ENDPOINT_TARGET_MESSAGE);
+        }
+        if self.attachments.page_target_claimed_by_other(target_id) {
+            return Some(FOREIGN_TARGET_MESSAGE);
+        }
+        None
+    }
+
+    /// page controller 只在没有活动控制者、也没有同会话的另一个预留时才能接入。
+    fn page_controller_taken(&self, target_id: &str) -> bool {
+        self.page_sessions.contains_key(target_id)
+            || self.reservations.values().any(|reservation| {
+                reservation.role == Role::Controller
+                    && matches!(&reservation.endpoint,
+                        Endpoint::Page { target_id: other } if other == target_id)
+            })
     }
 
     fn commit(
@@ -1504,15 +1668,35 @@ impl Broker {
         if self.lifecycle != Lifecycle::Running || self.clients.len() >= MAX_CLIENTS {
             return false;
         }
-        let page = matches!(reservation.endpoint, Endpoint::Page { .. });
-        // 先验证 controller 身份，再取得准入序号；耗尽时不改变 owner/epoch。
-        if reservation.role == Role::Controller {
-            if self.control_active.is_some() || self.active_controller.is_some() {
+        // 预留后目标归属可能变化；提交前按同一规则复核，viewer 也受限。
+        if let Endpoint::Page { target_id } = &reservation.endpoint {
+            if self.page_endpoint_error(target_id).is_some() {
                 return false;
             }
-            if let Some(controller) = &self.controller {
-                if controller != &reservation.owner {
-                    return false;
+        }
+        let page = matches!(reservation.endpoint, Endpoint::Page { .. });
+        let mut epoch = self.control_epoch;
+        // 先验证控制权身份，再取得准入序号；耗尽时不改变 owner/epoch。
+        if reservation.role == Role::Controller {
+            match &reservation.endpoint {
+                Endpoint::Browser => {
+                    if self.control_active.is_some() || self.active_controller.is_some() {
+                        return false;
+                    }
+                    if let Some(controller) = &self.controller {
+                        if controller != &reservation.owner {
+                            return false;
+                        }
+                    }
+                }
+                Endpoint::Page { target_id } => {
+                    if self.page_controller_taken(target_id) {
+                        return false;
+                    }
+                    match take_sequence(&mut self.next_page_epoch) {
+                        Some(page_epoch) => epoch = page_epoch,
+                        None => return false,
+                    }
                 }
             }
         }
@@ -1525,22 +1709,44 @@ impl Broker {
             None
         };
         if reservation.role == Role::Controller {
-            if self.controller.is_none() {
-                self.controller = Some(reservation.owner.clone());
+            match &reservation.endpoint {
+                Endpoint::Browser => {
+                    if self.controller.is_none() {
+                        self.controller = Some(reservation.owner.clone());
+                    }
+                    self.active_controller = Some(id);
+                }
+                Endpoint::Page { target_id } => {
+                    // 主 target 在连接建立时即归属该页面，先于它的 attach 回复。
+                    if !self.attachments.claim_primary(target_id) {
+                        return false;
+                    }
+                    self.page_sessions.insert(
+                        target_id.clone(),
+                        PageSession {
+                            controller: id,
+                            epoch,
+                        },
+                    );
+                }
             }
-            self.active_controller = Some(id);
         }
         self.notes_tx.send_modify(|notes| {
             notes.clients.retain(|id, _| self.clients.contains_key(id));
             notes.clients.insert(id, (false, false));
         });
+        let page_id = match &reservation.endpoint {
+            Endpoint::Page { target_id } => Some(target_id.clone()),
+            Endpoint::Browser => None,
+        };
         let client = Client {
             slots: Arc::new(Semaphore::new(MAX_PENDING_PER_CLIENT)),
             ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
             owner: reservation.owner,
             role: reservation.role,
-            epoch: self.control_epoch,
+            epoch,
             endpoint: reservation.endpoint.clone(),
+            page: page_id,
             primary: None,
             page_ready: !page,
             page_queue: VecDeque::new(),
@@ -1710,6 +1916,29 @@ impl Broker {
             return;
         }
         let session = error_session(&request);
+        if method == "Target.getTargets" && self.client_has_page(client_id) {
+            self.request_page_targets(client_id, request, external_id, session);
+            return;
+        }
+        // page 连接的 Target.getTargetInfo 默认指向本会话的主 target，而不是浏览器 target。
+        if method == "Target.getTargetInfo" {
+            if let Some(page) = self
+                .clients
+                .get(&client_id)
+                .and_then(|state| state.page.clone())
+            {
+                if request.observed.string("targetId").is_none() {
+                    self.request_page_target_info(
+                        client_id,
+                        &page,
+                        session.as_deref(),
+                        request,
+                        external_id,
+                    );
+                    return;
+                }
+            }
+        }
         if method == "Browser.close" {
             self.request_close_from_client(client_id, external_id, session);
             if let Some(close) = self.close.as_mut() {
@@ -1977,13 +2206,12 @@ impl Broker {
         if client.role == Role::Viewer && !VIEW_METHODS.contains(&method) {
             return Err("Viewer connection cannot control the browser");
         }
-        if client.role == Role::Controller
-            && (client.retired
-                || self.active_controller != Some(client_id)
-                || self.controller.as_deref() != Some(client.owner.as_str())
-                || client.epoch != self.control_epoch)
+        if client.role == Role::Controller && (client.retired || !self.controller_active(client_id))
         {
             return Err("Control has changed; reconnect and observe before acting");
+        }
+        if let Some(page) = client.page.as_deref() {
+            self.check_page_scope(page, request, method)?;
         }
         let owns_id = request
             .lease
@@ -1998,6 +2226,72 @@ impl Broker {
             return Err(message);
         }
         Ok(())
+    }
+
+    /// page session 的方法与 target 都必须限定在该会话内；无法归属的参数 fail closed。
+    fn check_page_scope(
+        &self,
+        page: &str,
+        request: &Request,
+        method: &str,
+    ) -> Result<(), &'static str> {
+        if method.starts_with("Fetch.") || PAGE_SESSION_DENIED_METHODS.contains(&method) {
+            return Err(PAGE_SESSION_DENIED_MESSAGE);
+        }
+        if request.observed.fallback {
+            return Err("Invalid CDP request");
+        }
+        // 未列入 allowlist 或缺少 targetId 的 Kitesurf 方法会落到实例级默认页面/渲染器。
+        if method.starts_with("Kitesurf.")
+            && (!PAGE_SCOPED_KITESURF_METHODS.contains(&method)
+                || request.observed.string("targetId").is_none())
+        {
+            return Err(PAGE_SESSION_DENIED_MESSAGE);
+        }
+        // 用参数寻址上游 session 的方法同样不能跨 page session。
+        if let Some(session) = request.observed.string("sessionId") {
+            let local = self.attachments.owner(session).is_some_and(|owner| {
+                self.clients
+                    .get(&owner)
+                    .and_then(|state| state.page.as_deref())
+                    == Some(page)
+            });
+            if !local {
+                return Err(FOREIGN_SESSION_MESSAGE);
+            }
+        }
+        let Some(target) = request.observed.string("targetId") else {
+            return Ok(());
+        };
+        if INSTANCE_TARGET_IDS.contains(&target) {
+            return Err(PAGE_SESSION_DENIED_MESSAGE);
+        }
+        match self.attachments.page_of_target(target) {
+            Some(owner) if owner != page => Err(FOREIGN_TARGET_MESSAGE),
+            // 已 attach、主 target 或引擎报告的 opener/父 frame 落在本页。
+            Some(_) => Ok(()),
+            // 无归属的 frame/popup 不能由 page session 先到先得。
+            None => Err(PAGE_SESSION_UNOWNED_MESSAGE),
+        }
+    }
+
+    /// Browser 端点沿用实例级单控制者；page session 使用自己的控制者与代次。
+    fn controller_active(&self, client_id: ClientId) -> bool {
+        let Some(client) = self.clients.get(&client_id) else {
+            return false;
+        };
+        match &client.endpoint {
+            Endpoint::Browser => {
+                self.active_controller == Some(client_id)
+                    && self.controller.as_deref() == Some(client.owner.as_str())
+                    && client.epoch == self.control_epoch
+            }
+            Endpoint::Page { .. } => client.page.as_deref().is_some_and(|page| {
+                self.page_sessions.get(page).is_some_and(|session| {
+                    session.controller == client_id && session.epoch == client.epoch
+                })
+            }),
+        }
     }
 
     /// 单调准入序号；耗尽后 fixed 拒绝，不 wrap、不 saturate。
@@ -2148,12 +2442,8 @@ impl Broker {
             return;
         }
         if matches!(state.endpoint, Endpoint::Page { .. }) {
-            let primary = state.primary.as_deref();
-            let budget = self.upstream.handle.budget.clone();
-            let mut scratch = budget.json_scratch();
-            if !value.outer.is_some_and(|span| {
-                primary.is_some_and(|primary| value.raw.at(span).equals(primary, &mut scratch))
-            }) {
+            let allowed = self.page_event_allowed(client, value);
+            if !allowed {
                 return;
             }
         }
@@ -2172,6 +2462,36 @@ impl Broker {
             return;
         };
         self.enqueue(client, text, lease);
+    }
+
+    /// page 连接只接收自己拥有的 session 事件；attach 事件在注册后按 owner 再验一次。
+    fn page_event_allowed(&self, client: ClientId, value: &Received) -> bool {
+        match value.method {
+            Some(EventMethod::Attached) => self.page_has_session(client, value, value.session),
+            // detached_event 已按被移除 attachment 的 owner 选定唯一接收者。
+            Some(EventMethod::Detached) => true,
+            // 无 session 的发现事件只广播给 Browser 端点；这里只放行本连接自己的会话。
+            _ => self.page_has_session(client, value, value.outer),
+        }
+    }
+
+    fn page_has_session(&self, client: ClientId, value: &Received, span: Option<RawSpan>) -> bool {
+        let Some(span) = span else {
+            return false;
+        };
+        let mut scratch = self.upstream.handle.budget.json_scratch();
+        let mut buffer = [0; 4096];
+        let Ok(session) = value.raw.at(span).identity_text(&mut buffer, &mut scratch) else {
+            return false;
+        };
+        session.is_some_and(|session| {
+            self.attachments.owner(session) == Some(client)
+                || self
+                    .clients
+                    .get(&client)
+                    .and_then(|state| state.primary.as_deref())
+                    == Some(session)
+        })
     }
 
     fn disconnect_client(&mut self, client: ClientId, code: u16, reason: &str, retire: bool) {
@@ -2195,6 +2515,7 @@ impl Broker {
         if self.active_controller == Some(client) {
             self.active_controller = None;
         }
+        self.release_page_session(client);
         self.observer.with(
             "client-closed",
             json!({ "kind": "client-closed", "clients": self.clients.len() }),
@@ -2220,6 +2541,7 @@ impl Broker {
         if self.active_controller == Some(client) {
             self.active_controller = None;
         }
+        self.release_page_session(client);
         let needs_retire =
             self.attachments.count_for(client) > 0 || self.attachments.auto_owner == Some(client);
         if needs_retire && self.lifecycle != Lifecycle::Lost {
@@ -2227,6 +2549,20 @@ impl Broker {
             return;
         }
         self.maybe_reap_client(client);
+    }
+
+    /// 控制者断开后 page session 没有活动控制权；target 归属仍由 attachments 持有。
+    fn release_page_session(&mut self, client: ClientId) {
+        let pages = self
+            .page_sessions
+            .iter()
+            .filter(|(_, session)| session.controller == client)
+            .map(|(page, _)| page.clone())
+            .collect::<Vec<_>>();
+        for page in pages {
+            self.page_sessions.remove(&page);
+            self.attachments.release_primary(&page);
+        }
     }
 
     /// 关闭且 pending/unknown、管理操作、retirement、attachment 引用全部清空才可回收。
@@ -2448,12 +2784,287 @@ impl Broker {
         }
     }
 
+    fn request_targets_for_page(
+        &mut self,
+        page: String,
+        reply: oneshot::Sender<Result<LeasedTargets, String>>,
+    ) {
+        if matches!(self.lifecycle, Lifecycle::Lost | Lifecycle::Closed) {
+            let _ = reply.send(Err("browser session is lost".to_string()));
+            return;
+        }
+        if self.lifecycle != Lifecycle::Running {
+            let _ = reply.send(Err("Browser is busy".to_string()));
+            return;
+        }
+        let spec = PendingSpec {
+            client: None,
+            role: None,
+            external_id: None,
+            explicit_session: None,
+            epoch: self.control_epoch,
+            seq: None,
+            method: "Target.getTargets".to_string(),
+            kind: PendingKind::ScopedTargets { page, reply },
+            deadline: self.internal_deadline,
+        };
+        if let Err(message) = self.send_request("Target.getTargets", None, None, spec) {
+            self.observer.kind("targets-unavailable");
+            let _ = message;
+        }
+    }
+
+    /// 该连接是否按某个 page session 限定作用域。
+    fn client_has_page(&self, client: ClientId) -> bool {
+        self.clients
+            .get(&client)
+            .is_some_and(|state| state.page.is_some())
+    }
+
+    /// page 连接的 Target.getTargets 只在 broker 内过滤；实例级 Browser 端点保持原转发路径。
+    fn request_page_targets(
+        &mut self,
+        client_id: ClientId,
+        request: Request,
+        external_id: i64,
+        session: Option<String>,
+    ) {
+        let Some((page, role, epoch)) = self.clients.get(&client_id).and_then(|state| {
+            state
+                .page
+                .clone()
+                .map(|page| (page, state.role, state.epoch))
+        }) else {
+            return;
+        };
+        let spec = PendingSpec {
+            client: Some(client_id),
+            role: Some(role),
+            external_id: Some(external_id),
+            explicit_session: session.clone(),
+            epoch,
+            seq: None,
+            method: "Target.getTargets".to_string(),
+            kind: PendingKind::TargetsForClient { page },
+            deadline: self.client_deadline,
+        };
+        let lease = request.lease.clone();
+        if let Err(message) = self.send_raw_request("Target.getTargets", None, None, spec, lease) {
+            self.send_error(client_id, external_id, -32000, &message, session);
+        }
+    }
+
+    /// page 连接的 Target.getTargetInfo 默认查询本会话的主 target（或显式 session 的 target）。
+    fn request_page_target_info(
+        &mut self,
+        client_id: ClientId,
+        page: &str,
+        explicit_session: Option<&str>,
+        request: Request,
+        external_id: i64,
+    ) {
+        let Some((role, epoch, target)) = self.clients.get(&client_id).map(|state| {
+            let target = explicit_session
+                .and_then(|session| self.attachments.attachment(session))
+                .map_or_else(|| page.to_string(), |attachment| attachment.target.clone());
+            (state.role, state.epoch, target)
+        }) else {
+            return;
+        };
+        // 注入的 targetId 不经过 check_page_scope，这里必须再验证归属与实例 ID。
+        let owned = target == page || self.attachments.page_of_target(&target) == Some(page);
+        if INSTANCE_TARGET_IDS.contains(&target.as_str()) || !owned {
+            let message = if INSTANCE_TARGET_IDS.contains(&target.as_str()) {
+                PAGE_SESSION_DENIED_MESSAGE
+            } else {
+                PAGE_SESSION_UNOWNED_MESSAGE
+            };
+            self.send_error(
+                client_id,
+                external_id,
+                -32000,
+                message,
+                explicit_session.map(str::to_string),
+            );
+            return;
+        }
+        let spec = PendingSpec {
+            client: Some(client_id),
+            role: Some(role),
+            external_id: Some(external_id),
+            explicit_session: explicit_session.map(str::to_string),
+            epoch,
+            seq: None,
+            method: "Target.getTargetInfo".to_string(),
+            kind: PendingKind::Client,
+            deadline: self.client_deadline,
+        };
+        let params = json!({ "targetId": target });
+        let Ok(raw) = serde_json::value::to_raw_value(&params) else {
+            self.send_error(
+                client_id,
+                external_id,
+                -32000,
+                "Invalid CDP request",
+                explicit_session.map(str::to_string),
+            );
+            return;
+        };
+        let lease = request.lease.clone();
+        if let Err(message) =
+            self.send_raw_request("Target.getTargetInfo", Some(&raw), None, spec, lease)
+        {
+            self.send_error(
+                client_id,
+                external_id,
+                -32000,
+                &message,
+                explicit_session.map(str::to_string),
+            );
+        }
+    }
+
+    /// getTargets 的 targetInfos 也带 opener/父 frame；分页过滤前先记录归属关系。
+    fn record_target_infos(&mut self, value: &Received) {
+        if value.has_error() {
+            return;
+        }
+        let budget = self.upstream.handle.budget.clone();
+        let mut scratch = budget.json_scratch();
+        let Some(infos) = value
+            .raw
+            .node("result")
+            .and_then(|node| node.field("targetInfos", &mut scratch))
+        else {
+            return;
+        };
+        if !infos.is_array() {
+            return;
+        }
+        let Some(mut array) = infos.array(&mut scratch) else {
+            return;
+        };
+        let mut target_buffer = [0; 4096];
+        let mut opener_buffer = [0; 4096];
+        while let Ok(Some(info)) = array.next(&mut scratch) {
+            let target = info
+                .field("targetId", &mut scratch)
+                .map(|node| node.identity_text(&mut target_buffer, &mut scratch))
+                .transpose()
+                .ok()
+                .flatten()
+                .flatten()
+                .map(str::to_string);
+            let Some(target) = target else {
+                continue;
+            };
+            if let Some(kind) = info.field("type", &mut scratch) {
+                let is_page = kind.equals("page", &mut scratch);
+                self.attachments.record_target_kind(&target, is_page);
+            }
+            let opener = info
+                .field("openerId", &mut scratch)
+                .or_else(|| info.field("openerFrameId", &mut scratch))
+                .map(|node| node.identity_text(&mut opener_buffer, &mut scratch))
+                .transpose()
+                .ok()
+                .flatten()
+                .flatten()
+                .map(str::to_string);
+            self.attachments.record_relation(&target, opener.as_deref());
+        }
+    }
+
+    fn send_page_targets(
+        &mut self,
+        client: ClientId,
+        external_id: i64,
+        page: &str,
+        session: Option<String>,
+        value: &Received,
+    ) {
+        self.record_target_infos(value);
+        if value.has_error() {
+            self.send_upstream_reply(client, external_id, session, value);
+            return;
+        }
+        let budget = self.upstream.handle.budget.clone();
+        let filtered = {
+            let mut scratch = budget.json_scratch();
+            scoped_target_infos(value, &budget, &mut scratch, |target| {
+                target == page || self.attachments.owns_page_target(page, target)
+            })
+        };
+        let Ok(raw) = filtered else {
+            self.send_error(
+                client,
+                external_id,
+                -32000,
+                "Payload budget exhausted",
+                session,
+            );
+            return;
+        };
+        let list = {
+            let mut scratch = budget.json_scratch();
+            raw.raw(raw.full_span(), &mut scratch)
+        };
+        let Ok(list) = list else {
+            self.send_error(
+                client,
+                external_id,
+                -32000,
+                "Payload budget exhausted",
+                session,
+            );
+            return;
+        };
+        #[derive(serde::Serialize)]
+        struct TargetList<'a> {
+            #[serde(rename = "targetInfos")]
+            target_infos: &'a RawValue,
+        }
+        self.send_reply(
+            client,
+            external_id,
+            TargetList { target_infos: list },
+            session,
+        );
+    }
+
+    /// 拒绝跨 session attach 后收回上游 session；不登记 attachment，只等结算。
+    fn detach_scoped(&mut self, session: &str) {
+        let params = json!({ "sessionId": session });
+        let spec = PendingSpec {
+            client: None,
+            role: None,
+            external_id: None,
+            explicit_session: None,
+            epoch: self.control_epoch,
+            seq: None,
+            method: "Target.detachFromTarget".to_string(),
+            kind: PendingKind::ScopeDetach,
+            deadline: self.internal_deadline,
+        };
+        if self
+            .send_request("Target.detachFromTarget", Some(&params), None, spec)
+            .is_err()
+        {
+            self.observer.kind("scope-detach-unavailable");
+        }
+    }
+
     fn start_page_attach(&mut self, client_id: ClientId, target: &str, seq: u64) -> bool {
+        if self.page_endpoint_error(target).is_some() {
+            return false;
+        }
         let Some(client) = self.clients.get(&client_id) else {
             return false;
         };
         let params = json!({ "targetId": target, "flatten": true });
-        if self.attachments.reserve(target, client_id, client.epoch)
+        if self
+            .attachments
+            .reserve(target, client_id, client.epoch, Some(target))
             != AttachmentReservation::Reserved
         {
             return false;
@@ -2568,9 +3179,13 @@ impl Broker {
         let Some(client) = client else {
             return;
         };
-        let outcome = self
-            .attachments
-            .register(client, epoch, session, target, None);
+        let page = self
+            .clients
+            .get(&client)
+            .and_then(|state| state.page.clone());
+        let outcome =
+            self.attachments
+                .register(client, epoch, session, target, None, page.as_deref());
         self.attachments.clear_intent(target, client);
         match outcome {
             Registration::New | Registration::Existing => {}
@@ -2578,6 +3193,10 @@ impl Broker {
                 self.quarantine_attachment(client, epoch, session, target);
             }
             Registration::Foreign | Registration::Quarantined => {}
+            Registration::ForeignPage => {
+                self.detach_scoped(session);
+                return;
+            }
             Registration::Budget => {
                 self.handle_lost("attachment metadata budget exhausted".into());
                 return;
@@ -2605,6 +3224,9 @@ impl Broker {
         if method == EventMethod::Detached {
             self.detached_event(value);
             return;
+        }
+        if method == EventMethod::Discovery {
+            self.record_target_relation(&value);
         }
         if value.outer.is_none() && method == EventMethod::Discovery {
             let recipients = self
@@ -2667,6 +3289,28 @@ impl Broker {
             })
     }
 
+    /// 目标信息里的关系决定子 frame/popup 的归属；缺失时目标保持无归属。
+    fn record_target_relation(&mut self, value: &Received) {
+        let budget = self.upstream.handle.budget.clone();
+        let mut scratch = budget.json_scratch();
+        let target = received_identity(value, value.target, &mut scratch);
+        let opener = received_identity(value, value.opener, &mut scratch);
+        let Some(target) = target else {
+            return;
+        };
+        if value.destroyed {
+            self.attachments.forget_relation(&target);
+            self.attachments.forget_target_kind(&target);
+        } else {
+            if let Some(is_page) = value.page_target {
+                self.attachments.record_target_kind(&target, is_page);
+            }
+            if let Some(opener) = opener.as_deref() {
+                self.attachments.record_relation(&target, Some(opener));
+            }
+        }
+    }
+
     // span 已在 parse 中验证类型、4096-byte 上限和 Unicode；后续只借用同一不可变 owner。
     fn attached_event(&mut self, value: Received) {
         let Some(session_span) = value.session else {
@@ -2706,6 +3350,14 @@ impl Broker {
         let (Some(session), Some(target)) = (session, target) else {
             return;
         };
+        // attach 事件同样携带 opener/父 frame；先记录关系，再据此判定 page 归属。
+        if let Some(is_page) = value.page_target {
+            self.attachments.record_target_kind(target, is_page);
+        }
+        if let Some(opener) = received_identity(&value, value.opener, &mut budget.json_scratch()) {
+            self.attachments
+                .record_relation(target, Some(opener.as_str()));
+        }
         // 未结算 cleanup detach 仍按同一 sessionId 在线寻址；窗口内同 ID attached 不是
         // 新 attachment，也不派第二次 detach。存活 attachment 仍走 register 原分支。
         if self.attachments.attachment(session).is_none() && self.cleanup_detach_unsettled(session)
@@ -2720,16 +3372,31 @@ impl Broker {
         };
         let epoch = state.epoch;
         let retired = state.closed || state.retired;
+        let page = state.page.clone();
+        // page 连接只能登记自己 attach 过的 target，或 opener/父 frame 属于本页的目标；
+        // 引擎主动附加的其他会话目标不投递，并收回上游 session。
+        if let Some(page) = page.as_deref() {
+            let intent = self.attachments.intent(target) == Some(owner);
+            if !intent && !self.attachments.owns_page_target(page, target) {
+                self.detach_scoped(session);
+                return;
+            }
+        }
         let auto = self.attachments.intent(target).is_none()
             && outer
                 .and_then(|session| self.attachments.owner(session))
                 .is_none();
-        let outcome = self
-            .attachments
-            .register(owner, epoch, session, target, outer);
+        let outcome =
+            self.attachments
+                .register(owner, epoch, session, target, outer, page.as_deref());
         match outcome {
             Registration::New | Registration::Existing => {}
             Registration::Foreign | Registration::Quarantined => return,
+            // 目标已被另一个 page session 登记：不投递，也不留下匿名上游 session。
+            Registration::ForeignPage => {
+                self.detach_scoped(session);
+                return;
+            }
             Registration::Full => {
                 self.quarantine_attachment(owner, epoch, session, target);
                 if auto {
@@ -2855,6 +3522,21 @@ impl Broker {
         let method = pending.method.clone();
         match pending.kind {
             PendingKind::Targets(reply) => {
+                let _ = reply.send(Err("Target discovery timed out".to_string()));
+            }
+            PendingKind::TargetsForClient { .. } => {
+                if let Some(client) = client {
+                    self.send_error(
+                        client,
+                        external_id.unwrap_or_default(),
+                        -32000,
+                        "Target discovery timed out",
+                        explicit_session,
+                    );
+                }
+            }
+            PendingKind::ScopeDetach => {}
+            PendingKind::ScopedTargets { reply, .. } => {
                 let _ = reply.send(Err("Target discovery timed out".to_string()));
             }
             PendingKind::Flush => {
@@ -3212,6 +3894,38 @@ impl Broker {
                 let result = targets_from(value, &self.upstream.handle.budget);
                 let _ = reply.send(result);
             }
+            PendingKind::TargetsForClient { page } => {
+                if let Some(client) = pending.client {
+                    self.send_page_targets(
+                        client,
+                        pending.external_id.unwrap_or_default(),
+                        &page,
+                        pending.explicit_session.clone(),
+                        value,
+                    );
+                }
+            }
+            // 收回被拒绝的上游 session；没有 attachment 需要登记或通知。
+            PendingKind::ScopeDetach => {}
+            PendingKind::ScopedTargets { page, reply } => {
+                let result = if value.has_error() {
+                    Err("Target discovery failed".to_string())
+                } else {
+                    self.record_target_infos(value);
+                    let budget = self.upstream.handle.budget.clone();
+                    let filtered = {
+                        let mut scratch = budget.json_scratch();
+                        scoped_target_infos(value, &budget, &mut scratch, |target| {
+                            target == page.as_str()
+                                || self.attachments.owns_page_target(&page, target)
+                        })
+                    };
+                    filtered
+                        .map(|raw| LeasedTargets { raw })
+                        .map_err(|_| "Target discovery budget exhausted".to_string())
+                };
+                let _ = reply.send(result);
+            }
             PendingKind::RetirementAuto { id: retirement } => {
                 self.retirement_auto_response(id, retirement, value);
             }
@@ -3259,9 +3973,13 @@ impl Broker {
         let Some(epoch) = self.clients.get(&client_id).map(|state| state.epoch) else {
             return;
         };
-        let outcome = self
-            .attachments
-            .register(client_id, epoch, &session, target, None);
+        let page = self
+            .clients
+            .get(&client_id)
+            .and_then(|state| state.page.clone());
+        let outcome =
+            self.attachments
+                .register(client_id, epoch, &session, target, None, page.as_deref());
         self.attachments.clear_intent(target, client_id);
         match outcome {
             Registration::New | Registration::Existing => {}
@@ -3271,6 +3989,12 @@ impl Broker {
                 return;
             }
             Registration::Foreign | Registration::Quarantined => {
+                self.disconnect_client(client_id, 1008, "Target expired", true);
+                return;
+            }
+            // reserve 已按页面归属拒绝；若仍竞争失败，只结算上游 session。
+            Registration::ForeignPage => {
+                self.detach_scoped(&session);
                 self.disconnect_client(client_id, 1008, "Target expired", true);
                 return;
             }
@@ -3356,9 +4080,18 @@ impl Broker {
             // 已发出的 attach 按发起时的 client/epoch 登记，不借用当前 controller 身份。
             let epoch = active.work.epoch;
             let parent = active.work.explicit_session.clone();
-            let outcome =
-                self.attachments
-                    .register(client, epoch, &session, &target, parent.as_deref());
+            let page = self
+                .clients
+                .get(&client)
+                .and_then(|state| state.page.clone());
+            let outcome = self.attachments.register(
+                client,
+                epoch,
+                &session,
+                &target,
+                parent.as_deref(),
+                page.as_deref(),
+            );
             self.attachments.clear_intent(&target, client);
             match outcome {
                 Registration::New | Registration::Existing => {
@@ -3377,6 +4110,10 @@ impl Broker {
                                 .into(),
                         )),
                     );
+                }
+                Registration::ForeignPage => {
+                    self.detach_scoped(&session);
+                    self.finish_managed(active.work, Err((-32000, FOREIGN_TARGET_MESSAGE.into())));
                 }
                 Registration::Budget => {
                     self.handle_lost("attachment metadata budget exhausted".into());
@@ -3609,11 +4346,21 @@ impl Broker {
             (candidate, next)
         };
         let _ = next;
-        match self.attachments.reserve(&candidate, client, epoch) {
+        let page = self
+            .clients
+            .get(&client)
+            .and_then(|state| state.page.clone());
+        match self
+            .attachments
+            .reserve(&candidate, client, epoch, page.as_deref())
+        {
             AttachmentReservation::Reserved => {}
             AttachmentReservation::Full => {
                 self.auto_overflow(client);
                 return BackfillStep::Failed(ATTACH_LIMIT_MESSAGE.into());
+            }
+            AttachmentReservation::ForeignPage => {
+                return BackfillStep::Failed(FOREIGN_TARGET_MESSAGE.into());
             }
             AttachmentReservation::Busy | AttachmentReservation::Budget => {
                 return BackfillStep::Failed("Payload budget exhausted".into());
@@ -3674,9 +4421,13 @@ impl Broker {
         };
         // 已发出的 attach 始终按原 client/epoch 登记，不读取当前 controller 身份。
         let epoch = active.work.epoch;
-        let outcome = self
-            .attachments
-            .register(client, epoch, &session, target, None);
+        let page = self
+            .clients
+            .get(&client)
+            .and_then(|state| state.page.clone());
+        let outcome =
+            self.attachments
+                .register(client, epoch, &session, target, None, page.as_deref());
         self.attachments.clear_intent(target, client);
         match outcome {
             Registration::New | Registration::Existing => self.continue_backfill(active),
@@ -3694,6 +4445,10 @@ impl Broker {
                             .into(),
                     )),
                 );
+            }
+            Registration::ForeignPage => {
+                self.detach_scoped(&session);
+                self.finish_managed(active.work, Err((-32000, FOREIGN_TARGET_MESSAGE.into())));
             }
             Registration::Budget => {
                 self.handle_lost("attachment metadata budget exhausted".into());
@@ -3931,6 +4686,14 @@ impl Broker {
         if !failed {
             return;
         }
+        // page 连接从不持有实例级 auto owner，失败回滚也不能改写它。
+        if self
+            .clients
+            .get(&client)
+            .is_none_or(|state| state.page.is_some())
+        {
+            return;
+        }
         if auto {
             if self.attachments.auto_owner == Some(client) {
                 self.attachments.auto_owner = None;
@@ -3962,11 +4725,18 @@ impl Broker {
             }
             "Target.setAutoAttach" => {
                 // Node 在发送前记录 auto owner，失败不回滚；这里保持同一可见性。
-                let auto = work.params.auto_attach.unwrap_or(false);
-                if auto {
-                    self.attachments.auto_owner = Some(work.client);
-                } else {
-                    self.attachments.auto_owner = None;
+                // page 连接在准入时已明确拒绝，只有 Browser 端点能改写实例级 auto owner。
+                if self
+                    .clients
+                    .get(&work.client)
+                    .is_some_and(|state| state.page.is_none())
+                {
+                    let auto = work.params.auto_attach.unwrap_or(false);
+                    if auto {
+                        self.attachments.auto_owner = Some(work.client);
+                    } else {
+                        self.attachments.auto_owner = None;
+                    }
                 }
                 Ok(())
             }
@@ -3980,9 +4750,18 @@ impl Broker {
         client: ClientId,
         epoch: u64,
     ) -> Result<(), &'static str> {
-        match self.attachments.reserve(target, client, epoch) {
+        let page = self
+            .clients
+            .get(&client)
+            .and_then(|state| state.page.clone());
+        match self
+            .attachments
+            .reserve(target, client, epoch, page.as_deref())
+        {
             AttachmentReservation::Reserved => Ok(()),
             AttachmentReservation::Full => Err(ATTACH_LIMIT_MESSAGE),
+            // 目标属于另一个 page session；明确拒绝，不静默转发。
+            AttachmentReservation::ForeignPage => Err(FOREIGN_TARGET_MESSAGE),
             AttachmentReservation::Busy | AttachmentReservation::Budget => {
                 Err("This connection does not own that attachment")
             }
@@ -4036,9 +4815,7 @@ impl Broker {
         if state.role == Role::Viewer {
             return true;
         }
-        self.controller.as_deref() == Some(state.owner.as_str())
-            && state.epoch == self.control_epoch
-            && self.active_controller == Some(client)
+        self.controller_active(client)
     }
 }
 
@@ -4060,6 +4837,21 @@ fn stage_id(stage: &ManagedStage) -> Option<u64> {
     }
 }
 
+fn received_identity(
+    value: &Received,
+    span: Option<RawSpan>,
+    scratch: &mut crate::transport::JsonScratchGuard<'_>,
+) -> Option<String> {
+    let mut buffer = [0; 4096];
+    value
+        .raw
+        .at(span?)
+        .identity_text(&mut buffer, scratch)
+        .ok()
+        .flatten()
+        .map(str::to_string)
+}
+
 fn target_infos(
     value: &Received,
     budget: &PayloadBudget,
@@ -4073,6 +4865,45 @@ fn target_infos(
         Some(infos) => infos.copy(budget, scratch),
         None => LeasedRaw::literal("[]", budget),
     }
+}
+
+/// 保持 targetInfos 每个元素的原始字节，只保留本 page session 可见的 target。
+fn scoped_target_infos(
+    value: &Received,
+    budget: &PayloadBudget,
+    scratch: &mut crate::transport::JsonScratchGuard<'_>,
+    owned: impl Fn(&str) -> bool,
+) -> Result<LeasedRaw, cdp_raw::RawError> {
+    let infos = target_infos(value, budget, scratch)?;
+    let capacity = infos.as_str().len().saturating_add(1);
+    let lease = budget
+        .try_acquire(capacity, false)
+        .ok_or(cdp_raw::RawError::Budget)?;
+    let mut text = String::with_capacity(capacity);
+    text.push('[');
+    let mut array = infos
+        .node()
+        .array(scratch)
+        .ok_or(cdp_raw::RawError::Invalid)?;
+    let mut buffer = [0; 4096];
+    let mut first = true;
+    while let Some(info) = array.next(scratch)? {
+        let target = info
+            .field("targetId", scratch)
+            .map(|node| node.identity_text(&mut buffer, scratch))
+            .transpose()?
+            .flatten();
+        if !target.is_some_and(&owned) {
+            continue;
+        }
+        if !first {
+            text.push(',');
+        }
+        first = false;
+        text.push_str(info.raw(scratch)?.get());
+    }
+    text.push(']');
+    LeasedRaw::new(text, lease)
 }
 
 fn targets_from(value: &Received, budget: &PayloadBudget) -> Result<LeasedTargets, String> {
@@ -5157,6 +5988,9 @@ impl Broker {
         self.unknown.clear();
         self.client_pending = 0;
         self.internal_pending = 0;
+        for page in std::mem::take(&mut self.page_sessions).into_keys() {
+            self.attachments.release_primary(&page);
+        }
         for (client, external, session) in failures {
             self.send_error(
                 client,

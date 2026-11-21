@@ -334,7 +334,13 @@ async fn handle_request(
             })
             .to_string(),
         ),
-        (Method::GET, "/json") | (Method::GET, "/json/list") => targets_body(&context).await,
+        (Method::GET, "/json") | (Method::GET, "/json/list") => {
+            let query = match parse_query(request.uri().query()) {
+                Ok(query) => query,
+                Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+            };
+            targets_body(&context, &query).await
+        }
         (Method::POST, "/flush") => match context.broker.flush().await {
             Ok(status) => match budgeted_body(&context.broker.payload_budget(), &status) {
                 Some(body) => json_response(StatusCode::OK, body),
@@ -555,8 +561,14 @@ async fn session_body(context: &HostContext) -> Response<Full<Bytes>> {
     )
 }
 
-async fn targets_body(context: &HostContext) -> Response<Full<Bytes>> {
-    let tabs = match context.broker.targets().await {
+// `page` 是 loopback 单用户模型下的便利过滤，不是授权边界：查询参数由调用方提供，
+// 不能证明它属于调用者的 session。需要隔离的调用方应使用页面 CDP 的 Target.getTargets。
+async fn targets_body(context: &HostContext, query: &Query) -> Response<Full<Bytes>> {
+    let tabs = match &query.page {
+        Some(page) => context.broker.targets_for_page(page.clone()).await,
+        None => context.broker.targets().await,
+    };
+    let tabs = match tabs {
         Ok(tabs) => tabs,
         Err(message) => return error_response(StatusCode::CONFLICT, &message),
     };
@@ -807,6 +819,8 @@ struct Query {
     session: Option<String>,
     role: Option<String>,
     owner: Option<String>,
+    /// `/json/list?page=<targetId>` 把发现范围限定到该 page session。
+    page: Option<String>,
 }
 
 fn parse_query(query: Option<&str>) -> Result<Query, String> {
@@ -825,6 +839,7 @@ fn parse_query(query: Option<&str>) -> Result<Query, String> {
         session: values.remove("session"),
         role: values.remove("role"),
         owner: values.remove("owner"),
+        page: values.remove("page"),
     })
 }
 

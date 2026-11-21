@@ -3,11 +3,11 @@
 // https://opensource.org/licenses/Apache-2.0
 
 // attachment 归属只在 broker actor 内同步维护；本模块不启动任务、不加锁，也不决定
-// 可见性。归属优先级与 Node 宿主一致：显式 attach intent、已知 parent session、当前
-// autoattach owner。事件先解析接收者再修改状态，断开时只回收连接自己的 attachment。
-// 数量上限在这里统一检查；超限但已在上游创建的 session 只进入有界 quarantine。
+// 可见性。归属优先级：显式 attach intent、已知 parent session、autoattach owner；
+// 子 frame/popup 另按引擎报告的 opener/父 frame 链继承创建页归属。断开时只回收连接
+// 自己的 attachment；上限在这里检查，超限但已创建的 session 进入有界 quarantine。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::broker::ClientId;
 use crate::transport::{PayloadBudget, PayloadLease};
@@ -15,6 +15,10 @@ use crate::transport::{PayloadBudget, PayloadLease};
 pub const MAX_ATTACHMENTS: usize = 1024;
 pub const MAX_ATTACHMENTS_PER_CLIENT: usize = 256;
 pub const MAX_QUARANTINE: usize = 32;
+/// 引擎报告的 opener/父 frame 关系只需要覆盖活跃目标；超出后新目标保持无归属。
+const MAX_TARGET_RELATIONS: usize = 4096;
+/// 父链只可能来自引擎报告的 frame/popup 深度；截断防止异常环路。
+const MAX_RELATION_DEPTH: usize = 32;
 
 pub struct Attachment {
     pub session: String,
@@ -22,6 +26,7 @@ pub struct Attachment {
     pub parent: Option<String>,
     pub client: ClientId,
     pub epoch: u64,
+    page: Option<String>,
     _payload: PayloadLease,
 }
 
@@ -56,6 +61,8 @@ pub enum AttachmentReservation {
     Busy,
     Full,
     Budget,
+    /// target 已登记给另一个 page session。
+    ForeignPage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +73,8 @@ pub enum Registration {
     Quarantined,
     Full,
     Budget,
+    /// target 已登记给另一个 page session，不能为当前连接建立 attachment。
+    ForeignPage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,11 +87,25 @@ pub enum QuarantineResult {
     Budget,
 }
 
+struct PageClaim {
+    page: String,
+    attachments: usize,
+    /// 主 target 在其控制连接建立时即归属该页面，不依赖 attach 回复的先后。
+    primary: bool,
+}
+
 #[derive(Default)]
 pub struct Attachments {
     sessions: HashMap<String, Attachment>,
     explicit: HashMap<String, Intent>,
     quarantine: HashMap<String, Quarantine>,
+    /// target 独占：同一 target 只归属一个 page session，最后一个 attachment 释放时归还。
+    /// Browser 端点连接不登记，保持实例级可见性。
+    claims: HashMap<String, PageClaim>,
+    /// 引擎目标信息里的 opener/父 frame：子 target 通过它继承创建页的归属。
+    relations: HashMap<String, String>,
+    /// 引擎明确报告为非 page 的目标；类型未知的目标不记录，端点校验保持兼容。
+    non_page_targets: HashSet<String>,
     budget: PayloadBudget,
     pub auto_owner: Option<ClientId>,
 }
@@ -118,9 +141,18 @@ impl Attachments {
     }
 
     /// 派发前占一个 client/global 槽；在途 attach 与早期事件共享该预留。
-    pub fn reserve(&mut self, target: &str, client: ClientId, epoch: u64) -> AttachmentReservation {
+    pub fn reserve(
+        &mut self,
+        target: &str,
+        client: ClientId,
+        epoch: u64,
+        page: Option<&str>,
+    ) -> AttachmentReservation {
         if self.explicit.contains_key(target) {
             return AttachmentReservation::Busy;
+        }
+        if page.is_some_and(|page| !self.page_accepts(target, page)) {
+            return AttachmentReservation::ForeignPage;
         }
         if !self.can_reserve(client) {
             return AttachmentReservation::Full;
@@ -148,6 +180,7 @@ impl Attachments {
         session: &str,
         target: &str,
         parent: Option<&str>,
+        page: Option<&str>,
     ) -> Registration {
         if let Some(existing) = self.sessions.get(session) {
             return if existing.client == client {
@@ -158,6 +191,9 @@ impl Attachments {
         }
         if self.quarantine.contains_key(session) {
             return Registration::Quarantined;
+        }
+        if page.is_some_and(|page| !self.page_accepts(target, page)) {
+            return Registration::ForeignPage;
         }
         let mut reserved = false;
         if let Some(intent) = self.explicit.get(target) {
@@ -197,8 +233,24 @@ impl Attachments {
                 parent: parent.map(str::to_owned),
                 client,
                 epoch,
+                page: page.map(str::to_owned),
             },
         );
+        if let Some(page) = page {
+            match self.claims.get_mut(target) {
+                Some(claim) => claim.attachments = claim.attachments.saturating_add(1),
+                None => {
+                    self.claims.insert(
+                        target.to_string(),
+                        PageClaim {
+                            page: page.to_string(),
+                            attachments: 1,
+                            primary: false,
+                        },
+                    );
+                }
+            }
+        }
         Registration::New
     }
 
@@ -377,8 +429,140 @@ impl Attachments {
     }
 
     /// 先返回接收者，再由调用方决定投递；移除后不会再被当作广播事件。
+    /// 释放最后一个页面归属引用时归还 target。
     pub fn forget(&mut self, session: &str) -> Option<Attachment> {
-        self.sessions.remove(session)
+        let attachment = self.sessions.remove(session)?;
+        if attachment.page.is_some() {
+            self.release_claim(&attachment.target);
+        }
+        Some(attachment)
+    }
+
+    /// 记录引擎报告的 opener/父 frame；只用于把子 target 绑定到创建它的 page session。
+    pub fn record_relation(&mut self, target: &str, opener: Option<&str>) {
+        let Some(opener) = opener.filter(|opener| *opener != target) else {
+            return;
+        };
+        if self.relations.len() >= MAX_TARGET_RELATIONS && !self.relations.contains_key(target) {
+            return;
+        }
+        self.relations
+            .insert(target.to_string(), opener.to_string());
+    }
+
+    pub fn forget_relation(&mut self, target: &str) {
+        self.relations.remove(target);
+    }
+
+    /// 引擎报告的 targetInfo.type：只有 page 能作 page 端点的主目标。
+    pub fn record_target_kind(&mut self, target: &str, is_page: bool) {
+        if is_page {
+            self.non_page_targets.remove(target);
+            return;
+        }
+        if self.non_page_targets.len() >= MAX_TARGET_RELATIONS
+            && !self.non_page_targets.contains(target)
+        {
+            return;
+        }
+        self.non_page_targets.insert(target.to_string());
+    }
+
+    pub fn forget_target_kind(&mut self, target: &str) {
+        self.non_page_targets.remove(target);
+    }
+
+    /// 已由引擎证明不是顶层 page：带 opener/父 frame，或类型不是 page。
+    pub fn is_not_top_level_page(&self, target: &str) -> bool {
+        self.relations.contains_key(target) || self.non_page_targets.contains(target)
+    }
+
+    /// page session 是否仍可登记该 target；已登记归属或引擎报告的父链都属于同一页。
+    fn page_accepts(&self, target: &str, page: &str) -> bool {
+        self.page_of_target(target)
+            .is_none_or(|owner| owner == page)
+    }
+
+    /// 控制连接建立时先登记主 target；已被其他页面登记或并非顶层 page 时拒绝。
+    pub fn claim_primary(&mut self, target: &str) -> bool {
+        if self.is_not_top_level_page(target) {
+            return false;
+        }
+        match self.claims.get_mut(target) {
+            Some(claim) => {
+                if claim.page != target {
+                    return false;
+                }
+                claim.primary = true;
+                true
+            }
+            None => {
+                self.claims.insert(
+                    target.to_string(),
+                    PageClaim {
+                        page: target.to_string(),
+                        attachments: 0,
+                        primary: true,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// 控制连接结束后归还主 target；仍有 attachment 时保留到最后一个释放。
+    pub fn release_primary(&mut self, page: &str) {
+        let Some(claim) = self.claims.get_mut(page) else {
+            return;
+        };
+        if !claim.primary {
+            return;
+        }
+        claim.primary = false;
+        if claim.attachments == 0 {
+            self.claims.remove(page);
+        }
+    }
+
+    /// 以该 target 为主页面的连接能否接入；其他页面已登记时会被拒绝。
+    pub fn page_target_claimed_by_other(&self, target: &str) -> bool {
+        self.page_of_target(target)
+            .is_some_and(|owner| owner != target)
+    }
+
+    fn release_claim(&mut self, target: &str) {
+        let Some(claim) = self.claims.get_mut(target) else {
+            return;
+        };
+        claim.attachments = claim.attachments.saturating_sub(1);
+        if claim.attachments == 0 && !claim.primary {
+            self.claims.remove(target);
+        }
+    }
+
+    /// Browser 端点连接不登记归属，因此这里只反映 page session 的 target 集合。
+    /// 未 attach 的子 frame/popup 也按引擎报告的 opener/父 frame 链归属到创建页。
+    pub fn page_of_target(&self, target: &str) -> Option<&str> {
+        let mut current = target;
+        for _ in 0..MAX_RELATION_DEPTH {
+            if let Some(claim) = self.claims.get(current) {
+                return Some(claim.page.as_str());
+            }
+            current = self.relations.get(current)?;
+        }
+        None
+    }
+
+    pub fn owns_page_target(&self, page: &str, target: &str) -> bool {
+        self.page_of_target(target) == Some(page)
+    }
+
+    pub fn targets_for_page(&self, page: &str) -> Vec<String> {
+        self.claims
+            .iter()
+            .filter(|(_, claim)| claim.page == page)
+            .map(|(target, _)| target.clone())
+            .collect()
     }
 
     pub fn first_session(&self, client: ClientId) -> Option<String> {
