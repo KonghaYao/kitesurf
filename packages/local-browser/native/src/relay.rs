@@ -561,6 +561,8 @@ async fn session_body(context: &HostContext) -> Response<Full<Bytes>> {
     )
 }
 
+// `page` 是 loopback 单用户模型下的便利过滤，不是授权边界：查询参数由调用方提供，
+// 不能证明它属于调用者的 session。需要隔离的调用方应使用页面 CDP 的 Target.getTargets。
 async fn targets_body(context: &HostContext, query: &Query) -> Response<Full<Bytes>> {
     let tabs = match &query.page {
         Some(page) => context.broker.targets_for_page(page.clone()).await,

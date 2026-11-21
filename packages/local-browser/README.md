@@ -87,21 +87,31 @@ rejected. A page session's primary target is bound as soon as its controller con
 session cannot attach it while the controller's first attach is still in flight. The
 `/devtools/browser` endpoint keeps the single-controller rule above and still sees every target and
 its discovery events. Provision pages through that endpoint first (`Target.createTarget`), then
-connect one page session per target; any other target is bound to the first page session that
-attaches to it.
+connect one page session per target. A frame or popup belongs to the page session whose target the
+engine reports as its `openerFrameId` or `openerId` parent. A page session can attach only targets
+it already owns and their reported children; any target the engine reports as another session's
+child, and any target with no reported owner, returns an explicit error instead of being attached.
+Target exclusivity therefore covers frames and popups, not just top-level pages.
 
 Page connections operate only their own target and CDP sessions. Instance-level methods such as
 `Browser.close`, `Target.createTarget`, `Target.createBrowserContext`,
 `Target.disposeBrowserContext`, `Storage.clearDataForOrigin`, `Storage.clearCookies`,
 `Network.clearBrowserCookies` and `Network.clearBrowserCache` return an explicit CDP error instead
-of being forwarded. `Fetch.enable` and the rest of `Fetch.*` are rejected until Fetch interception
-can be isolated per page. `Target.getTargets` and `/json/list?page={targetId}` list only the
-session's targets, and other sessions' target and attach events are not delivered.
-`Target.setAutoAttach` on a page connection stays scoped to that session and does not change the
-instance-wide auto-attach owner. All page sessions share the instance's single SQLite profile, so
-they see the same cookies and same-origin localStorage; use separate profiles for independent
-accounts. Viewer connections to `/devtools/page/{targetId}` keep their existing attach and frame
-behavior.
+of being forwarded. `Kitesurf.*` is instance-level except for the per-target state, scene,
+screencast and diagnostic methods that accept a `targetId`; a page connection must pass the
+`targetId` of a target it owns, and target-less or otherwise instance-wide calls (including
+`Kitesurf.setOutboundFilters`, `Kitesurf.disposeRenderer`, `Kitesurf.setPartialRaster`,
+`Kitesurf.getMemoryStats` and `Kitesurf.getPageState` without a target) are rejected.
+`Fetch.enable` and the rest of `Fetch.*` are rejected until Fetch interception can be isolated per
+page. `Target.getTargets` and `/json/list?page={targetId}` list only the session's targets,
+`Target.getTargetInfo` without a target defaults to the session's primary page, and other
+sessions' target and attach events are not delivered. `Target.setAutoAttach` on a page connection
+is rejected rather than silently doing nothing; use the `/devtools/browser` endpoint when
+instance-wide auto-attach is required. `/json/list?page={targetId}` trusts its query parameter
+under the loopback single-user trust model: it is a convenience filter, not an authorization check.
+All page sessions share the instance's single SQLite profile, so they see the same cookies and
+same-origin localStorage; use separate profiles for independent accounts. Viewer connections to
+`/devtools/page/{targetId}` keep their existing attach and frame behavior.
 
 Internet access uses the existing Kitesurf network stack. Page access to loopback/private
 networks is blocked by default; enable it intentionally with `--allow-private-network` for local

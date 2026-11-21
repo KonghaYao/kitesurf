@@ -3,9 +3,9 @@
 // https://opensource.org/licenses/Apache-2.0
 
 // attachment 归属只在 broker actor 内同步维护；本模块不启动任务、不加锁，也不决定
-// 可见性。归属优先级与 Node 宿主一致：显式 attach intent、已知 parent session、当前
-// autoattach owner。事件先解析接收者再修改状态，断开时只回收连接自己的 attachment。
-// 数量上限在这里统一检查；超限但已在上游创建的 session 只进入有界 quarantine。
+// 可见性。归属优先级：显式 attach intent、已知 parent session、autoattach owner；
+// 子 frame/popup 另按引擎报告的 opener/父 frame 链继承创建页归属。断开时只回收连接
+// 自己的 attachment；上限在这里检查，超限但已创建的 session 进入有界 quarantine。
 
 use std::collections::HashMap;
 
@@ -15,6 +15,10 @@ use crate::transport::{PayloadBudget, PayloadLease};
 pub const MAX_ATTACHMENTS: usize = 1024;
 pub const MAX_ATTACHMENTS_PER_CLIENT: usize = 256;
 pub const MAX_QUARANTINE: usize = 32;
+/// 引擎报告的 opener/父 frame 关系只需要覆盖活跃目标；超出后新目标保持无归属。
+const MAX_TARGET_RELATIONS: usize = 4096;
+/// 父链只可能来自引擎报告的 frame/popup 深度；截断防止异常环路。
+const MAX_RELATION_DEPTH: usize = 32;
 
 pub struct Attachment {
     pub session: String,
@@ -98,6 +102,8 @@ pub struct Attachments {
     /// target 独占：同一 target 只归属一个 page session，最后一个 attachment 释放时归还。
     /// Browser 端点连接不登记，保持实例级可见性。
     claims: HashMap<String, PageClaim>,
+    /// 引擎目标信息里的 opener/父 frame：子 target 通过它继承创建页的归属。
+    relations: HashMap<String, String>,
     budget: PayloadBudget,
     pub auto_owner: Option<ClientId>,
 }
@@ -430,7 +436,23 @@ impl Attachments {
         Some(attachment)
     }
 
-    /// page session 是否仍可登记该 target；未登记的 target 由第一个 page session 取得。
+    /// 记录引擎报告的 opener/父 frame；只用于把子 target 绑定到创建它的 page session。
+    pub fn record_relation(&mut self, target: &str, opener: Option<&str>) {
+        let Some(opener) = opener.filter(|opener| *opener != target) else {
+            return;
+        };
+        if self.relations.len() >= MAX_TARGET_RELATIONS && !self.relations.contains_key(target) {
+            return;
+        }
+        self.relations
+            .insert(target.to_string(), opener.to_string());
+    }
+
+    pub fn forget_relation(&mut self, target: &str) {
+        self.relations.remove(target);
+    }
+
+    /// page session 是否仍可登记该 target；已登记归属或引擎报告的父链都属于同一页。
     fn page_accepts(&self, target: &str, page: &str) -> bool {
         self.page_of_target(target)
             .is_none_or(|owner| owner == page)
@@ -491,8 +513,16 @@ impl Attachments {
     }
 
     /// Browser 端点连接不登记归属，因此这里只反映 page session 的 target 集合。
+    /// 未 attach 的子 frame/popup 也按引擎报告的 opener/父 frame 链归属到创建页。
     pub fn page_of_target(&self, target: &str) -> Option<&str> {
-        self.claims.get(target).map(|claim| claim.page.as_str())
+        let mut current = target;
+        for _ in 0..MAX_RELATION_DEPTH {
+            if let Some(claim) = self.claims.get(current) {
+                return Some(claim.page.as_str());
+            }
+            current = self.relations.get(current)?;
+        }
+        None
     }
 
     pub fn owns_page_target(&self, page: &str, target: &str) -> bool {

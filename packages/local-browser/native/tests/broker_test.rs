@@ -1384,6 +1384,17 @@ async fn cross_page_session_attach_is_rejected_before_upstream() {
     .await;
     let attach = next_request(&mut engine).await;
     engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+    // 引擎在 targetInfos 里报告 shared 是 page-a 的 frame；关系先于 attach 记录。
+    send(&alice, &broker, r#"{"id":0,"method":"Target.getTargets"}"#).await;
+    let targets = next_request(&mut engine).await;
+    engine.reply(
+        request_id(&targets),
+        json!({"targetInfos":[
+            {"targetId":"page-a","type":"page"},
+            {"targetId":"shared","type":"iframe","openerFrameId":"page-a"}
+        ]}),
+    );
+    assert_eq!(next_frame(&mut alice).await["id"], 0);
     send(
         &alice,
         &broker,
@@ -1497,7 +1508,7 @@ async fn page_session_owns_its_primary_target_before_attach_completes() {
     assert!(!broker.wait_terminal().await);
 }
 
-// 控制连接断开并收回上游 session 后，主 target 回到可登记状态。
+// 控制连接断开并收回上游 session 后，主 target 回到可登记状态；另一个会话不能接管它。
 #[tokio::test]
 async fn page_session_releases_primary_target_after_disconnect() {
     let mut engine = fake_engine().await;
@@ -1521,7 +1532,7 @@ async fn page_session_releases_primary_target_after_disconnect() {
     let detach = next_method(&mut engine, "Target.detachFromTarget").await;
     assert_eq!(detach["params"]["sessionId"], "session-a");
     engine.reply(request_id(&detach), json!({}));
-    // 另一个 page session 可以重新登记这个 target。
+    // 另一个 page session 不能以 target ID 取得已释放的主 target。
     let mut bob = connect(
         &broker,
         Endpoint::Page {
@@ -1539,10 +1550,27 @@ async fn page_session_releases_primary_target_after_disconnect() {
         r#"{"id":2,"method":"Target.attachToTarget","params":{"targetId":"page-a","flatten":true}}"#,
     )
     .await;
+    let rejected = next_frame(&mut bob).await;
+    assert_eq!(rejected["id"], 2);
+    assert!(
+        message(&rejected).contains("not part of this page session"),
+        "{}",
+        message(&rejected)
+    );
+    expect_no_request(&mut engine).await;
+    // 同一 target 的新 page session 可以重新登记它。
+    let _again = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
     let attach = next_request(&mut engine).await;
     assert_eq!(attach["params"]["targetId"], "page-a");
     engine.reply(request_id(&attach), json!({"sessionId":"session-a2"}));
-    assert_eq!(next_frame(&mut bob).await["id"], 2);
     engine.kill();
     assert!(!broker.wait_terminal().await);
 }
@@ -1610,6 +1638,17 @@ async fn page_session_target_list_and_events_are_scoped() {
     .await;
     let attach = next_request(&mut engine).await;
     engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+    // child-a 的父 frame 是 page-a；先由 getTargets 记录关系，attach 才能取得归属。
+    send(&alice, &broker, r#"{"id":5,"method":"Target.getTargets"}"#).await;
+    let targets = next_request(&mut engine).await;
+    engine.reply(
+        request_id(&targets),
+        json!({"targetInfos":[
+            {"targetId":"page-a","type":"page"},
+            {"targetId":"child-a","type":"iframe","openerFrameId":"page-a"}
+        ]}),
+    );
+    assert_eq!(next_frame(&mut alice).await["id"], 5);
     send(
         &alice,
         &broker,
@@ -1733,6 +1772,342 @@ async fn page_session_rejects_instance_and_unscoped_methods() {
         );
     }
     expect_no_request(&mut engine).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+// Kitesurf.* 是实例级入口：page 连接只有带本会话 targetId 的按页方法可以转发。
+#[tokio::test]
+async fn page_session_rejects_instance_kitesurf_methods() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+    let _bob = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-b".into(),
+        },
+        Role::Controller,
+        "bob",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-b"}));
+    for (id, method) in [
+        "Kitesurf.setLayoutMode",
+        "Kitesurf.setOutboundFilters",
+        "Kitesurf.disposeRenderer",
+        "Kitesurf.setPartialRaster",
+        "Kitesurf.getPageState",
+        "Kitesurf.setControlValue",
+        "Kitesurf.recordScene",
+        "Kitesurf.getRendererInfo",
+        "Kitesurf.getMemoryStats",
+        "Kitesurf.getFontFaces",
+        "Kitesurf.getSessionInfo",
+        "Kitesurf.getConnectionInfo",
+    ]
+    .iter()
+    .enumerate()
+    {
+        send(
+            &alice,
+            &broker,
+            &json!({"id":id + 1,"method":method,"params":{}}).to_string(),
+        )
+        .await;
+        let rejected = next_frame(&mut alice).await;
+        assert_eq!(rejected["id"], id as i64 + 1);
+        assert!(
+            message(&rejected).contains("page-session connection"),
+            "{method}: {}",
+            message(&rejected)
+        );
+    }
+    // 即使带 targetId，实例级方法也不能转发。
+    send(
+        &alice,
+        &broker,
+        r#"{"id":20,"method":"Kitesurf.setOutboundFilters","params":{"targetId":"page-a","allowRequestPattern":["*"]}}"#,
+    )
+    .await;
+    assert!(message(&next_frame(&mut alice).await).contains("page-session connection"));
+    // 另一个会话的主 target 不能按 ID 读取或改写。
+    send(
+        &alice,
+        &broker,
+        r#"{"id":21,"method":"Kitesurf.setLayoutMode","params":{"targetId":"page-b","mode":"full"}}"#,
+    )
+    .await;
+    assert!(message(&next_frame(&mut alice).await).contains("another page session"));
+    // 本会话的主 target 可按页转发，并沿用主 session。
+    send(
+        &alice,
+        &broker,
+        r#"{"id":22,"method":"Kitesurf.setLayoutMode","params":{"targetId":"page-a","mode":"full"}}"#,
+    )
+    .await;
+    let layout = next_request(&mut engine).await;
+    assert_eq!(layout["method"], "Kitesurf.setLayoutMode");
+    assert_eq!(layout["sessionId"], "session-a");
+    assert_eq!(layout["params"]["targetId"], "page-a");
+    engine.reply(
+        request_id(&layout),
+        json!({"mode":"full","scope":"target","targetId":"page-a"}),
+    );
+    let frame = next_frame(&mut alice).await;
+    assert_eq!(frame["id"], 22);
+    assert_eq!(frame["result"]["targetId"], "page-a");
+    expect_no_request(&mut engine).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+// frame/popup 只属于引擎报告的 opener/父 frame 所在会话；未登记的目标保持无归属。
+#[tokio::test]
+async fn page_session_binds_frame_and_popup_targets_to_their_opener() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut browser = connect(&broker, Endpoint::Browser, Role::Controller, "orchestrator").await;
+    // 发现事件只投递给 Browser 端点；收到事件即证明 broker 已记录关系。
+    send(
+        &browser,
+        &broker,
+        r#"{"id":1,"method":"Target.setDiscoverTargets","params":{"discover":true}}"#,
+    )
+    .await;
+    let discover = next_request(&mut engine).await;
+    assert_eq!(discover["method"], "Target.setDiscoverTargets");
+    engine.reply(request_id(&discover), json!({}));
+    assert_eq!(next_frame(&mut browser).await["id"], 1);
+    for event in [
+        json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"frame-a","type":"iframe","openerFrameId":"page-a"}}}),
+        json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"popup-a","type":"page","openerId":"page-a"}}}),
+        json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"frame-b","type":"iframe","openerFrameId":"frame-a"}}}),
+    ] {
+        engine.event(event);
+    }
+    for _ in 0..3 {
+        assert_eq!(
+            next_frame(&mut browser).await["method"],
+            "Target.targetCreated"
+        );
+    }
+
+    let mut alice = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+    let mut bob = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-b".into(),
+        },
+        Role::Controller,
+        "bob",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-b"}));
+
+    for (id, target) in [(1, "frame-a"), (2, "popup-a"), (3, "frame-b")] {
+        send(
+            &bob,
+            &broker,
+            &json!({"id":id,"method":"Target.attachToTarget","params":{"targetId":target,"flatten":true}})
+                .to_string(),
+        )
+        .await;
+        let rejected = next_frame(&mut bob).await;
+        assert_eq!(rejected["id"], id);
+        assert!(
+            message(&rejected).contains("another page session"),
+            "{target}: {}",
+            message(&rejected)
+        );
+    }
+    send(
+        &bob,
+        &broker,
+        r#"{"id":4,"method":"Target.attachToTarget","params":{"targetId":"stray","flatten":true}}"#,
+    )
+    .await;
+    assert!(
+        message(&next_frame(&mut bob).await).contains("not part of this page session"),
+        "unowned target must not be attachable"
+    );
+    // 父会话可以 attach 自己的 frame、popup 和父链上的孙 frame。
+    for (id, target) in [(5, "frame-a"), (6, "popup-a"), (7, "frame-b")] {
+        send(
+            &alice,
+            &broker,
+            &json!({"id":id,"method":"Target.attachToTarget","params":{"targetId":target,"flatten":true}})
+                .to_string(),
+        )
+        .await;
+        let attach = next_request(&mut engine).await;
+        assert_eq!(attach["method"], "Target.attachToTarget");
+        assert_eq!(attach["params"]["targetId"], target);
+        assert_eq!(attach["sessionId"], "session-a");
+        engine.reply(
+            request_id(&attach),
+            json!({"sessionId":format!("child-{id}")}),
+        );
+        assert_eq!(next_frame(&mut alice).await["id"], id);
+    }
+    expect_no_request(&mut engine).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+// page 连接的 setAutoAttach 明确拒绝；Browser 端点仍保留实例级 auto-attach。
+#[tokio::test]
+async fn page_session_rejects_set_auto_attach_and_keeps_browser_behavior() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut browser = connect(&broker, Endpoint::Browser, Role::Controller, "orchestrator").await;
+    let mut alice = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+    send(
+        &alice,
+        &broker,
+        r#"{"id":1,"method":"Target.setAutoAttach","params":{"autoAttach":true,"flatten":true,"waitForDebuggerOnStart":false}}"#,
+    )
+    .await;
+    let rejected = next_frame(&mut alice).await;
+    assert_eq!(rejected["id"], 1);
+    assert!(
+        message(&rejected).contains("page-session connection"),
+        "{}",
+        message(&rejected)
+    );
+    expect_no_request(&mut engine).await;
+
+    send(
+        &browser,
+        &broker,
+        r#"{"id":2,"method":"Target.setAutoAttach","params":{"autoAttach":true,"flatten":true,"waitForDebuggerOnStart":false}}"#,
+    )
+    .await;
+    let auto = next_request(&mut engine).await;
+    assert_eq!(auto["method"], "Target.setAutoAttach");
+    assert!(auto.get("sessionId").is_none());
+    engine.reply(request_id(&auto), json!({}));
+    let targets = next_request(&mut engine).await;
+    assert_eq!(targets["method"], "Target.getTargets");
+    engine.reply(request_id(&targets), json!({"targetInfos": []}));
+    let reply = next_frame(&mut browser).await;
+    assert_eq!(reply["id"], 2);
+    assert!(reply.get("result").is_some());
+    expect_no_request(&mut engine).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+// page 连接不带 targetId 的 getTargetInfo 指向主 target；实例目标与 browser target 被拒绝。
+#[tokio::test]
+async fn page_session_get_target_info_defaults_to_primary_and_rejects_browser_target() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut browser = connect(&broker, Endpoint::Browser, Role::Controller, "orchestrator").await;
+    let mut alice = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+
+    send(
+        &alice,
+        &broker,
+        r#"{"id":1,"method":"Target.getTargetInfo"}"#,
+    )
+    .await;
+    let info = next_request(&mut engine).await;
+    assert_eq!(info["method"], "Target.getTargetInfo");
+    assert_eq!(info["params"]["targetId"], "page-a");
+    assert!(info.get("sessionId").is_none());
+    engine.reply(
+        request_id(&info),
+        json!({"targetInfo":{"targetId":"page-a","type":"page"}}),
+    );
+    let frame = next_frame(&mut alice).await;
+    assert_eq!(frame["id"], 1);
+    assert_eq!(frame["result"]["targetInfo"]["targetId"], "page-a");
+
+    for (id, target) in [(2, "browser"), (3, "kitesurf-engine")] {
+        send(
+            &alice,
+            &broker,
+            &json!({"id":id,"method":"Target.attachToTarget","params":{"targetId":target,"flatten":true}})
+                .to_string(),
+        )
+        .await;
+        let rejected = next_frame(&mut alice).await;
+        assert_eq!(rejected["id"], id);
+        assert!(
+            message(&rejected).contains("page-session connection"),
+            "{target}: {}",
+            message(&rejected)
+        );
+    }
+    send(
+        &alice,
+        &broker,
+        r#"{"id":4,"method":"Target.getTargetInfo","params":{"targetId":"browser"}}"#,
+    )
+    .await;
+    assert!(message(&next_frame(&mut alice).await).contains("page-session connection"));
+    expect_no_request(&mut engine).await;
+
+    // Browser 端点不注入 page，保持原有实例级查询。
+    send(
+        &browser,
+        &broker,
+        r#"{"id":5,"method":"Target.getTargetInfo"}"#,
+    )
+    .await;
+    let info = next_request(&mut engine).await;
+    assert_eq!(info["method"], "Target.getTargetInfo");
+    assert!(info.get("params").is_none());
+    engine.reply(
+        request_id(&info),
+        json!({"targetInfo":{"targetId":"browser","type":"browser"}}),
+    );
+    let frame = next_frame(&mut browser).await;
+    assert_eq!(frame["id"], 5);
+    assert_eq!(frame["result"]["targetInfo"]["targetId"], "browser");
     engine.kill();
     assert!(!broker.wait_terminal().await);
 }
@@ -3981,6 +4356,18 @@ async fn queued_managed_session_expired_before_dispatch_is_rejected() {
     assert_eq!(bootstrap["method"], "Target.attachToTarget");
     assert_eq!(bootstrap["params"]["targetId"], "tab");
     engine.reply(request_id(&bootstrap), json!({ "sessionId": "primary" }));
+    // T2/T3 是 tab 的子 frame；先由 getTargets 记录父链，attach 才有归属。
+    send(&alice, &broker, r#"{"id":0,"method":"Target.getTargets"}"#).await;
+    let targets = next_request(&mut engine).await;
+    engine.reply(
+        request_id(&targets),
+        json!({"targetInfos":[
+            {"targetId":"tab","type":"page"},
+            {"targetId":"T2","type":"iframe","openerFrameId":"tab"},
+            {"targetId":"T3","type":"iframe","openerFrameId":"tab"}
+        ]}),
+    );
+    assert_eq!(next_reply(&mut alice, 0).await["id"], 0);
     send(
         &alice,
         &broker,
@@ -4000,10 +4387,11 @@ async fn queued_managed_session_expired_before_dispatch_is_rejected() {
     let held = next_request(&mut engine).await;
     assert_eq!(held["method"], "Target.attachToTarget");
     assert_eq!(held["params"]["targetId"], "T3");
+    // 排队中的 managed 请求在派发前失效：detach 的显式 session 会随事件过期。
     send(
         &alice,
         &broker,
-        r#"{"id":3,"method":"Target.setAutoAttach","sessionId":"S2","params":{"autoAttach":true,"flatten":true}}"#,
+        r#"{"id":3,"method":"Target.detachFromTarget","sessionId":"S2","params":{"sessionId":"S2"}}"#,
     )
     .await;
     await_request_slots(&broker, 2).await;
@@ -4020,7 +4408,7 @@ async fn queued_managed_session_expired_before_dispatch_is_rejected() {
     let rejected = next_reply(&mut alice, 3).await;
     assert_eq!(rejected["error"]["code"], -32000);
     assert!(
-        message(&rejected).contains("attachment expired or belongs to another"),
+        message(&rejected).contains("not part of this page session"),
         "{rejected}"
     );
     send(

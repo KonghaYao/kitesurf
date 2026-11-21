@@ -162,8 +162,38 @@ const PAGE_SESSION_DENIED_METHODS: &[&str] = &[
     "Target.createTarget",
     "Target.disposeBrowserContext",
     "Target.getBrowserContexts",
+    "Target.setAutoAttach",
     "Target.setDiscoverTargets",
     "Target.setRemoteLocations",
+];
+
+/// 引擎的实例级 target ID；page session 不能 attach，也不能按它读取实例状态。
+const INSTANCE_TARGET_IDS: &[&str] = &["browser", "kitesurf-page-renderer", "kitesurf-engine"];
+
+/// Kitesurf 方法只有显式携带本会话 targetId 时才可按页转发；其余 Kitesurf.* 属实例级。
+/// 引擎在不带 targetId 时会读取或改写第一张页面/共享渲染器状态，不能透传。
+const PAGE_SCOPED_KITESURF_METHODS: &[&str] = &[
+    "Kitesurf.setLayoutMode",
+    "Kitesurf.getLayoutMode",
+    "Kitesurf.startSceneStream",
+    "Kitesurf.stopSceneStream",
+    "Kitesurf.sceneFrameAck",
+    "Kitesurf.getSceneResources",
+    "Kitesurf.getNavigatePhases",
+    "Kitesurf.hasPendingCriticalResources",
+    "Kitesurf.getPageState",
+    "Kitesurf.setControlValue",
+    "Kitesurf.markPaintDamage",
+    "Kitesurf.getPaintDamageSince",
+    "Kitesurf.getMemoryStats",
+    "Kitesurf.recordScene",
+    "Kitesurf.getScreencastStatus",
+    "Kitesurf.getRbiResources",
+    "Kitesurf.getFontFaces",
+    "Kitesurf.getMemprofDump",
+    "Kitesurf.resetMemprof",
+    "Kitesurf.boaForceCollect",
+    "Kitesurf.getSceneStats",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -230,6 +260,10 @@ struct Received {
     outer: Option<RawSpan>,
     session: Option<RawSpan>,
     target: Option<RawSpan>,
+    /// 引擎目标信息里的 openerId/openerFrameId；用于绑定 frame/popup 归属。
+    opener: Option<RawSpan>,
+    /// 无 targetInfo 的 Target.targetDestroyed：清除该 target 的父链。
+    destroyed: bool,
     attached: Option<LeasedIdentity>,
 }
 
@@ -267,16 +301,30 @@ impl Received {
         } else {
             None
         };
-        let target = if method == Some(EventMethod::Attached) {
-            string(
-                params
-                    .and_then(|node| node.field("targetInfo", &mut scratch))
-                    .and_then(|node| node.field("targetId", &mut scratch)),
-                &mut scratch,
-            )?
-        } else {
-            None
+        // attach 与发现事件都携带 targetInfo；targetDestroyed 只有 params.targetId。
+        let target_info = matches!(method, Some(EventMethod::Attached | EventMethod::Discovery))
+            .then(|| params.and_then(|node| node.field("targetInfo", &mut scratch)))
+            .flatten();
+        let target = match method {
+            Some(EventMethod::Attached | EventMethod::Discovery) => match target_info {
+                Some(info) => string(info.field("targetId", &mut scratch), &mut scratch)?,
+                None => string(
+                    params.and_then(|node| node.field("targetId", &mut scratch)),
+                    &mut scratch,
+                )?,
+            },
+            _ => None,
         };
+        let opener = match (method, target_info) {
+            (Some(EventMethod::Attached | EventMethod::Discovery), Some(info)) => {
+                let opener = info
+                    .field("openerId", &mut scratch)
+                    .or_else(|| info.field("openerFrameId", &mut scratch));
+                string(opener, &mut scratch)?
+            }
+            _ => None,
+        };
+        let destroyed = method == Some(EventMethod::Discovery) && target_info.is_none();
         let attached = None;
         Ok(Self {
             raw,
@@ -284,6 +332,8 @@ impl Received {
             outer,
             session,
             target,
+            opener,
+            destroyed,
             attached,
         })
     }
@@ -765,7 +815,7 @@ impl BrokerHandle {
             .and_then(|result| result)
     }
 
-    /// 会话范围内的发现：只返回该 page session 已登记的 target。
+    /// 会话范围内的发现：主 target、已 attach 的 target 及其引擎报告的子 frame/popup。
     pub async fn targets_for_page(&self, page: String) -> Result<LeasedTargets, String> {
         self.command(|reply| BrokerCommand::TargetsForPage(page, reply))
             .await
@@ -1837,6 +1887,25 @@ impl Broker {
             self.request_page_targets(client_id, request, external_id, session);
             return;
         }
+        // page 连接的 Target.getTargetInfo 默认指向本会话的主 target，而不是浏览器 target。
+        if method == "Target.getTargetInfo" {
+            if let Some(page) = self
+                .clients
+                .get(&client_id)
+                .and_then(|state| state.page.clone())
+            {
+                if request.observed.string("targetId").is_none() {
+                    self.request_page_target_info(
+                        client_id,
+                        &page,
+                        session.as_deref(),
+                        request,
+                        external_id,
+                    );
+                    return;
+                }
+            }
+        }
         if method == "Browser.close" {
             self.request_close_from_client(client_id, external_id, session);
             if let Some(close) = self.close.as_mut() {
@@ -2139,6 +2208,14 @@ impl Broker {
         if request.observed.fallback {
             return Err("Invalid CDP request");
         }
+        // 未列入 allowlist 或缺少 targetId 的 Kitesurf 方法会落到实例级默认页面/渲染器。
+        if method.starts_with("Kitesurf.") {
+            if !PAGE_SCOPED_KITESURF_METHODS.contains(&method)
+                || request.observed.string("targetId").is_none()
+            {
+                return Err(PAGE_SESSION_DENIED_MESSAGE);
+            }
+        }
         // 用参数寻址上游 session 的方法同样不能跨 page session。
         if let Some(session) = request.observed.string("sessionId") {
             let local = self.attachments.owner(session).is_some_and(|owner| {
@@ -2154,11 +2231,14 @@ impl Broker {
         let Some(target) = request.observed.string("targetId") else {
             return Ok(());
         };
+        if INSTANCE_TARGET_IDS.contains(&target) {
+            return Err(PAGE_SESSION_DENIED_MESSAGE);
+        }
         match self.attachments.page_of_target(target) {
             Some(owner) if owner != page => Err(FOREIGN_TARGET_MESSAGE),
+            // 已 attach、主 target 或引擎报告的 opener/父 frame 落在本页。
             Some(_) => Ok(()),
-            // 只有 attach 可以为会话取得尚未登记的新 target。
-            None if method == "Target.attachToTarget" => Ok(()),
+            // 无归属的 frame/popup 不能由 page session 先到先得。
             None => Err(PAGE_SESSION_UNOWNED_MESSAGE),
         }
     }
@@ -2742,6 +2822,109 @@ impl Broker {
         }
     }
 
+    /// page 连接的 Target.getTargetInfo 默认查询本会话的主 target（或显式 session 的 target）。
+    fn request_page_target_info(
+        &mut self,
+        client_id: ClientId,
+        page: &str,
+        explicit_session: Option<&str>,
+        request: Request,
+        external_id: i64,
+    ) {
+        let Some((role, epoch, target)) = self.clients.get(&client_id).map(|state| {
+            let target = explicit_session
+                .and_then(|session| self.attachments.attachment(session))
+                .map_or_else(|| page.to_string(), |attachment| attachment.target.clone());
+            (state.role, state.epoch, target)
+        }) else {
+            return;
+        };
+        let spec = PendingSpec {
+            client: Some(client_id),
+            role: Some(role),
+            external_id: Some(external_id),
+            explicit_session: explicit_session.map(str::to_string),
+            epoch,
+            seq: None,
+            method: "Target.getTargetInfo".to_string(),
+            kind: PendingKind::Client,
+            deadline: self.client_deadline,
+        };
+        let params = json!({ "targetId": target });
+        let Ok(raw) = serde_json::value::to_raw_value(&params) else {
+            self.send_error(
+                client_id,
+                external_id,
+                -32000,
+                "Invalid CDP request",
+                explicit_session.map(str::to_string),
+            );
+            return;
+        };
+        let lease = request.lease.clone();
+        if let Err(message) =
+            self.send_raw_request("Target.getTargetInfo", Some(&raw), None, spec, lease)
+        {
+            self.send_error(
+                client_id,
+                external_id,
+                -32000,
+                &message,
+                explicit_session.map(str::to_string),
+            );
+        }
+    }
+
+    /// getTargets 的 targetInfos 也带 opener/父 frame；分页过滤前先记录归属关系。
+    fn record_target_infos(&mut self, value: &Received) {
+        if value.has_error() {
+            return;
+        }
+        let budget = self.upstream.handle.budget.clone();
+        let mut scratch = budget.json_scratch();
+        let Some(infos) = value
+            .raw
+            .node("result")
+            .and_then(|node| node.field("targetInfos", &mut scratch))
+        else {
+            return;
+        };
+        if !infos.is_array() {
+            return;
+        }
+        let Some(mut array) = infos.array(&mut scratch) else {
+            return;
+        };
+        let mut target_buffer = [0; 4096];
+        let mut opener_buffer = [0; 4096];
+        loop {
+            let Ok(Some(info)) = array.next(&mut scratch) else {
+                break;
+            };
+            let target = info
+                .field("targetId", &mut scratch)
+                .map(|node| node.identity_text(&mut target_buffer, &mut scratch))
+                .transpose()
+                .ok()
+                .flatten()
+                .flatten()
+                .map(str::to_string);
+            let Some(target) = target else {
+                continue;
+            };
+            let opener = info
+                .field("openerId", &mut scratch)
+                .or_else(|| info.field("openerFrameId", &mut scratch))
+                .map(|node| node.identity_text(&mut opener_buffer, &mut scratch))
+                .transpose()
+                .ok()
+                .flatten()
+                .flatten()
+                .map(str::to_string);
+            self.attachments.record_relation(&target, opener.as_deref());
+        }
+    }
+
     fn send_page_targets(
         &mut self,
         client: ClientId,
@@ -2750,6 +2933,7 @@ impl Broker {
         session: Option<String>,
         value: &Received,
     ) {
+        self.record_target_infos(value);
         if value.has_error() {
             self.send_upstream_reply(client, external_id, session, value);
             return;
@@ -2988,6 +3172,9 @@ impl Broker {
             self.detached_event(value);
             return;
         }
+        if method == EventMethod::Discovery {
+            self.record_target_relation(&value);
+        }
         if value.outer.is_none() && method == EventMethod::Discovery {
             let recipients = self
                 .clients
@@ -3049,6 +3236,22 @@ impl Broker {
             })
     }
 
+    /// 目标信息里的关系决定子 frame/popup 的归属；缺失时目标保持无归属。
+    fn record_target_relation(&mut self, value: &Received) {
+        let budget = self.upstream.handle.budget.clone();
+        let mut scratch = budget.json_scratch();
+        let target = received_identity(value, value.target, &mut scratch);
+        let opener = received_identity(value, value.opener, &mut scratch);
+        let Some(target) = target else {
+            return;
+        };
+        if value.destroyed {
+            self.attachments.forget_relation(&target);
+        } else if let Some(opener) = opener.as_deref() {
+            self.attachments.record_relation(&target, Some(opener));
+        }
+    }
+
     // span 已在 parse 中验证类型、4096-byte 上限和 Unicode；后续只借用同一不可变 owner。
     fn attached_event(&mut self, value: Received) {
         let Some(session_span) = value.session else {
@@ -3088,6 +3291,11 @@ impl Broker {
         let (Some(session), Some(target)) = (session, target) else {
             return;
         };
+        // attach 事件同样携带 opener/父 frame；先记录关系，再据此判定 page 归属。
+        if let Some(opener) = received_identity(&value, value.opener, &mut budget.json_scratch()) {
+            self.attachments
+                .record_relation(target, Some(opener.as_str()));
+        }
         // 未结算 cleanup detach 仍按同一 sessionId 在线寻址；窗口内同 ID attached 不是
         // 新 attachment，也不派第二次 detach。存活 attachment 仍走 register 原分支。
         if self.attachments.attachment(session).is_none() && self.cleanup_detach_unsettled(session)
@@ -3103,6 +3311,15 @@ impl Broker {
         let epoch = state.epoch;
         let retired = state.closed || state.retired;
         let page = state.page.clone();
+        // page 连接只能登记自己 attach 过的 target，或 opener/父 frame 属于本页的目标；
+        // 引擎主动附加的其他会话目标不投递，并收回上游 session。
+        if let Some(page) = page.as_deref() {
+            let intent = self.attachments.intent(target) == Some(owner);
+            if !intent && !self.attachments.owns_page_target(page, target) {
+                self.detach_scoped(session);
+                return;
+            }
+        }
         let auto = self.attachments.intent(target).is_none()
             && outer
                 .and_then(|session| self.attachments.owner(session))
@@ -3632,6 +3849,7 @@ impl Broker {
                 let result = if value.has_error() {
                     Err("Target discovery failed".to_string())
                 } else {
+                    self.record_target_infos(value);
                     let budget = self.upstream.handle.budget.clone();
                     let filtered = {
                         let mut scratch = budget.json_scratch();
@@ -4445,7 +4663,7 @@ impl Broker {
             }
             "Target.setAutoAttach" => {
                 // Node 在发送前记录 auto owner，失败不回滚；这里保持同一可见性。
-                // page 连接的上游请求带 primary session，不能改写实例级 auto owner。
+                // page 连接在准入时已明确拒绝，只有 Browser 端点能改写实例级 auto owner。
                 if self
                     .clients
                     .get(&work.client)
@@ -4555,6 +4773,21 @@ fn stage_id(stage: &ManagedStage) -> Option<u64> {
         ManagedStage::BackfillTargets { id } => Some(*id),
         ManagedStage::BackfillAttach { id, .. } => Some(*id),
     }
+}
+
+fn received_identity(
+    value: &Received,
+    span: Option<RawSpan>,
+    scratch: &mut crate::transport::JsonScratchGuard<'_>,
+) -> Option<String> {
+    let mut buffer = [0; 4096];
+    value
+        .raw
+        .at(span?)
+        .identity_text(&mut buffer, scratch)
+        .ok()
+        .flatten()
+        .map(str::to_string)
 }
 
 fn target_infos(
