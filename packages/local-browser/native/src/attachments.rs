@@ -22,6 +22,7 @@ pub struct Attachment {
     pub parent: Option<String>,
     pub client: ClientId,
     pub epoch: u64,
+    page: Option<String>,
     _payload: PayloadLease,
 }
 
@@ -56,6 +57,8 @@ pub enum AttachmentReservation {
     Busy,
     Full,
     Budget,
+    /// target 已登记给另一个 page session。
+    ForeignPage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +69,8 @@ pub enum Registration {
     Quarantined,
     Full,
     Budget,
+    /// target 已登记给另一个 page session，不能为当前连接建立 attachment。
+    ForeignPage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,11 +83,19 @@ pub enum QuarantineResult {
     Budget,
 }
 
+struct PageClaim {
+    page: String,
+    attachments: usize,
+}
+
 #[derive(Default)]
 pub struct Attachments {
     sessions: HashMap<String, Attachment>,
     explicit: HashMap<String, Intent>,
     quarantine: HashMap<String, Quarantine>,
+    /// target 独占：同一 target 只归属一个 page session，最后一个 attachment 释放时归还。
+    /// Browser 端点连接不登记，保持实例级可见性。
+    claims: HashMap<String, PageClaim>,
     budget: PayloadBudget,
     pub auto_owner: Option<ClientId>,
 }
@@ -118,9 +131,18 @@ impl Attachments {
     }
 
     /// 派发前占一个 client/global 槽；在途 attach 与早期事件共享该预留。
-    pub fn reserve(&mut self, target: &str, client: ClientId, epoch: u64) -> AttachmentReservation {
+    pub fn reserve(
+        &mut self,
+        target: &str,
+        client: ClientId,
+        epoch: u64,
+        page: Option<&str>,
+    ) -> AttachmentReservation {
         if self.explicit.contains_key(target) {
             return AttachmentReservation::Busy;
+        }
+        if page.is_some_and(|page| !self.page_accepts(target, page)) {
+            return AttachmentReservation::ForeignPage;
         }
         if !self.can_reserve(client) {
             return AttachmentReservation::Full;
@@ -148,6 +170,7 @@ impl Attachments {
         session: &str,
         target: &str,
         parent: Option<&str>,
+        page: Option<&str>,
     ) -> Registration {
         if let Some(existing) = self.sessions.get(session) {
             return if existing.client == client {
@@ -158,6 +181,9 @@ impl Attachments {
         }
         if self.quarantine.contains_key(session) {
             return Registration::Quarantined;
+        }
+        if page.is_some_and(|page| !self.page_accepts(target, page)) {
+            return Registration::ForeignPage;
         }
         let mut reserved = false;
         if let Some(intent) = self.explicit.get(target) {
@@ -197,8 +223,23 @@ impl Attachments {
                 parent: parent.map(str::to_owned),
                 client,
                 epoch,
+                page: page.map(str::to_owned),
             },
         );
+        if let Some(page) = page {
+            match self.claims.get_mut(target) {
+                Some(claim) => claim.attachments = claim.attachments.saturating_add(1),
+                None => {
+                    self.claims.insert(
+                        target.to_string(),
+                        PageClaim {
+                            page: page.to_string(),
+                            attachments: 1,
+                        },
+                    );
+                }
+            }
+        }
         Registration::New
     }
 
@@ -377,8 +418,46 @@ impl Attachments {
     }
 
     /// 先返回接收者，再由调用方决定投递；移除后不会再被当作广播事件。
+    /// 释放最后一个页面归属引用时归还 target。
     pub fn forget(&mut self, session: &str) -> Option<Attachment> {
-        self.sessions.remove(session)
+        let attachment = self.sessions.remove(session)?;
+        if attachment.page.is_some() {
+            self.release_claim(&attachment.target);
+        }
+        Some(attachment)
+    }
+
+    /// page session 是否仍可登记该 target；未登记的 target 由第一个 page session 取得。
+    fn page_accepts(&self, target: &str, page: &str) -> bool {
+        self.page_of_target(target)
+            .is_none_or(|owner| owner == page)
+    }
+
+    fn release_claim(&mut self, target: &str) {
+        let Some(claim) = self.claims.get_mut(target) else {
+            return;
+        };
+        claim.attachments = claim.attachments.saturating_sub(1);
+        if claim.attachments == 0 {
+            self.claims.remove(target);
+        }
+    }
+
+    /// Browser 端点连接不登记归属，因此这里只反映 page session 的 target 集合。
+    pub fn page_of_target(&self, target: &str) -> Option<&str> {
+        self.claims.get(target).map(|claim| claim.page.as_str())
+    }
+
+    pub fn owns_page_target(&self, page: &str, target: &str) -> bool {
+        self.page_of_target(target) == Some(page)
+    }
+
+    pub fn targets_for_page(&self, page: &str) -> Vec<String> {
+        self.claims
+            .iter()
+            .filter(|(_, claim)| claim.page == page)
+            .map(|(target, _)| target.clone())
+            .collect()
     }
 
     pub fn first_session(&self, client: ClientId) -> Option<String> {

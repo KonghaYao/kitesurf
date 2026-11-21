@@ -1317,6 +1317,403 @@ async fn page_waiting_rejects_unauthorized_requests_before_slot_admission() {
     assert!(!broker.wait_terminal().await);
 }
 
+// page session 的主键就是主 targetId；两个会话可以有相同的客户请求 ID 和序号。
+#[tokio::test]
+async fn page_sessions_share_client_ids_without_crossing_replies() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["method"], "Target.attachToTarget");
+    assert_eq!(attach["params"]["targetId"], "page-a");
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+    let mut bob = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-b".into(),
+        },
+        Role::Controller,
+        "bob",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["params"]["targetId"], "page-b");
+    engine.reply(request_id(&attach), json!({"sessionId":"session-b"}));
+
+    send(&alice, &broker, r#"{"id":1,"method":"Page.enable"}"#).await;
+    let alice_enable = next_request(&mut engine).await;
+    assert_eq!(alice_enable["sessionId"], "session-a");
+    send(&bob, &broker, r#"{"id":1,"method":"Page.enable"}"#).await;
+    let bob_enable = next_request(&mut engine).await;
+    assert_eq!(bob_enable["sessionId"], "session-b");
+    // 同一客户 ID 的回复倒序到达，也只能回到原连接。
+    engine.reply(request_id(&bob_enable), json!({"marker":"bob"}));
+    engine.reply(request_id(&alice_enable), json!({"marker":"alice"}));
+    let frame = next_frame(&mut alice).await;
+    assert_eq!(frame["id"], 1);
+    assert_eq!(frame["result"]["marker"], "alice");
+    let frame = next_frame(&mut bob).await;
+    assert_eq!(frame["id"], 1);
+    assert_eq!(frame["result"]["marker"], "bob");
+    expect_no_request(&mut engine).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+// 一个 target 只能属于一个 page session；第二个会话收到明确错误而不是转发。
+#[tokio::test]
+async fn cross_page_session_attach_is_rejected_before_upstream() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+    send(
+        &alice,
+        &broker,
+        r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"shared","flatten":true}}"#,
+    )
+    .await;
+    let child = next_request(&mut engine).await;
+    assert_eq!(child["sessionId"], "session-a");
+    assert_eq!(child["params"]["targetId"], "shared");
+    engine.reply(request_id(&child), json!({"sessionId":"child-a"}));
+    let frame = next_frame(&mut alice).await;
+    assert_eq!(frame["id"], 1);
+    assert_eq!(frame["result"]["sessionId"], "child-a");
+
+    let mut bob = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-b".into(),
+        },
+        Role::Controller,
+        "bob",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-b"}));
+    for (id, target) in [(2, "shared"), (3, "page-a")] {
+        send(
+            &bob,
+            &broker,
+            &json!({"id":id,"method":"Target.attachToTarget","params":{"targetId":target,"flatten":true}}).to_string(),
+        )
+        .await;
+        let rejected = next_frame(&mut bob).await;
+        assert_eq!(rejected["id"], id);
+        assert!(
+            message(&rejected).contains("another page session"),
+            "{}",
+            message(&rejected)
+        );
+    }
+    // 以参数指向另一个 page session 的上游 session 同样拒绝，不转发到引擎。
+    send(
+        &bob,
+        &broker,
+        r#"{"id":4,"method":"Target.sendMessageToTarget","params":{"sessionId":"session-a","message":"{}"}}"#,
+    )
+    .await;
+    let rejected = next_frame(&mut bob).await;
+    assert_eq!(rejected["id"], 4);
+    assert!(
+        message(&rejected).contains("not part of this page session"),
+        "{}",
+        message(&rejected)
+    );
+    expect_no_request(&mut engine).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+// 目标列表与事件只包含本 page session；实例级发现仍只发给 Browser 端点。
+#[tokio::test]
+async fn page_session_target_list_and_events_are_scoped() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+    send(
+        &alice,
+        &broker,
+        r#"{"id":1,"method":"Target.attachToTarget","params":{"targetId":"child-a","flatten":true}}"#,
+    )
+    .await;
+    let child = next_request(&mut engine).await;
+    engine.reply(request_id(&child), json!({"sessionId":"child-session"}));
+    assert_eq!(next_frame(&mut alice).await["id"], 1);
+
+    let mut bob = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-b".into(),
+        },
+        Role::Controller,
+        "bob",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-b"}));
+
+    let infos = json!({"targetInfos":[
+        {"targetId":"page-a","type":"page","url":"https://a.invalid/"},
+        {"targetId":"child-a","type":"iframe"},
+        {"targetId":"page-b","type":"page","url":"https://b.invalid/"},
+        {"targetId":"loose","type":"page"}
+    ]});
+    send(&alice, &broker, r#"{"id":10,"method":"Target.getTargets"}"#).await;
+    let targets = next_request(&mut engine).await;
+    assert_eq!(targets["method"], "Target.getTargets");
+    assert!(targets.get("sessionId").is_none());
+    engine.reply(request_id(&targets), infos.clone());
+    let frame = next_frame(&mut alice).await;
+    assert_eq!(frame["id"], 10);
+    let ids = frame["result"]["targetInfos"]
+        .as_array()
+        .expect("target infos")
+        .iter()
+        .map(|info| info["targetId"].as_str().expect("target id"))
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["page-a", "child-a"]);
+
+    send(&bob, &broker, r#"{"id":10,"method":"Target.getTargets"}"#).await;
+    let targets = next_request(&mut engine).await;
+    engine.reply(request_id(&targets), infos);
+    let frame = next_frame(&mut bob).await;
+    let ids = frame["result"]["targetInfos"]
+        .as_array()
+        .expect("target infos")
+        .iter()
+        .map(|info| info["targetId"].as_str().expect("target id"))
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["page-b"]);
+
+    // 发现事件只发给 Browser 端点；另一个会话的 attach 和普通事件不可见。
+    for event in [
+        json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"page-b","type":"page"}}}),
+        json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"page-a","type":"page"}}}),
+        json!({"method":"Target.targetDestroyed","params":{"targetId":"page-b"}}),
+        json!({"method":"Target.attachedToTarget","params":{"sessionId":"session-b","targetInfo":{"targetId":"page-b","type":"page"}}}),
+        json!({"method":"Runtime.consoleAPICalled","sessionId":"session-b","params":{"x":1}}),
+    ] {
+        engine.event(event);
+    }
+    let frame = next_frame(&mut bob).await;
+    assert_eq!(frame["method"], "Runtime.consoleAPICalled");
+    assert_eq!(frame["params"]["x"], 1);
+    expect_silence(&mut alice).await;
+    engine.event(json!({"method":"Page.loadEventFired","sessionId":"session-a"}));
+    assert_eq!(
+        next_frame(&mut alice).await["method"],
+        "Page.loadEventFired"
+    );
+    expect_silence(&mut bob).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+// 实例级或未按页隔离的方法在 page 连接上明确报错，不转发到引擎。
+#[tokio::test]
+async fn page_session_rejects_instance_and_unscoped_methods() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut page = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+    for (id, method) in [
+        "Browser.close",
+        "Storage.clearDataForOrigin",
+        "Target.createBrowserContext",
+        "Target.disposeBrowserContext",
+        "Target.createTarget",
+        "Fetch.enable",
+        "Fetch.disable",
+        "Network.clearBrowserCookies",
+    ]
+    .iter()
+    .enumerate()
+    {
+        send(
+            &page,
+            &broker,
+            &json!({"id":id + 1,"method":method,"params":{}}).to_string(),
+        )
+        .await;
+        let rejected = next_frame(&mut page).await;
+        assert_eq!(rejected["id"], id as i64 + 1);
+        assert!(
+            message(&rejected).contains("page-session connection"),
+            "{method}: {}",
+            message(&rejected)
+        );
+    }
+    expect_no_request(&mut engine).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+// 预置流程：Browser 端点建两个 target，两个 page 连接各接一个，并保持 Browser 控制。
+#[tokio::test]
+async fn browser_provisions_targets_for_independent_page_controllers() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut browser = connect(&broker, Endpoint::Browser, Role::Controller, "orchestrator").await;
+    for target in ["page-1", "page-2"] {
+        send(
+            &browser,
+            &broker,
+            r#"{"id":1,"method":"Target.createTarget","params":{"url":"about:blank"}}"#,
+        )
+        .await;
+        let create = next_request(&mut engine).await;
+        assert_eq!(create["method"], "Target.createTarget");
+        assert!(create.get("sessionId").is_none());
+        engine.reply(request_id(&create), json!({"targetId":target}));
+        let frame = next_frame(&mut browser).await;
+        assert_eq!(frame["id"], 1);
+        assert_eq!(frame["result"]["targetId"], target);
+    }
+
+    let mut alice = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-1".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["params"]["targetId"], "page-1");
+    engine.reply(request_id(&attach), json!({"sessionId":"session-1"}));
+    let mut bob = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-2".into(),
+        },
+        Role::Controller,
+        "bob",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["params"]["targetId"], "page-2");
+    engine.reply(request_id(&attach), json!({"sessionId":"session-2"}));
+
+    send(&alice, &broker, r#"{"id":7,"method":"Page.enable"}"#).await;
+    let enable = next_request(&mut engine).await;
+    assert_eq!(enable["sessionId"], "session-1");
+    engine.reply(request_id(&enable), json!({}));
+    assert_eq!(next_frame(&mut alice).await["id"], 7);
+    send(&bob, &broker, r#"{"id":8,"method":"Page.enable"}"#).await;
+    let enable = next_request(&mut engine).await;
+    assert_eq!(enable["sessionId"], "session-2");
+    engine.reply(request_id(&enable), json!({}));
+    assert_eq!(next_frame(&mut bob).await["id"], 8);
+
+    // Browser 控制者仍是实例控制者，可以继续使用 Browser 级方法。
+    send(
+        &browser,
+        &broker,
+        r#"{"id":9,"method":"Browser.getVersion"}"#,
+    )
+    .await;
+    let version = next_request(&mut engine).await;
+    assert_eq!(version["method"], "Browser.getVersion");
+    assert!(version.get("sessionId").is_none());
+    engine.reply(request_id(&version), json!({"product":"Kitesurf"}));
+    let frame = next_frame(&mut browser).await;
+    assert_eq!(frame["id"], 9);
+    expect_no_request(&mut engine).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+// 同一 page session 只允许一个控制连接；viewer 仍可连接。
+#[tokio::test]
+async fn page_session_allows_one_controller_but_keeps_viewers() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut controller = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+    let error = match broker
+        .reserve(ReserveRequest {
+            endpoint: Endpoint::Page {
+                target_id: "page-a".into(),
+            },
+            role: Role::Controller,
+            owner: "bob".to_string(),
+        })
+        .await
+    {
+        Ok(_) => panic!("second page controller must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error, "Another controller owns this page session");
+    let mut viewer = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Viewer,
+        "viewer",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["params"]["targetId"], "page-a");
+    engine.reply(request_id(&attach), json!({"sessionId":"viewer-session"}));
+    send(&viewer, &broker, r#"{"id":1,"method":"Page.enable"}"#).await;
+    let enable = next_request(&mut engine).await;
+    assert_eq!(enable["sessionId"], "viewer-session");
+    engine.reply(request_id(&enable), json!({}));
+    assert_eq!(next_frame(&mut viewer).await["id"], 1);
+    expect_silence(&mut controller).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
 #[tokio::test]
 async fn active_and_queued_management_share_the_64_request_limit() {
     let mut engine = fake_engine().await;

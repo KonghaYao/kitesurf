@@ -80,6 +80,25 @@ The new controller connects with `?owner=human`. Takeover does not cancel alread
 commands; re-observe their outcome before acting. This is local session ownership, not a
 multi-tenant authorization service. The control endpoint binds to loopback and checks Host/Origin.
 
+Several page sessions can be controlled at the same time on their own
+`ws://127.0.0.1:8787/devtools/page/{targetId}` connections. A page session's ID is its primary
+target ID; one target belongs to one page session, and a second controller for the same page is
+rejected. The `/devtools/browser` endpoint keeps the single-controller rule above and still sees
+every target and its discovery events. Provision pages through that endpoint first
+(`Target.createTarget`), then connect one page session per target.
+
+Page connections operate only their own target and CDP sessions. Instance-level methods such as
+`Browser.close`, `Target.createTarget`, `Target.createBrowserContext`,
+`Target.disposeBrowserContext`, `Storage.clearDataForOrigin`, `Storage.clearCookies`,
+`Network.clearBrowserCookies` and `Network.clearBrowserCache` return an explicit CDP error instead
+of being forwarded. `Fetch.enable` and the rest of `Fetch.*` are rejected until Fetch interception
+can be isolated per page. `Target.getTargets` and `/json/list?page={targetId}` list only the
+session's targets, and other sessions' target and attach events are not delivered.
+`Target.setAutoAttach` on a page connection stays scoped to that session and does not change the
+instance-wide auto-attach owner. All page sessions share the instance's single SQLite profile, so
+they see the same cookies and same-origin localStorage; use separate profiles for independent
+accounts. Viewer and DevTools connections to `/devtools/page/{targetId}` are unchanged.
+
 Internet access uses the existing Kitesurf network stack. Page access to loopback/private
 networks is blocked by default; enable it intentionally with `--allow-private-network` for local
 sites. Existing cookie and origin policies remain in effect. Outbound requests go directly: the
