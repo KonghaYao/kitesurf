@@ -195,10 +195,7 @@ export function parseConnectionParams(request: Request): ConnectionParams {
 // The host owns the application deadlines, and a zero removes one (the local browser keeps a
 // session open for as long as its socket lives). A ksIdleMs/ksMaxSessionMs parameter already
 // lowered the default, so it still shortens whatever the host allows.
-function applyHostDeadlines(
-  params: ConnectionParams,
-  options: Required<ConnectionOptions>,
-): void {
+function applyHostDeadlines(params: ConnectionParams, options: Required<ConnectionOptions>): void {
   const idle = options.idleTimeoutMs || Infinity;
   params.idleMs = params.idleMs === IDLE_SESSION_MS ? idle : Math.min(idle, params.idleMs);
   const max = options.maxSessionMs || Infinity;
