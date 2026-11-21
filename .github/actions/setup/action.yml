@@ -31,6 +31,15 @@ outputs:
   bazel-cache-paths:
     description: The paths the job saves the Bazel caches from, as the restore read them.
     value: ${{ steps.plan.outputs.cache-paths }}
+  bazel-repo-cache-key:
+    description: The shared repository-cache key; only main saves it.
+    value: ${{ steps.bazel-repo.outputs.cache-primary-key }}
+  bazel-repo-cache-hit:
+    description: "'true' when the shared repository cache matched exactly."
+    value: ${{ steps.bazel-repo.outputs.cache-hit }}
+  bazel-repo-cache-path:
+    description: The shared repository-cache path.
+    value: ${{ steps.plan.outputs.repo-cache-path }}
   bazelflare:
     description: "'true' when every Bazel command builds on bazelflare."
     value: ${{ steps.plan.outputs.bazelflare }}
@@ -55,12 +64,16 @@ runs:
             printf 'cache-restore-keys<<EOF\nbazelflare-repo-%s-\nEOF\n' "$RUNNER_OS"
             printf 'cache-paths<<EOF\n~/.cache/bazel-repo\nEOF\n'
           else
-            # The release matrix runs x64 and arm64 Linux on the same OS label, so the cache key
-            # must name the architecture or both jobs would restore and save the same entry.
-            echo "cache-key=bazel-$RUNNER_OS-$RUNNER_ARCH-$LOCKS-$GITHUB_SHA"
-            printf 'cache-restore-keys<<EOF\nbazel-%s-%s-%s-\nbazel-%s-%s-\nbazel-%s-\nEOF\n' \
-              "$RUNNER_OS" "$RUNNER_ARCH" "$LOCKS" "$RUNNER_OS" "$RUNNER_ARCH" "$RUNNER_OS"
-            printf 'cache-paths<<EOF\n~/.cache/bazel-disk\n~/.cache/bazel-repo\nEOF\n'
+            # The release matrix runs x64 and arm64 Linux on the same OS label, so the disk cache
+            # key must name the architecture. The repository cache holds the shared crates; save
+            # it once from main and let every platform restore it, to fit the 10 GB quota.
+            echo "cache-key=bazel-disk-$RUNNER_OS-$RUNNER_ARCH-$LOCKS-$GITHUB_SHA"
+            printf 'cache-restore-keys<<EOF\nbazel-disk-%s-%s-%s-\nbazel-disk-%s-%s-\nEOF\n' \
+              "$RUNNER_OS" "$RUNNER_ARCH" "$LOCKS" "$RUNNER_OS" "$RUNNER_ARCH"
+            printf 'cache-paths<<EOF\n~/.cache/bazel-disk\nEOF\n'
+            echo "repo-cache-key=bazel-repo-$LOCKS-$GITHUB_SHA"
+            printf 'repo-cache-restore-keys<<EOF\nbazel-repo-%s-\nbazel-repo-\nEOF\n' "$LOCKS"
+            printf 'repo-cache-path<<EOF\n~/.cache/bazel-repo\nEOF\n'
           fi
         } >> "$GITHUB_OUTPUT"
     # A cold Bazel build of every lane fills the runner's root disk. Drop SDKs the jobs never use;
@@ -127,3 +140,12 @@ runs:
         path: ${{ steps.plan.outputs.cache-paths }}
         key: ${{ steps.plan.outputs.cache-key }}
         restore-keys: ${{ steps.plan.outputs.cache-restore-keys }}
+    # The repository cache is content-addressed and mostly shared across platforms. Restore the
+    # main-run copy here; only main (and the release x64 job) saves it, keeping the quota for disks.
+    - if: inputs.bazel-cache == 'true' && steps.plan.outputs.bazelflare != 'true'
+      id: bazel-repo
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ steps.plan.outputs.repo-cache-path }}
+        key: ${{ steps.plan.outputs.repo-cache-key }}
+        restore-keys: ${{ steps.plan.outputs.repo-cache-restore-keys }}

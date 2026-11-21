@@ -57,6 +57,17 @@ jobs:
         with:
           path: ${{ steps.setup.outputs.bazel-cache-paths }}
           key: ${{ steps.setup.outputs.bazel-cache-key }}
+      # The repository cache is shared by the release matrix; save it once from main. Its
+      # content-addressed files are identical across platforms, so one copy serves all of them.
+      - if: >-
+          !cancelled() && github.ref == 'refs/heads/main'
+          && steps.setup.outputs.bazelflare != 'true'
+          && steps.setup.outputs.bazel-repo-cache-key != ''
+          && steps.setup.outputs.bazel-repo-cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.setup.outputs.bazel-repo-cache-path }}
+          key: ${{ steps.setup.outputs.bazel-repo-cache-key }}
 
   # The e2e, wpt and playwright jobs are separate checks, rerun on their own when they flake; on
   # bazelflare they share the ci job's actions, so the engine compiles once. They save no cache:
@@ -73,7 +84,7 @@ jobs:
       - id: setup
         uses: ./.github/actions/setup
         with:
-          bazel-cache: "true"
+          bazel-cache: ${{ github.repository == 'cloudflare/kitesurf' && 'true' || 'false' }}
           bazelflare: ${{ github.repository == 'cloudflare/kitesurf' && 'true' || 'false' }}
           pnpm-cache: "false"
       # Each test file is its own action on a bazelflare executor. The suite needs more memory than
@@ -99,7 +110,7 @@ jobs:
       - id: setup
         uses: ./.github/actions/setup
         with:
-          bazel-cache: "true"
+          bazel-cache: ${{ github.repository == 'cloudflare/kitesurf' && 'true' || 'false' }}
           bazelflare: ${{ github.repository == 'cloudflare/kitesurf' && 'true' || 'false' }}
           pnpm-cache: "false"
       # Each spec boots an engine on a bazelflare executor, whose image holds the pinned Playwright
@@ -125,7 +136,7 @@ jobs:
       - id: setup
         uses: ./.github/actions/setup
         with:
-          bazel-cache: "true"
+          bazel-cache: ${{ github.repository == 'cloudflare/kitesurf' && 'true' || 'false' }}
           bazelflare: ${{ github.repository == 'cloudflare/kitesurf' && 'true' || 'false' }}
           pnpm-cache: "false"
       # The buckets run on bazelflare's WPT executors, whose image holds the pinned corpus. A fork's
