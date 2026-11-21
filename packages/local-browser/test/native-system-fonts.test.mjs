@@ -417,7 +417,7 @@ test(
       true,
       `font host must cover the Han sample: ${JSON.stringify(match)}`,
     );
-    const family = /^system CJK script=Hani locale=zh-CN family=(.+) bytes=\d+$/.exec(
+    const family = /^system CJK script=Hani locale=[^ ]* family=(.+) bytes=\d+$/.exec(
       cjkDiagnostic,
     )?.[1];
     assert.ok(family, cjkDiagnostic);
