@@ -142,8 +142,12 @@ const PAGE_SESSION_DENIED_MESSAGE: &str =
 const FOREIGN_TARGET_MESSAGE: &str = "Target belongs to another page session";
 const FOREIGN_SESSION_MESSAGE: &str = "Session is not part of this page session";
 const PAGE_SESSION_UNOWNED_MESSAGE: &str = "Target is not part of this page session";
+/// page 端点只能承载顶层 page；frame/popup 必须先由父会话 attach。
+const PAGE_ENDPOINT_TARGET_MESSAGE: &str =
+    "Only a top-level page target can back a page connection";
 /// 实例级或无法限定到会话的方法；page session 只操作自己的 target 与 CDP session。
-/// Browser.getVersion 是只读发现字段，DevTools 页面连接仍可使用。
+/// Browser.getVersion 是只读发现字段，DevTools 页面连接仍可使用。Page 的预导航脚本表挂在
+/// 共享 BrowserState 上，page 连接写入会影响其他页面的下次导航。
 const PAGE_SESSION_DENIED_METHODS: &[&str] = &[
     "Browser.close",
     "Browser.crash",
@@ -153,6 +157,8 @@ const PAGE_SESSION_DENIED_METHODS: &[&str] = &[
     "Kitesurf.flushProfile",
     "Network.clearBrowserCache",
     "Network.clearBrowserCookies",
+    "Page.addScriptToEvaluateOnNewDocument",
+    "Page.removeScriptToEvaluateOnNewDocument",
     "Security.setIgnoreCertificateErrors",
     "Storage.clearCookies",
     "Storage.clearDataForOrigin",
@@ -262,6 +268,8 @@ struct Received {
     target: Option<RawSpan>,
     /// 引擎目标信息里的 openerId/openerFrameId；用于绑定 frame/popup 归属。
     opener: Option<RawSpan>,
+    /// targetInfo.type 是否为 page；None 表示事件没有 targetInfo。
+    page_target: Option<bool>,
     /// 无 targetInfo 的 Target.targetDestroyed：清除该 target 的父链。
     destroyed: bool,
     attached: Option<LeasedIdentity>,
@@ -324,6 +332,9 @@ impl Received {
             }
             _ => None,
         };
+        let page_target = target_info
+            .and_then(|info| info.field("type", &mut scratch))
+            .map(|node| node.equals("page", &mut scratch));
         let destroyed = method == Some(EventMethod::Discovery) && target_info.is_none();
         let attached = None;
         Ok(Self {
@@ -333,6 +344,7 @@ impl Received {
             session,
             target,
             opener,
+            page_target,
             destroyed,
             attached,
         })
@@ -1578,6 +1590,11 @@ impl Broker {
         if self.clients.len() >= MAX_CLIENTS || self.reservations.len() >= MAX_RESERVED {
             return Err("Too many browser connections".to_string());
         }
+        if let Endpoint::Page { target_id } = &request.endpoint {
+            if let Some(message) = self.page_endpoint_error(target_id) {
+                return Err(message.to_string());
+            }
+        }
         if request.role == Role::Controller {
             match &request.endpoint {
                 Endpoint::Browser => {
@@ -1600,9 +1617,6 @@ impl Broker {
                     if self.page_controller_taken(target_id) {
                         return Err(PAGE_SESSION_CONTROL_MESSAGE.to_string());
                     }
-                    if self.attachments.page_target_claimed_by_other(target_id) {
-                        return Err(FOREIGN_TARGET_MESSAGE.to_string());
-                    }
                 }
             }
         }
@@ -1616,6 +1630,19 @@ impl Broker {
         };
         self.reservations.insert(id, reservation.clone());
         Ok(reservation)
+    }
+
+    /// page 端点主目标只能是未归属（或同页）的顶层 page；实例与子目标一律拒绝。
+    fn page_endpoint_error(&self, target_id: &str) -> Option<&'static str> {
+        if INSTANCE_TARGET_IDS.contains(&target_id)
+            || self.attachments.is_not_top_level_page(target_id)
+        {
+            return Some(PAGE_ENDPOINT_TARGET_MESSAGE);
+        }
+        if self.attachments.page_target_claimed_by_other(target_id) {
+            return Some(FOREIGN_TARGET_MESSAGE);
+        }
+        None
     }
 
     /// page controller 只在没有活动控制者、也没有同会话的另一个预留时才能接入。
@@ -1640,6 +1667,12 @@ impl Broker {
         }
         if self.lifecycle != Lifecycle::Running || self.clients.len() >= MAX_CLIENTS {
             return false;
+        }
+        // 预留后目标归属可能变化；提交前按同一规则复核，viewer 也受限。
+        if let Endpoint::Page { target_id } = &reservation.endpoint {
+            if self.page_endpoint_error(target_id).is_some() {
+                return false;
+            }
         }
         let page = matches!(reservation.endpoint, Endpoint::Page { .. });
         let mut epoch = self.control_epoch;
@@ -2839,6 +2872,23 @@ impl Broker {
         }) else {
             return;
         };
+        // 注入的 targetId 不经过 check_page_scope，这里必须再验证归属与实例 ID。
+        let owned = target == page || self.attachments.page_of_target(&target) == Some(page);
+        if INSTANCE_TARGET_IDS.contains(&target.as_str()) || !owned {
+            let message = if INSTANCE_TARGET_IDS.contains(&target.as_str()) {
+                PAGE_SESSION_DENIED_MESSAGE
+            } else {
+                PAGE_SESSION_UNOWNED_MESSAGE
+            };
+            self.send_error(
+                client_id,
+                external_id,
+                -32000,
+                message,
+                explicit_session.map(str::to_string),
+            );
+            return;
+        }
         let spec = PendingSpec {
             client: Some(client_id),
             role: Some(role),
@@ -2912,6 +2962,10 @@ impl Broker {
             let Some(target) = target else {
                 continue;
             };
+            if let Some(kind) = info.field("type", &mut scratch) {
+                let is_page = kind.equals("page", &mut scratch);
+                self.attachments.record_target_kind(&target, is_page);
+            }
             let opener = info
                 .field("openerId", &mut scratch)
                 .or_else(|| info.field("openerFrameId", &mut scratch))
@@ -3005,6 +3059,9 @@ impl Broker {
     }
 
     fn start_page_attach(&mut self, client_id: ClientId, target: &str, seq: u64) -> bool {
+        if self.page_endpoint_error(target).is_some() {
+            return false;
+        }
         let Some(client) = self.clients.get(&client_id) else {
             return false;
         };
@@ -3247,8 +3304,14 @@ impl Broker {
         };
         if value.destroyed {
             self.attachments.forget_relation(&target);
-        } else if let Some(opener) = opener.as_deref() {
-            self.attachments.record_relation(&target, Some(opener));
+            self.attachments.forget_target_kind(&target);
+        } else {
+            if let Some(is_page) = value.page_target {
+                self.attachments.record_target_kind(&target, is_page);
+            }
+            if let Some(opener) = opener.as_deref() {
+                self.attachments.record_relation(&target, Some(opener));
+            }
         }
     }
 
@@ -3292,6 +3355,9 @@ impl Broker {
             return;
         };
         // attach 事件同样携带 opener/父 frame；先记录关系，再据此判定 page 归属。
+        if let Some(is_page) = value.page_target {
+            self.attachments.record_target_kind(target, is_page);
+        }
         if let Some(opener) = received_identity(&value, value.opener, &mut budget.json_scratch()) {
             self.attachments
                 .record_relation(target, Some(opener.as_str()));

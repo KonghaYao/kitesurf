@@ -7,7 +7,7 @@
 // 子 frame/popup 另按引擎报告的 opener/父 frame 链继承创建页归属。断开时只回收连接
 // 自己的 attachment；上限在这里检查，超限但已创建的 session 进入有界 quarantine。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::broker::ClientId;
 use crate::transport::{PayloadBudget, PayloadLease};
@@ -104,6 +104,8 @@ pub struct Attachments {
     claims: HashMap<String, PageClaim>,
     /// 引擎目标信息里的 opener/父 frame：子 target 通过它继承创建页的归属。
     relations: HashMap<String, String>,
+    /// 引擎明确报告为非 page 的目标；类型未知的目标不记录，端点校验保持兼容。
+    non_page_targets: HashSet<String>,
     budget: PayloadBudget,
     pub auto_owner: Option<ClientId>,
 }
@@ -452,14 +454,40 @@ impl Attachments {
         self.relations.remove(target);
     }
 
+    /// 引擎报告的 targetInfo.type：只有 page 能作 page 端点的主目标。
+    pub fn record_target_kind(&mut self, target: &str, is_page: bool) {
+        if is_page {
+            self.non_page_targets.remove(target);
+            return;
+        }
+        if self.non_page_targets.len() >= MAX_TARGET_RELATIONS
+            && !self.non_page_targets.contains(target)
+        {
+            return;
+        }
+        self.non_page_targets.insert(target.to_string());
+    }
+
+    pub fn forget_target_kind(&mut self, target: &str) {
+        self.non_page_targets.remove(target);
+    }
+
+    /// 已由引擎证明不是顶层 page：带 opener/父 frame，或类型不是 page。
+    pub fn is_not_top_level_page(&self, target: &str) -> bool {
+        self.relations.contains_key(target) || self.non_page_targets.contains(target)
+    }
+
     /// page session 是否仍可登记该 target；已登记归属或引擎报告的父链都属于同一页。
     fn page_accepts(&self, target: &str, page: &str) -> bool {
         self.page_of_target(target)
             .is_none_or(|owner| owner == page)
     }
 
-    /// 控制连接建立时先登记主 target；已被其他页面登记时拒绝。
+    /// 控制连接建立时先登记主 target；已被其他页面登记或并非顶层 page 时拒绝。
     pub fn claim_primary(&mut self, target: &str) -> bool {
+        if self.is_not_top_level_page(target) {
+            return false;
+        }
         match self.claims.get_mut(target) {
             Some(claim) => {
                 if claim.page != target {

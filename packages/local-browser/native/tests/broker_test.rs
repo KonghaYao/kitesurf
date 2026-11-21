@@ -2112,6 +2112,255 @@ async fn page_session_get_target_info_defaults_to_primary_and_rejects_browser_ta
     assert!(!broker.wait_terminal().await);
 }
 
+// 实例级 ID 不能作为 /devtools/page/{targetId} 的主目标，也不会向上游发起 attach。
+#[tokio::test]
+async fn page_session_endpoint_rejects_instance_targets() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    for (role, target) in [
+        (Role::Controller, "browser"),
+        (Role::Viewer, "browser"),
+        (Role::Controller, "kitesurf-engine"),
+        (Role::Controller, "kitesurf-page-renderer"),
+    ] {
+        let error = match broker
+            .reserve(ReserveRequest {
+                endpoint: Endpoint::Page {
+                    target_id: target.into(),
+                },
+                role,
+                owner: format!("owner-{target}"),
+            })
+            .await
+        {
+            Ok(_) => panic!("{target} must not back a page connection"),
+            Err(error) => error,
+        };
+        assert_eq!(error, super::PAGE_ENDPOINT_TARGET_MESSAGE, "{target}");
+    }
+    expect_no_request(&mut engine).await;
+    // 普通 page target 仍能接入，证明拒绝只针对实例目标。
+    let _page = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["method"], "Target.attachToTarget");
+    assert_eq!(attach["params"]["targetId"], "page-a");
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+// frame/popup/非 page 目标不能直接作 page 端点；父会话登记后仍可正常 attach。
+#[tokio::test]
+async fn page_session_endpoint_rejects_frames_and_popups() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut browser = connect(&broker, Endpoint::Browser, Role::Controller, "orchestrator").await;
+    send(
+        &browser,
+        &broker,
+        r#"{"id":1,"method":"Target.setDiscoverTargets","params":{"discover":true}}"#,
+    )
+    .await;
+    let discover = next_request(&mut engine).await;
+    engine.reply(request_id(&discover), json!({}));
+    assert_eq!(next_frame(&mut browser).await["id"], 1);
+    for event in [
+        json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"frame-a","type":"iframe","openerFrameId":"page-a"}}}),
+        json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"popup-a","type":"page","openerId":"page-a"}}}),
+        json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"orphan-frame","type":"iframe"}}}),
+        json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"worker-a","type":"worker"}}}),
+    ] {
+        engine.event(event);
+    }
+    for _ in 0..4 {
+        assert_eq!(
+            next_frame(&mut browser).await["method"],
+            "Target.targetCreated"
+        );
+    }
+    // 父页面尚未登记时，子目标也不能作为 page 端点被先到先得。
+    for (role, target) in [
+        (Role::Controller, "frame-a"),
+        (Role::Viewer, "frame-a"),
+        (Role::Controller, "popup-a"),
+        (Role::Controller, "orphan-frame"),
+        (Role::Controller, "worker-a"),
+    ] {
+        let error = match broker
+            .reserve(ReserveRequest {
+                endpoint: Endpoint::Page {
+                    target_id: target.into(),
+                },
+                role,
+                owner: format!("owner-{target}"),
+            })
+            .await
+        {
+            Ok(_) => panic!("{target} must not back a page connection"),
+            Err(error) => error,
+        };
+        assert_eq!(error, super::PAGE_ENDPOINT_TARGET_MESSAGE, "{target}");
+    }
+    expect_no_request(&mut engine).await;
+
+    let mut alice = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["params"]["targetId"], "page-a");
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+    // 父会话登记后，frame/popup 只能通过 Target.attachToTarget 接入。
+    for (id, target) in [(1, "frame-a"), (2, "popup-a")] {
+        send(
+            &alice,
+            &broker,
+            &json!({"id":id,"method":"Target.attachToTarget","params":{"targetId":target,"flatten":true}})
+                .to_string(),
+        )
+        .await;
+        let child = next_request(&mut engine).await;
+        assert_eq!(child["method"], "Target.attachToTarget");
+        assert_eq!(child["params"]["targetId"], target);
+        assert_eq!(child["sessionId"], "session-a");
+        engine.reply(
+            request_id(&child),
+            json!({"sessionId":format!("child-{id}")}),
+        );
+        assert_eq!(next_frame(&mut alice).await["id"], id);
+    }
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+// 端点被拒绝后，无 targetId 的 getTargetInfo 仍只返回本会话的真实主页面。
+#[tokio::test]
+async fn page_session_get_target_info_stays_on_page_after_rejected_endpoint() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    assert!(broker
+        .reserve(ReserveRequest {
+            endpoint: Endpoint::Page {
+                target_id: "browser".into(),
+            },
+            role: Role::Controller,
+            owner: "alice".to_string(),
+        })
+        .await
+        .is_err());
+    expect_no_request(&mut engine).await;
+
+    let mut alice = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["params"]["targetId"], "page-a");
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+
+    send(
+        &alice,
+        &broker,
+        r#"{"id":1,"method":"Target.getTargetInfo"}"#,
+    )
+    .await;
+    let info = next_request(&mut engine).await;
+    assert_eq!(info["method"], "Target.getTargetInfo");
+    assert_eq!(info["params"]["targetId"], "page-a");
+    assert!(info.get("sessionId").is_none());
+    engine.reply(
+        request_id(&info),
+        json!({"targetInfo":{"targetId":"page-a","type":"page"}}),
+    );
+    let frame = next_frame(&mut alice).await;
+    assert_eq!(frame["id"], 1);
+    assert_eq!(frame["result"]["targetInfo"]["targetId"], "page-a");
+    assert_ne!(frame["result"]["targetInfo"]["targetId"], "browser");
+    expect_no_request(&mut engine).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+// 预导航脚本表是共享 BrowserState：page 连接拒绝读改，Browser 端点保持实例级能力。
+#[tokio::test]
+async fn page_session_rejects_global_pre_nav_script_methods() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut browser = connect(&broker, Endpoint::Browser, Role::Controller, "orchestrator").await;
+    let mut alice = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+    for (id, method) in [
+        (1, "Page.addScriptToEvaluateOnNewDocument"),
+        (2, "Page.removeScriptToEvaluateOnNewDocument"),
+    ] {
+        send(
+            &alice,
+            &broker,
+            &json!({"id":id,"method":method,"params":{"source":"window.injected = 1","identifier":"script-1"}})
+                .to_string(),
+        )
+        .await;
+        let rejected = next_frame(&mut alice).await;
+        assert_eq!(rejected["id"], id);
+        assert!(
+            message(&rejected).contains("page-session connection"),
+            "{method}: {}",
+            message(&rejected)
+        );
+    }
+    expect_no_request(&mut engine).await;
+    // 普通 Page 方法仍按主 session 转发。
+    send(&alice, &broker, r#"{"id":3,"method":"Page.enable"}"#).await;
+    let enable = next_request(&mut engine).await;
+    assert_eq!(enable["sessionId"], "session-a");
+    engine.reply(request_id(&enable), json!({}));
+    assert_eq!(next_frame(&mut alice).await["id"], 3);
+    // Browser 端点保留共享脚本表。
+    send(
+        &browser,
+        &broker,
+        r#"{"id":4,"method":"Page.addScriptToEvaluateOnNewDocument","params":{"source":"window.injected = 1"}}"#,
+    )
+    .await;
+    let add = next_request(&mut engine).await;
+    assert_eq!(add["method"], "Page.addScriptToEvaluateOnNewDocument");
+    assert!(add.get("sessionId").is_none());
+    engine.reply(request_id(&add), json!({"identifier":"script-1"}));
+    let frame = next_frame(&mut browser).await;
+    assert_eq!(frame["id"], 4);
+    assert_eq!(frame["result"]["identifier"], "script-1");
+    expect_no_request(&mut engine).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
 // 预置流程：Browser 端点建两个 target，两个 page 连接各接一个，并保持 Browser 控制。
 #[tokio::test]
 async fn browser_provisions_targets_for_independent_page_controllers() {
