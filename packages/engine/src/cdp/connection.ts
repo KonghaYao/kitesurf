@@ -62,7 +62,6 @@ import { markArrival } from "./arrival.ts";
 import { StyleCache } from "./style-cache.ts";
 import { makeWallClock } from "../eval/host-clock.ts";
 import { LocalStorage } from "../state/local-storage.ts";
-import { MemorySessionStore } from "../state/session-store.ts";
 import { ProfileCommitter, flushProfile, type ProfilePersistence } from "../state/profile.ts";
 // Wrangler generates the ambient `Env` declaration from wrangler.jsonc.
 
