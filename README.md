@@ -31,20 +31,20 @@ reconnect behavior, control ownership, and build details.
 
 ## Install a release archive
 
-The v0.5.2 release workflow prepares native packages for Linux x64, Linux arm64
+The v0.5.3 release workflow prepares native packages for Linux x64, Linux arm64
 and macOS arm64. After the draft is published, install with
 [mise](https://mise.jdx.dev/):
 
 ```bash
-mise use -g github:KonghaYao/kitesurf@0.5.2
+mise use -g github:KonghaYao/kitesurf@0.5.3
 kitesurf serve
 ```
 
 To install manually on macOS, download the archive and its checksum:
 
 ```bash
-archive=kitesurf-0.5.2-darwin-arm64.tar.gz
-release=https://github.com/KonghaYao/kitesurf/releases/download/v0.5.2
+archive=kitesurf-0.5.3-darwin-arm64.tar.gz
+release=https://github.com/KonghaYao/kitesurf/releases/download/v0.5.3
 curl -fLO "$release/$archive"
 curl -fLO "$release/$archive.sha256"
 shasum -a 256 -c "$archive.sha256"

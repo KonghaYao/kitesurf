@@ -20,7 +20,7 @@ import { readEvents, required, startNativeHost } from "./host-adapter.mjs";
 const nativeHost = required("KITESURF_NATIVE_HOST");
 process.env.KITESURF_NATIVE_HOST = nativeHost;
 const scenario = process.env.KITESURF_CLI_SCENARIO;
-const expectedVersion = "0.5.2";
+const expectedVersion = "0.5.3";
 
 function spawnCli(args, timeout = 60_000) {
   const child = spawn(nativeHost, args, { stdio: ["ignore", "pipe", "pipe"] });
