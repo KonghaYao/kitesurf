@@ -137,6 +137,9 @@ const FRAME_CAPACITY: usize = 8;
 const COMMAND_CAPACITY: usize = 256;
 
 const PAGE_SESSION_CONTROL_MESSAGE: &str = "Another controller owns this page session";
+/// 显式接管 page session 时，旧控制者收到可解析的关闭帧而不是无原因的 1006。
+const PAGE_SESSION_TAKEOVER_CODE: u16 = 4001;
+const PAGE_SESSION_TAKEOVER_REASON: &str = "Page session taken over by ";
 const PAGE_SESSION_DENIED_MESSAGE: &str =
     "This method is not available on a page-session connection";
 const FOREIGN_TARGET_MESSAGE: &str = "Target belongs to another page session";
@@ -221,12 +224,14 @@ pub struct ReserveRequest {
     pub owner: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Reservation {
     id: ClientId,
     endpoint: Endpoint,
     role: Role,
     owner: String,
+    /// 该预留显式要求接管已在控制中的 page session。
+    takeover: bool,
 }
 
 impl Reservation {
@@ -416,7 +421,11 @@ pub struct SessionSnapshot {
 }
 
 enum BrokerCommand {
-    Reserve(ReserveRequest, oneshot::Sender<Result<Reservation, String>>),
+    Reserve(
+        ReserveRequest,
+        bool,
+        oneshot::Sender<Result<Reservation, ReserveError>>,
+    ),
     Commit {
         reservation: Reservation,
         writer: mpsc::Sender<ClientCommand>,
@@ -502,6 +511,58 @@ impl ControlError {
             Self::Conflict { controller, .. } => controller.clone(),
             Self::Other(_) => None,
         }
+    }
+}
+
+/// 预留失败的稳定形状；page 冲突附带当前控制者与 target，HTTP 入口据此生成可解析的 409。
+#[derive(Debug)]
+pub struct ReserveError {
+    message: String,
+    controller: Option<String>,
+    target: Option<String>,
+}
+
+impl ReserveError {
+    fn other(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            controller: None,
+            target: None,
+        }
+    }
+
+    fn conflict(message: impl Into<String>, controller: Option<String>) -> Self {
+        Self {
+            message: message.into(),
+            controller,
+            target: None,
+        }
+    }
+
+    fn page_conflict(controller: Option<String>, target: &str) -> Self {
+        Self {
+            message: PAGE_SESSION_CONTROL_MESSAGE.to_string(),
+            controller,
+            target: Some(target.to_string()),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn controller(&self) -> Option<&str> {
+        self.controller.as_deref()
+    }
+
+    pub fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+}
+
+impl std::fmt::Display for ReserveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
     }
 }
 
@@ -716,10 +777,23 @@ impl BrokerHandle {
         });
     }
 
-    pub async fn reserve(&self, request: ReserveRequest) -> Result<Reservation, String> {
-        self.command(|reply| BrokerCommand::Reserve(request, reply))
+    pub async fn reserve(&self, request: ReserveRequest) -> Result<Reservation, ReserveError> {
+        self.reserve_with_takeover(request, false).await
+    }
+
+    /// `takeover` 只对 page 端点控制器生效；预留本身不改变控制权，提交时才退休旧控制者。
+    pub async fn reserve_with_takeover(
+        &self,
+        request: ReserveRequest,
+        takeover: bool,
+    ) -> Result<Reservation, ReserveError> {
+        match self
+            .command(|reply| BrokerCommand::Reserve(request, takeover, reply))
             .await
-            .and_then(|result| result)
+        {
+            Ok(result) => result,
+            Err(_) => Err(ReserveError::other("browser session is lost")),
+        }
     }
 
     pub async fn commit(
@@ -1466,8 +1540,8 @@ impl Broker {
                     MAX_INTERNAL_PENDING - self.internal_slots.available_permits(),
                 ));
             }
-            BrokerCommand::Reserve(request, reply) => {
-                let result = self.reserve(request);
+            BrokerCommand::Reserve(request, takeover, reply) => {
+                let result = self.reserve(request, takeover);
                 let _ = reply.send(result);
             }
             BrokerCommand::Commit {
@@ -1580,42 +1654,64 @@ impl Broker {
         self.pump_finalize();
     }
 
-    fn reserve(&mut self, request: ReserveRequest) -> Result<Reservation, String> {
+    fn reserve(
+        &mut self,
+        request: ReserveRequest,
+        takeover: bool,
+    ) -> Result<Reservation, ReserveError> {
         if self.lifecycle != Lifecycle::Running {
-            return Err("Browser unavailable".to_string());
+            return Err(ReserveError::other("Browser unavailable"));
         }
         if !valid_owner(&request.owner) {
-            return Err("Owner name is too long".to_string());
+            return Err(ReserveError::other("Owner name is too long"));
+        }
+        // 观察者永远不写，接管只属于控制连接。
+        if takeover && request.role == Role::Viewer {
+            return Err(ReserveError::other(
+                "Viewer connections cannot take over a page session",
+            ));
         }
         if self.clients.len() >= MAX_CLIENTS || self.reservations.len() >= MAX_RESERVED {
-            return Err("Too many browser connections".to_string());
+            return Err(ReserveError::other("Too many browser connections"));
         }
         if let Endpoint::Page { target_id } = &request.endpoint {
             if let Some(message) = self.page_endpoint_error(target_id) {
-                return Err(message.to_string());
+                return Err(ReserveError::other(message));
             }
         }
         if request.role == Role::Controller {
             match &request.endpoint {
                 Endpoint::Browser => {
+                    if takeover {
+                        return Err(ReserveError::other(
+                            "Use the control endpoint to take over the browser",
+                        ));
+                    }
                     if self.control_active.is_some() {
-                        return Err("Control change is in progress".to_string());
+                        return Err(ReserveError::other("Control change is in progress"));
                     }
                     if let Some(controller) = &self.controller {
                         if controller != &request.owner {
-                            return Err(
-                                "Another controller owns the browser; explicitly take control"
-                                    .to_string(),
-                            );
+                            return Err(ReserveError::conflict(
+                                "Another controller owns the browser; explicitly take control",
+                                Some(controller.clone()),
+                            ));
                         }
                     }
                     if self.active_controller.is_some() {
-                        return Err("Controller is already connected".to_string());
+                        return Err(ReserveError::other("Controller is already connected"));
                     }
                 }
                 Endpoint::Page { target_id } => {
-                    if self.page_controller_taken(target_id) {
-                        return Err(PAGE_SESSION_CONTROL_MESSAGE.to_string());
+                    // 另一个控制握手尚未提交时不能排队，否则提交先后会让两个写入者短暂并存。
+                    if self.page_controller_reserved(target_id) {
+                        return Err(ReserveError::other("Control change is in progress"));
+                    }
+                    if self.page_session_controller(target_id).is_some() && !takeover {
+                        return Err(ReserveError::page_conflict(
+                            self.page_session_owner(target_id),
+                            target_id,
+                        ));
                     }
                 }
             }
@@ -1627,6 +1723,7 @@ impl Broker {
             endpoint: request.endpoint,
             role: request.role,
             owner: request.owner,
+            takeover,
         };
         self.reservations.insert(id, reservation.clone());
         Ok(reservation)
@@ -1645,14 +1742,41 @@ impl Broker {
         None
     }
 
-    /// page controller 只在没有活动控制者、也没有同会话的另一个预留时才能接入。
-    fn page_controller_taken(&self, target_id: &str) -> bool {
-        self.page_sessions.contains_key(target_id)
-            || self.reservations.values().any(|reservation| {
-                reservation.role == Role::Controller
-                    && matches!(&reservation.endpoint,
-                        Endpoint::Page { target_id: other } if other == target_id)
-            })
+    /// 已有控制者时只有显式 takeover 才能预留；预留阶段不改变控制权。
+    fn page_controller_reserved(&self, target_id: &str) -> bool {
+        self.reservations.values().any(|reservation| {
+            reservation.role == Role::Controller
+                && matches!(&reservation.endpoint,
+                    Endpoint::Page { target_id: other } if other == target_id)
+        })
+    }
+
+    fn page_session_controller(&self, target_id: &str) -> Option<ClientId> {
+        self.page_sessions
+            .get(target_id)
+            .map(|session| session.controller)
+    }
+
+    fn page_session_owner(&self, target_id: &str) -> Option<String> {
+        let controller = self.page_session_controller(target_id)?;
+        self.clients
+            .get(&controller)
+            .map(|state| state.owner.clone())
+    }
+
+    /// 显式接管：旧控制者收到带 owner 的关闭帧，其上游 session 走常规退休清理。
+    /// 早于 attach 回复的 intent 一并撤回，避免新控制者被旧握手的 Busy 拒绝。
+    fn retire_page_controller(&mut self, client: ClientId, page: &str, owner: &str) {
+        self.attachments.clear_intent(page, client);
+        if let Some(state) = self.clients.get_mut(&client) {
+            state.retired = true;
+        }
+        self.disconnect_client(
+            client,
+            PAGE_SESSION_TAKEOVER_CODE,
+            &takeover_reason(owner),
+            true,
+        );
     }
 
     fn commit(
@@ -1676,6 +1800,7 @@ impl Broker {
         }
         let page = matches!(reservation.endpoint, Endpoint::Page { .. });
         let mut epoch = self.control_epoch;
+        let mut takeover_from = None;
         // 先验证控制权身份，再取得准入序号；耗尽时不改变 owner/epoch。
         if reservation.role == Role::Controller {
             match &reservation.endpoint {
@@ -1690,13 +1815,15 @@ impl Broker {
                     }
                 }
                 Endpoint::Page { target_id } => {
-                    if self.page_controller_taken(target_id) {
+                    let previous = self.page_session_controller(target_id);
+                    if previous.is_some() && !reservation.takeover {
                         return false;
                     }
                     match take_sequence(&mut self.next_page_epoch) {
                         Some(page_epoch) => epoch = page_epoch,
                         None => return false,
                     }
+                    takeover_from = previous;
                 }
             }
         }
@@ -1717,6 +1844,10 @@ impl Broker {
                     self.active_controller = Some(id);
                 }
                 Endpoint::Page { target_id } => {
+                    // 准入检查已全部通过；此处的退休不会失败，也不会回滚已接受的接管。
+                    if let Some(previous) = takeover_from {
+                        self.retire_page_controller(previous, target_id, &reservation.owner);
+                    }
                     // 主 target 在连接建立时即归属该页面，先于它的 attach 回复。
                     if !self.attachments.claim_primary(target_id) {
                         return false;
@@ -2610,6 +2741,18 @@ impl Broker {
 fn valid_owner(owner: &str) -> bool {
     let units = owner.encode_utf16().count();
     !owner.is_empty() && units <= MAX_OWNER_UTF16
+}
+
+/// 关闭帧 reason 上限 123 bytes；owner 允许 128 个 UTF-16 单元，必须按字符截断。
+fn takeover_reason(owner: &str) -> String {
+    let mut reason = String::from(PAGE_SESSION_TAKEOVER_REASON);
+    for character in owner.chars() {
+        if reason.len() + character.len_utf8() > 123 {
+            break;
+        }
+        reason.push(character);
+    }
+    reason
 }
 
 #[cfg(all(test, feature = "test-faults"))]
@@ -3977,6 +4120,11 @@ impl Broker {
             .clients
             .get(&client_id)
             .and_then(|state| state.page.clone());
+        // 接管可能早于 attach 回复：迟到 session 只登记清理身份，不能再驱动旧连接。
+        let retired = self
+            .clients
+            .get(&client_id)
+            .is_none_or(|state| state.closed || state.retired);
         let outcome =
             self.attachments
                 .register(client_id, epoch, &session, target, None, page.as_deref());
@@ -3988,7 +4136,17 @@ impl Broker {
                 self.disconnect_client(client_id, 1008, "Target expired", true);
                 return;
             }
-            Registration::Foreign | Registration::Quarantined => {
+            Registration::Foreign => {
+                // 新控制者的 attach intent 会让旧 session 显示为 Foreign；无主的迟到
+                // session 没有其他 owner，直接在上游回收。
+                if retired && self.attachments.owner(&session).is_none() {
+                    self.detach_scoped(&session);
+                } else {
+                    self.disconnect_client(client_id, 1008, "Target expired", true);
+                }
+                return;
+            }
+            Registration::Quarantined => {
                 self.disconnect_client(client_id, 1008, "Target expired", true);
                 return;
             }
@@ -4002,6 +4160,10 @@ impl Broker {
                 self.handle_lost("attachment metadata budget exhausted".into());
                 return;
             }
+        }
+        if retired {
+            self.start_retirement(client_id);
+            return;
         }
         let Some(state) = self.clients.get_mut(&client_id) else {
             return;

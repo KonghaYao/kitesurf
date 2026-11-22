@@ -103,6 +103,27 @@ export interface ListenerEntry {
   passive: boolean;
 }
 
+export interface HistorySeedEntry {
+  url: string;
+  /** The engine's navigation-history id for this entry, used to request a cross-document visit. */
+  entryId?: number;
+}
+
+/** The session history committed before this document, so `history.length` and traversal agree
+ * with `Page.getNavigationHistory`. Only the entry at `index` belongs to this document. */
+export interface HistorySeed {
+  entries: HistorySeedEntry[];
+  index: number;
+}
+
+/** Extra information about a same-document URL change. `entryId` names the engine's entry;
+ * `traversal` marks a visit to an entry the history already holds, so the engine moves its
+ * cursor instead of recording a new push. */
+export interface HistoryChangeDetail {
+  entryId?: number;
+  traversal?: boolean;
+}
+
 export interface BuildDocumentOpts {
   pageUrl: string;
   initialCookieString: string;
@@ -117,9 +138,11 @@ export interface BuildDocumentOpts {
   referrer?: string;
   getCurrentUrl?: () => string;
   getDocumentUrl?: () => string;
+  history?: HistorySeed;
   setCurrentUrl?: (
     newUrl: string,
-    kind: "hash" | "navigate" | "pushState" | "replaceState" | "historyApi",
+    kind: "hash" | "navigate" | "pushState" | "replaceState" | "historyApi" | "historyTraverse",
+    detail?: HistoryChangeDetail,
   ) => void;
   canonicalizeInlineStyle?: (
     css: string,
@@ -174,7 +197,11 @@ export let topNavigationAllowed: boolean = true;
 export let getCurrentUrl: () => string = () => "";
 export let getDocumentUrl: () => string = () => "";
 export let setCurrentUrl:
-  | ((url: string, kind: "hash" | "navigate" | "pushState" | "replaceState" | "historyApi") => void)
+  | ((
+      url: string,
+      kind: "hash" | "navigate" | "pushState" | "replaceState" | "historyApi" | "historyTraverse",
+      detail?: HistoryChangeDetail,
+    ) => void)
   | null = null;
 export let getRectByAuthId: ((id: number) => AuthRectSnapshot | null) | null = null;
 export let getScrollInfoByAuthId: ((id: number) => AuthScrollInfoSnapshot | null) | null = null;

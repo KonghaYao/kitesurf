@@ -49,6 +49,124 @@ function warnMatchBudget(budget: MatchBudget): void {
   console.warn("kitesurf: CSS matched-style reply is over budget; skipping larger matches");
 }
 
+// The frontend polls `CSS.takeComputedStyleUpdates` every few milliseconds. Answering an empty
+// poll at once turns that into an unbounded busy loop, so a take with nothing pending waits for
+// a change, or this long, before it replies.
+export const COMPUTED_STYLE_TAKE_TIMEOUT_MS = 100;
+
+// A re-render can touch thousands of nodes; the take reply keeps a bounded sample of them.
+const MAX_PENDING_STYLE_UPDATES = 256;
+
+interface ComputedStyleUpdates {
+  // Node ids seen mutated since the last take; their computed style may have changed.
+  pending: Set<number>;
+  // `trackComputedStyleUpdatesForNode` narrows recording to one node id; null records any node.
+  trackedNodeId: number | null;
+  waiters: Set<() => void>;
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
+const computedStyleUpdates = new WeakMap<TargetState, ComputedStyleUpdates>();
+
+function computedStyleUpdatesFor(target: TargetState): ComputedStyleUpdates {
+  let updates = computedStyleUpdates.get(target);
+  if (!updates) {
+    updates = { pending: new Set(), trackedNodeId: null, waiters: new Set(), timer: null };
+    computedStyleUpdates.set(target, updates);
+  }
+  return updates;
+}
+
+// The page agent reports DOM mutations, not recalculated styles; a mutation that can reach the
+// cascade is the closest signal this engine has, and the frontend re-reads the node either way.
+function recordComputedStyleMutations(target: TargetState, mutations: CdpMutation[]): void {
+  const updates = computedStyleUpdates.get(target);
+  if (!updates) return;
+  let recorded = false;
+  const note = (nodeId: number | undefined): void => {
+    if (typeof nodeId !== "number" || nodeId <= 0) return;
+    if (updates.trackedNodeId !== null && nodeId !== updates.trackedNodeId) return;
+    if (updates.pending.size >= MAX_PENDING_STYLE_UPDATES) return;
+    if (updates.pending.has(nodeId)) return;
+    updates.pending.add(nodeId);
+    recorded = true;
+  };
+  for (const m of mutations) {
+    if (!m || typeof m !== "object") continue;
+    switch (m.kind) {
+      case "attributeModified":
+      case "attributeRemoved":
+      case "characterDataModified":
+        note(m.nodeId);
+        break;
+      case "childNodeInserted":
+        note(m.parentNodeId);
+        note(m.node.nodeId);
+        break;
+      case "childNodeRemoved":
+        note(m.parentNodeId);
+        break;
+      case "childNodeCountUpdated":
+        note(m.nodeId);
+        break;
+      case "shadowRootPushed":
+        note(m.hostId);
+        break;
+      case "stylesheetResourceLoaded":
+        break;
+    }
+  }
+  if (recorded) wakeComputedStyleWaiters(updates);
+}
+
+function wakeComputedStyleWaiters(updates: ComputedStyleUpdates): void {
+  if (updates.timer !== null) {
+    clearTimeout(updates.timer);
+    updates.timer = null;
+  }
+  const waiters = Array.from(updates.waiters);
+  updates.waiters.clear();
+  for (const wake of waiters) wake();
+}
+
+function waitForComputedStyleUpdate(updates: ComputedStyleUpdates): Promise<void> {
+  return new Promise((resolve) => {
+    const wake = (): void => {
+      updates.waiters.delete(wake);
+      resolve();
+    };
+    updates.waiters.add(wake);
+    if (updates.timer !== null) return;
+    updates.timer = setTimeout(() => {
+      updates.timer = null;
+      // The window elapsed: every blocked poll answers now, so a client that does not await
+      // its replies cannot build a backlog of timers behind this one.
+      wakeComputedStyleWaiters(updates);
+    }, COMPUTED_STYLE_TAKE_TIMEOUT_MS);
+  });
+}
+
+function takePendingComputedStyleUpdates(updates: ComputedStyleUpdates): number[] {
+  if (updates.pending.size === 0) return [];
+  const nodeIds = Array.from(updates.pending);
+  updates.pending.clear();
+  return nodeIds;
+}
+
+async function takeComputedStyleUpdates(
+  target: TargetState | undefined,
+): Promise<Protocol.CSS.TakeComputedStyleUpdatesResponse> {
+  if (!target) {
+    await new Promise<void>((resolve) => setTimeout(resolve, COMPUTED_STYLE_TAKE_TIMEOUT_MS));
+    return { nodeIds: [] };
+  }
+  const updates = computedStyleUpdatesFor(target);
+  const pending = takePendingComputedStyleUpdates(updates);
+  if (pending.length > 0) return { nodeIds: pending };
+  await waitForComputedStyleUpdate(updates);
+  return { nodeIds: takePendingComputedStyleUpdates(updates) };
+}
+
 export async function handleCss(ctx: DispatchCtx, req: CdpRequest): Promise<unknown> {
   const target = pickTarget(ctx, req.sessionId);
   const session = target ? sessionOf(ctx, target) : null;
@@ -56,6 +174,10 @@ export async function handleCss(ctx: DispatchCtx, req: CdpRequest): Promise<unkn
 
   switch (req.method) {
     case "CSS.enable": {
+      if (target) {
+        // A fresh inspector starts with no stale badges from before it attached.
+        computedStyleUpdatesFor(target).pending.clear();
+      }
       if (req.sessionId && target) {
         target.cssEnabledSessions.add(req.sessionId);
         for (const [id, entry] of target.styleSheets) {
@@ -69,11 +191,20 @@ export async function handleCss(ctx: DispatchCtx, req: CdpRequest): Promise<unkn
       }
       return {};
     }
-    case "CSS.disable":
+    case "CSS.disable": {
       if (req.sessionId && target) {
         target.cssEnabledSessions.delete(req.sessionId);
       }
+      if (target && target.cssEnabledSessions.size === 0) {
+        const updates = computedStyleUpdates.get(target);
+        if (updates) {
+          updates.pending.clear();
+          wakeComputedStyleWaiters(updates);
+          computedStyleUpdates.delete(target);
+        }
+      }
       return {};
+    }
 
     case "CSS.getComputedStyleForNode": {
       const nodeId = req.params?.nodeId;
@@ -173,14 +304,23 @@ export async function handleCss(ctx: DispatchCtx, req: CdpRequest): Promise<unkn
       } satisfies Protocol.CSS.GetPlatformFontsForNodeResponse;
 
     case "CSS.trackComputedStyleUpdates":
-    case "CSS.trackComputedStyleUpdatesForNode":
-      // Computed-style change badges are unsupported; style queries still work.
+      // The page reports mutations, not property-level invalidations, so tracking keeps no
+      // property list and takeComputedStyleUpdates below reports the nodes those mutations touch.
+      if (target) computedStyleUpdatesFor(target).trackedNodeId = null;
       return {};
 
+    case "CSS.trackComputedStyleUpdatesForNode": {
+      if (target) {
+        const nodeId = req.params?.nodeId;
+        computedStyleUpdatesFor(target).trackedNodeId =
+          typeof nodeId === "number" && nodeId > 0 ? nodeId : null;
+      }
+      return {};
+    }
+
     case "CSS.takeComputedStyleUpdates":
-      return {
-        nodeIds: [],
-      } satisfies Protocol.CSS.TakeComputedStyleUpdatesResponse;
+      // Each CDP message runs on its own task, so this wait does not hold up later commands.
+      return takeComputedStyleUpdates(target);
 
     default:
       return {};
@@ -717,6 +857,12 @@ export function clearStyleSheetsForNavigate(ctx: DispatchCtx, target: TargetStat
   }
   target.styleSheets.clear();
   target.nextStyleSheetRev.clear();
+  // Node ids are per document, so updates recorded against the old one are no longer meaningful.
+  const updates = computedStyleUpdates.get(target);
+  if (updates) {
+    updates.pending.clear();
+    wakeComputedStyleWaiters(updates);
+  }
 }
 
 export function syncStyleSheetsFromMutations(
@@ -724,6 +870,9 @@ export function syncStyleSheetsFromMutations(
   target: TargetState,
   mutations: CdpMutation[],
 ): void {
+  // Recording runs before the stylesheet gate: a client can poll computed-style updates without
+  // any stylesheet to reconcile.
+  recordComputedStyleMutations(target, mutations);
   if (target.cssEnabledSessions.size === 0) return;
   let needsEnumerate = false;
   for (const m of mutations) {

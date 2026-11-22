@@ -254,6 +254,19 @@ fn error_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
     json_response(status, json!({ "error": message }).to_string())
 }
 
+/// 冲突正文必须可解析：当前控制者、page target 与显式接管提示都随 409 返回。
+fn reserve_error_response(error: &crate::broker::ReserveError) -> Response<Full<Bytes>> {
+    let mut value = json!({ "error": error.message() });
+    if let Some(controller) = error.controller() {
+        value["controller"] = json!(controller);
+    }
+    if let Some(target) = error.target() {
+        value["targetId"] = json!(target);
+        value["takeover"] = json!("force=true");
+    }
+    json_response(StatusCode::CONFLICT, value.to_string())
+}
+
 fn allowed_origin(request: &Request<Incoming>, port: u16) -> bool {
     let hosts = request.headers().get_all(HOST).iter().count();
     if hosts != 1 {
@@ -821,6 +834,8 @@ struct Query {
     owner: Option<String>,
     /// `/json/list?page=<targetId>` 把发现范围限定到该 page session。
     page: Option<String>,
+    /// `?force=true`（别名 `?takeover=true`）显式接管 page session 的当前控制者。
+    force: bool,
 }
 
 fn parse_query(query: Option<&str>) -> Result<Query, String> {
@@ -840,6 +855,12 @@ fn parse_query(query: Option<&str>) -> Result<Query, String> {
         role: values.remove("role"),
         owner: values.remove("owner"),
         page: values.remove("page"),
+        force: match values.remove("force").or_else(|| values.remove("takeover")) {
+            None => false,
+            Some(value) if value.is_empty() || value == "true" || value == "1" => true,
+            Some(value) if value == "false" || value == "0" => false,
+            Some(_) => return Err("Invalid takeover parameter".to_string()),
+        },
     })
 }
 
@@ -888,17 +909,26 @@ async fn upgrade(
     if owner.is_empty() || owner.encode_utf16().count() > 128 {
         return error_response(StatusCode::CONFLICT, "Owner name is too long");
     }
+    if query.force && matches!(endpoint, Endpoint::Browser) {
+        return error_response(
+            StatusCode::CONFLICT,
+            "Use the control endpoint to take over the browser",
+        );
+    }
     let reservation = match context
         .broker
-        .reserve(ReserveRequest {
-            endpoint,
-            role,
-            owner,
-        })
+        .reserve_with_takeover(
+            ReserveRequest {
+                endpoint,
+                role,
+                owner,
+            },
+            query.force,
+        )
         .await
     {
         Ok(reservation) => reservation,
-        Err(message) => return error_response(StatusCode::CONFLICT, &message),
+        Err(error) => return reserve_error_response(&error),
     };
     let reservation_id = reservation.id();
     let version = request

@@ -4,10 +4,12 @@
 
 import { describe, it, expect, vi } from "vitest";
 import {
+  COMPUTED_STYLE_TAKE_TIMEOUT_MS,
   MAX_PARSED_DECLARATIONS_PER_SHEET,
   MAX_PARSED_RULES_PER_SHEET,
   handleCss,
   syncStyleSheetsFromEnumeration,
+  syncStyleSheetsFromMutations,
 } from "../src/cdp/css.ts";
 import { ensureInterception, unregisterInterception } from "../src/cdp/fetch-interception.ts";
 import { registerOutboundFilters } from "../src/cdp/outbound-filter-registry.ts";
@@ -896,5 +898,101 @@ describe("CSS.getMatchedStylesForNode reply bounds", () => {
     );
     expect(result.matchedCSSRules?.length).toBe(1);
     expect(calls).toBe(1);
+  });
+});
+
+describe("CSS.takeComputedStyleUpdates", () => {
+  const take = async (ctx: DispatchCtx) =>
+    (await handleCss(ctx, {
+      id: 1,
+      method: "CSS.takeComputedStyleUpdates",
+      sessionId: "s1",
+    })) as CdpResultOf<"CSS.takeComputedStyleUpdates">;
+
+  // DevTools enables document-wide tracking before it polls for badges.
+  const track = (ctx: DispatchCtx) =>
+    handleCss(ctx, {
+      id: 1,
+      method: "CSS.trackComputedStyleUpdates",
+      params: { propertiesToTrack: [{ name: "color", value: "rgb(0, 0, 0)" }] },
+      sessionId: "s1",
+    });
+
+  it("waits out a poll without updates instead of answering at once", async () => {
+    const ctx = makeCtx(makeTarget(makeStub({})));
+    const started = performance.now();
+    const r = await take(ctx);
+    const elapsed = performance.now() - started;
+    expect(r.nodeIds).toEqual([]);
+    expect(elapsed).toBeGreaterThanOrEqual(COMPUTED_STYLE_TAKE_TIMEOUT_MS / 2);
+    expect(elapsed).toBeLessThan(COMPUTED_STYLE_TAKE_TIMEOUT_MS * 5);
+  });
+
+  it("answers a waiting poll as soon as a mutation reaches the cascade", async () => {
+    const target = makeTarget(makeStub({}));
+    const ctx = makeCtx(target);
+    const started = performance.now();
+    const pending = take(ctx);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    syncStyleSheetsFromMutations(ctx, target, [
+      { kind: "attributeModified", nodeId: 7, name: "style", value: "color: red" },
+    ]);
+    const r = await pending;
+    expect(r.nodeIds).toEqual([7]);
+    expect(performance.now() - started).toBeLessThan(COMPUTED_STYLE_TAKE_TIMEOUT_MS);
+  });
+
+  it("returns pending updates at once and drains them", async () => {
+    const target = makeTarget(makeStub({}));
+    const ctx = makeCtx(target);
+    await track(ctx);
+    syncStyleSheetsFromMutations(ctx, target, [
+      { kind: "attributeModified", nodeId: 7, name: "style", value: "color: red" },
+    ]);
+    const started = performance.now();
+    const r = await take(ctx);
+    expect(r.nodeIds).toEqual([7]);
+    expect(performance.now() - started).toBeLessThan(COMPUTED_STYLE_TAKE_TIMEOUT_MS);
+
+    const nextStarted = performance.now();
+    const empty = await take(ctx);
+    expect(empty.nodeIds).toEqual([]);
+    expect(performance.now() - nextStarted).toBeGreaterThanOrEqual(
+      COMPUTED_STYLE_TAKE_TIMEOUT_MS / 2,
+    );
+  });
+
+  it("reports only the node trackComputedStyleUpdatesForNode names", async () => {
+    const target = makeTarget(makeStub({}));
+    const ctx = makeCtx(target);
+    await handleCss(ctx, {
+      id: 1,
+      method: "CSS.trackComputedStyleUpdatesForNode",
+      params: { nodeId: 5 },
+      sessionId: "s1",
+    });
+    syncStyleSheetsFromMutations(ctx, target, [
+      { kind: "attributeModified", nodeId: 7, name: "style", value: "color: red" },
+      { kind: "attributeModified", nodeId: 5, name: "class", value: "hot" },
+    ]);
+    expect((await take(ctx)).nodeIds).toEqual([5]);
+  });
+
+  it("lets other CSS commands answer while a take waits", async () => {
+    const target = makeTarget(
+      makeStub({ getComputedStyle: { computedStyle: [{ name: "color", value: "red" }] } }),
+    );
+    const ctx = makeCtx(target);
+    let settled = false;
+    const pending = take(ctx).then((r) => {
+      settled = true;
+      return r;
+    });
+    const computed = (await handleCss(ctx, req("CSS.getComputedStyleForNode", { nodeId: 5 }))) as {
+      computedStyle: unknown;
+    };
+    expect(computed.computedStyle).toEqual([{ name: "color", value: "red" }]);
+    expect(settled).toBe(false);
+    expect((await pending).nodeIds).toEqual([]);
   });
 });

@@ -43,6 +43,8 @@ declare module "devtools-protocol" {
          * browser/CDP-started navigation; the literal "null" for an opaque page initiator.
          */
         _kitesurfInitiatorOrigin?: string;
+        /** The navigation-history entry a traversal must visit; suppresses appending a new entry. */
+        _kitesurfHistoryEntryId?: number;
       }
       interface StartScreencastRequest {
         minFrameIntervalMs?: integer;

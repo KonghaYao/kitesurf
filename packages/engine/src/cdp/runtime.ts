@@ -15,6 +15,7 @@ import {
 import type { ConsoleEntry } from "@kitesurf/jsrpc-types/shared";
 import { emitScriptParsed, hasDebuggerListeners, makeCompiledScriptMeta } from "./debugger.ts";
 import { emitMutations } from "./dom.ts";
+import { retryableContextDestroyed } from "./errors.ts";
 import { sessionOf } from "./page-session.ts";
 import { jarForTarget } from "./target.ts";
 import { emitFrameDclComplete, emitFrameLoadComplete } from "./page.ts";
@@ -149,9 +150,10 @@ function assertLiveContextId(target: TargetState | null | undefined, id: unknown
 function throwIfContextDestroyed(
   owner: { pageScript?: unknown } | null | undefined,
   ps: unknown,
+  target?: TargetState | null,
 ): void {
   if (owner && owner.pageScript !== ps) {
-    throw new Error("Execution context was destroyed.");
+    throw retryableContextDestroyed(target?.defaultContextId);
   }
 }
 
@@ -366,7 +368,7 @@ export async function handleRuntime(ctx: DispatchCtx, req: CdpRequest): Promise<
         }
         return pageScriptResultToCdp(result, returnByValue);
       } catch (err) {
-        throwIfContextDestroyed(oopifStub ? oopifFrame : target, ps);
+        throwIfContextDestroyed(oopifStub ? oopifFrame : target, ps, target);
         return loaderFailureResponse(err);
       }
     }
@@ -456,7 +458,7 @@ export async function handleRuntime(ctx: DispatchCtx, req: CdpRequest): Promise<
         }
         return pageScriptResultToCdp(result, returnByValue);
       } catch (err) {
-        throwIfContextDestroyed(childFrame || target, ps);
+        throwIfContextDestroyed(childFrame || target, ps, target);
         return loaderFailureResponse(err);
       }
     }

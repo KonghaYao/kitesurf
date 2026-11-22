@@ -632,7 +632,7 @@ const buildDocumentBody = function buildDocument(dom: DomHandle, opts: BuildDocu
   cache.set(DOCUMENT_ID, document);
   setDocumentImpl(document);
 
-  const { window, Window } = installWindow(document);
+  const { window, Window } = installWindow(document, opts.history);
   installNamedPropertiesObject();
   installInitialNamedGlobals();
 
