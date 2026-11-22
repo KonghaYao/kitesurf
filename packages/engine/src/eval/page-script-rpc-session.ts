@@ -405,7 +405,9 @@ export class PageScriptRpcSession implements PageScriptStub {
   async unload(): ReturnType<PageScriptStub["unload"]> {
     this.retiring = true;
     try {
-      return await this.call("unload", {});
+      // Unload drains page-local state; an isolate wedged in page script must not hold the
+      // navigation that retires it, so this call gets a much shorter budget than the default.
+      return await this.call("unload", {}, 5_000);
     } finally {
       setTimeout(() => this.close("after unload"), 0);
     }

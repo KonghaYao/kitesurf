@@ -193,13 +193,14 @@ import {
   awaitDeferredFonts,
   deferredDegradedReads,
   demandDeferredFonts,
-  ensureFontsRegistered,
   emojiPendingPromise,
   cjkPendingPromise,
   demandFacesForScriptText,
   noteNavigateText,
   scriptPendingPromises,
   fontDeferActive,
+  startNavigationFonts,
+  systemFontsPending,
   systemFontDiagnostics,
   startFontPrefetch,
   forceMonoFace,
@@ -2482,6 +2483,9 @@ ksInternals.fontsReady = async () => {
     await awaitDeferredFonts();
     discoverFontFaces();
   }
+  // System faces load in the background; a reader that asks for final metrics waits here.
+  const system = systemFontsPending();
+  if (system) await system;
   return fontsIdle();
 };
 ksInternals.fontsInflightCount = fontsInflightCount;
@@ -3338,7 +3342,8 @@ export class PageScript extends WorkerEntrypoint implements PageScriptSession {
     if (fontDeferActive()) {
       startFontPrefetch(source.fonts);
     } else {
-      await ensureFontsRegistered(source.fonts);
+      // System fonts load behind the commit; the promise is null in that mode.
+      await startNavigationFonts(source.fonts);
     }
     emitNavigateDiagnostic("end", "fonts");
     markPhase("fontsMs");
@@ -3445,6 +3450,7 @@ export class PageScript extends WorkerEntrypoint implements PageScriptSession {
         doctypeMarker: marker,
         userAgent: startupUserAgent,
         referrer: startupReferrer,
+        ...(navigateOptions?.history ? { history: navigateOptions.history } : {}),
         canonicalizeInlineStyle: (css: string) => {
           try {
             return ks_parse_inline_style(css);
@@ -3510,7 +3516,7 @@ export class PageScript extends WorkerEntrypoint implements PageScriptSession {
         // History and origin checks use the committed document URL, not the
         // page URL a cross-document navigation may already have advanced.
         getDocumentUrl: () => state.documentUrl || state.pageUrl,
-        setCurrentUrl: (newUrl, kind) => {
+        setCurrentUrl: (newUrl, kind, detail) => {
           if (typeof newUrl !== "string" || newUrl.length === 0) return;
           const previous = state.pageUrl;
           if (startupCdpDebug) {
@@ -3521,6 +3527,7 @@ export class PageScript extends WorkerEntrypoint implements PageScriptSession {
                   kind,
                   previous,
                   newUrl,
+                  entryId: detail?.entryId,
                   same: previous === newUrl,
                 }),
               );
@@ -3530,7 +3537,7 @@ export class PageScript extends WorkerEntrypoint implements PageScriptSession {
           // A same-document change, including a history traversal, commits now;
           // a cross-document one waits for the new document, so the current one
           // keeps its URL until then.
-          if (kind !== "navigate") state.documentUrl = newUrl;
+          if (kind !== "navigate" && kind !== "historyTraverse") state.documentUrl = newUrl;
           if (kind === "hash" && previous !== newUrl && state.window) {
             const stateForPopstate = state.window.history?.state ?? null;
             queuePageTask(() => {
@@ -3556,11 +3563,11 @@ export class PageScript extends WorkerEntrypoint implements PageScriptSession {
             });
             scrollToFragment(newUrl);
           }
-          if (previous !== newUrl || kind === "navigate") {
+          if (previous !== newUrl || kind === "navigate" || kind === "historyTraverse") {
             const navigationType =
               kind === "hash"
                 ? "fragment"
-                : kind === "pushState" || kind === "replaceState"
+                : kind === "pushState" || kind === "replaceState" || kind === "historyApi"
                   ? "historyApi"
                   : "other";
             const report = () => {
@@ -3572,6 +3579,8 @@ export class PageScript extends WorkerEntrypoint implements PageScriptSession {
                     navigationType,
                     kind,
                     previousUrl: previous,
+                    ...(typeof detail?.entryId === "number" ? { entryId: detail.entryId } : {}),
+                    ...(detail?.traversal === true ? { traversal: true } : {}),
                   },
                 });
               } catch {}
@@ -3579,7 +3588,7 @@ export class PageScript extends WorkerEntrypoint implements PageScriptSession {
             // A cross-document navigation retires this isolate once the new page is fetched.
             // Report it after the running script returns, as Chrome does, so the reply to the
             // evaluate that set the location is sent before the engine starts the navigation.
-            if (kind === "navigate") nativeSetTimeout(report, 0);
+            if (kind === "navigate" || kind === "historyTraverse") nativeSetTimeout(report, 0);
             else report();
           }
         },
@@ -6937,6 +6946,7 @@ async function queryDomAwaitPendingResources(
   const emoji = emojiPendingPromise();
   const cjk = cjkPendingPromise();
   const upgrade = upgradePendingPromise();
+  const system = systemFontsPending();
   const fontPromises: Promise<void>[] = [];
   if (emoji) fontPromises.push(emoji.catch(() => {}));
   if (cjk) fontPromises.push(cjk.catch(() => {}));
@@ -6944,6 +6954,7 @@ async function queryDomAwaitPendingResources(
     fontPromises.push(promise.catch(() => {}));
   }
   if (upgrade) fontPromises.push(upgrade.catch(() => {}));
+  if (system) fontPromises.push(system.catch(() => {}));
   let fontsTimedOut = false;
   const fontsDone =
     fontPromises.length === 0

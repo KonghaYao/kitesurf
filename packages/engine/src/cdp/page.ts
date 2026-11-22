@@ -481,6 +481,26 @@ function recordNavigationHistory(target: TargetState, url: string, transitionTyp
   const outgoing = target.navigationHistory[target.navigationHistoryIndex];
   if (outgoing) outgoing.title = target.title;
 
+  // Chrome replaces the initial empty document's entry with the first real navigation, so a fresh
+  // target does not keep an about:blank entry behind `history.length`. A same-document change
+  // ("link", e.g. pushState or a hash write) pushes an entry instead.
+  const initial = target.navigationHistory[0];
+  if (
+    target.navigationHistory.length === 1 &&
+    target.navigationHistoryIndex === 0 &&
+    transitionType !== "link" &&
+    initial &&
+    (initial.url === "about:blank" || initial.url === "") &&
+    url !== "about:blank" &&
+    url !== ""
+  ) {
+    initial.url = url;
+    initial.userTypedURL = url;
+    initial.title = "";
+    initial.transitionType = isNavigationTransitionType(transitionType) ? transitionType : "other";
+    return;
+  }
+
   if (target.navigationHistoryIndex < target.navigationHistory.length - 1) {
     target.navigationHistory.length = target.navigationHistoryIndex + 1;
   }
@@ -497,6 +517,46 @@ function recordNavigationHistory(target: TargetState, url: string, transitionTyp
 
 function clearPendingNavAbort(target: TargetState, navAbort: AbortController): void {
   if (target.pendingNavAbort === navAbort) target.pendingNavAbort = null;
+}
+
+// A same-document traversal revisits an entry the list already holds. The page reports the entry
+// id when the engine seeded it and otherwise only the URL it was pushed with, so match the
+// nearest entry with that URL instead of recording a duplicate.
+function traversalHistoryIndex(target: TargetState, url: string, entryId: number | null): number {
+  if (entryId !== null) {
+    const byId = target.navigationHistory.findIndex((e) => e.id === entryId);
+    if (byId >= 0) return byId;
+  }
+  const current = target.navigationHistoryIndex;
+  for (let distance = 1; distance < target.navigationHistory.length; distance++) {
+    for (const index of [current - distance, current + distance]) {
+      if (target.navigationHistory[index]?.url === url) return index;
+    }
+  }
+  return -1;
+}
+
+// A committed navigation retires the isolate the old document runs in. Page-session reads wait
+// for this gate, so a command issued between commit and the replacement's publication runs in the
+// new document instead of being rejected by (or racing) the isolate the navigation is replacing.
+function beginNavigationGate(target: TargetState): () => void {
+  target.navigationGateDepth = (target.navigationGateDepth ?? 0) + 1;
+  if (!target.navigationReady) {
+    target.navigationReady = new Promise<void>((release) => {
+      target.navigationRelease = release;
+    });
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    target.navigationGateDepth = Math.max(0, (target.navigationGateDepth ?? 1) - 1);
+    if (target.navigationGateDepth > 0) return;
+    const release = target.navigationRelease;
+    target.navigationRelease = null;
+    target.navigationReady = null;
+    release?.();
+  };
 }
 
 function clearTimerIfSet(timer: ReturnType<typeof setTimeout> | null): void {
@@ -762,6 +822,19 @@ export async function handlePage(
         typeof ksParams?._kitesurfPostContentType === "string"
           ? ksParams._kitesurfPostContentType
           : "application/x-www-form-urlencoded";
+      const ksHistoryEntryId =
+        typeof ksParams?._kitesurfHistoryEntryId === "number"
+          ? ksParams._kitesurfHistoryEntryId
+          : null;
+      // A traversal visits an existing entry; recording it as back_forward keeps the list intact.
+      const navTransitionType =
+        ksHistoryEntryId !== null
+          ? "back_forward"
+          : ((req.params?.transitionType as string | undefined) ?? "typed");
+      if (ksHistoryEntryId !== null) {
+        const entryIndex = target.navigationHistory.findIndex((e) => e.id === ksHistoryEntryId);
+        if (entryIndex >= 0) target.navigationHistoryIndex = entryIndex;
+      }
       if (ctx.browser.cdpDebug) {
         console.log(
           `[kitesurf-nav] Page.navigate received id=${req.id} ` +
@@ -846,23 +919,38 @@ export async function handlePage(
             `navigate: wasm trap during parse: ${msg}`,
           );
         }
-        const {
-          console: capturedConsole,
-          cdpMutations,
-          exceptions,
-        } = await pushNavigateToPageScript(ctx, target, html, blitzUrl);
-        recordNavigationHistory(target, url, req.params?.transitionType ?? "typed");
-        emitNavigationLifecycle(ctx, target, req.sessionId);
-        emitExecutionContextCreated(ctx, target, req.sessionId);
-        emitCapturedConsole(ctx, target, capturedConsole, req.sessionId);
-        emitCapturedExceptions(ctx, target, exceptions, req.sessionId);
-        emitMutations(ctx, target, cdpMutations);
-        clearPendingNavAbort(target, navAbort);
-        return navigateReply(target.frameId, loaderId);
+        // Announce the commit before the isolate builds it. Page.frameNavigated must not trail
+        // the document because a font or the page's first script is slow; the gate keeps
+        // commands issued from the event on the new generation.
+        let releaseNavigationGate: (() => void) | null = null;
+        try {
+          emitFrameStartedLoading(ctx, target, mainFrame(target), req.sessionId);
+          releaseNavigationGate = beginNavigationGate(target);
+          emitFrameNavigated(ctx, target, mainFrame(target), req.sessionId);
+          const {
+            console: capturedConsole,
+            cdpMutations,
+            exceptions,
+          } = await pushNavigateToPageScript(ctx, target, html, blitzUrl);
+          recordNavigationHistory(target, url, navTransitionType);
+          emitNavigationLifecycle(ctx, target, req.sessionId);
+          emitExecutionContextCreated(ctx, target, req.sessionId);
+          emitCapturedConsole(ctx, target, capturedConsole, req.sessionId);
+          emitCapturedExceptions(ctx, target, exceptions, req.sessionId);
+          emitMutations(ctx, target, cdpMutations);
+          clearPendingNavAbort(target, navAbort);
+          return navigateReply(target.frameId, loaderId);
+        } catch (err) {
+          const errorText = err instanceof Error ? err.message : String(err);
+          return navigateReply(target.frameId, loaderId, errorText);
+        } finally {
+          releaseNavigationGate?.();
+        }
       }
 
       emitFrameStartedLoading(ctx, target, mainFrame(target), req.sessionId);
 
+      let releaseNavigationGate: (() => void) | null = null;
       try {
         const reqHeaders: Record<string, string> = {
           "user-agent":
@@ -1068,7 +1156,7 @@ export async function handlePage(
         target.docReferrerPolicy = resp.headers.get("referrer-policy");
         target.docCsp = resp.headers.get("content-security-policy");
         target.docCspReportOnly = resp.headers.get("content-security-policy-report-only");
-        recordNavigationHistory(target, finalUrl, req.params?.transitionType ?? "typed");
+        recordNavigationHistory(target, finalUrl, navTransitionType);
 
         const setCookies = readSetCookieHeaders(resp);
         for (const sc of setCookies) {
@@ -1152,6 +1240,7 @@ export async function handlePage(
         // Drain Network completion before Page.frameNavigated for the main frame.
         ctx.browser.networkEvents.drain();
 
+        releaseNavigationGate = beginNavigationGate(target);
         {
           const mf = mainFrame(target);
           mf.url = finalUrl;
@@ -1218,6 +1307,8 @@ export async function handlePage(
       } catch (err) {
         const errorText = err instanceof Error ? err.message : String(err);
         return navigateReply(target.frameId, loaderId, errorText);
+      } finally {
+        releaseNavigationGate?.();
       }
     }
 
@@ -1322,6 +1413,10 @@ export async function handlePage(
           url: target.url,
         }),
       );
+      // The commit announcement lives here, not in emitNavigationLifecycle: the navigate paths
+      // emit it earlier, before the isolate builds the document.
+      emitFrameStartedLoading(ctx, target, mainFrame(target), req.sessionId);
+      emitFrameNavigated(ctx, target, mainFrame(target), req.sessionId);
       emitNavigationLifecycle(ctx, target, req.sessionId);
       emitExecutionContextCreated(ctx, target, req.sessionId);
       emitCapturedConsole(ctx, target, capturedConsole, req.sessionId);
@@ -2351,6 +2446,16 @@ async function pushNavigateToPageScriptInner(
         ...(sharedLocalStorage
           ? { localStorage: sharedLocalStorage.storage.entries(sharedLocalStorage.origin) }
           : {}),
+        // The committed session history, so page-script history.length and back/forward agree
+        // with Page.getNavigationHistory for this document.
+        ...(target.navigationHistory.length > 0
+          ? {
+              history: {
+                entries: target.navigationHistory.map((e) => ({ url: e.url, entryId: e.id })),
+                index: target.navigationHistoryIndex,
+              },
+            }
+          : {}),
         modulePreloadPins: preloadSeeds.map(({ url, integrity }) => ({ url, integrity })),
         // The legacy plan (no bundle: a failed bake) gates its parser scripts from these.
         scriptPolicy: {
@@ -3223,14 +3328,13 @@ function scheduleNetworkIdleEmit(
   ctx.ctx.waitUntil(work);
 }
 
+// The lifecycle tail of a commit whose frame events were already emitted: these documents
+// register their frames but never load a child document.
 function emitNavigationLifecycle(
   ctx: DispatchCtx,
   target: TargetState,
   sessionId: string | undefined,
 ): void {
-  emitFrameStartedLoading(ctx, target, mainFrame(target), sessionId);
-  emitFrameNavigated(ctx, target, mainFrame(target), sessionId);
-  // These documents register their frames but never load a child document.
   rebuildFrameTreeChildren(target, newChildFrameBudget());
   const childFrames = [...target.frames.values()].filter(
     (frame) => frame.parentFrameId !== null && frame.lifecycle === "init",
@@ -4605,6 +4709,39 @@ function handleUpstreamFrameEvent(
       isSameOriginPathChange(previousUrl, url);
 
     const crossDocument = kind === "navigate";
+    const historyEntryId = typeof params.entryId === "number" ? params.entryId : null;
+    const traversal = params.traversal === true;
+
+    if (kind === "historyTraverse") {
+      const historyIndex =
+        historyEntryId === null
+          ? -1
+          : target.navigationHistory.findIndex((e) => e.id === historyEntryId);
+      if (historyIndex < 0) return;
+      target.navigationHistoryIndex = historyIndex;
+      (async () => {
+        try {
+          const { dispatch } = await import("./dispatch.ts");
+          await dispatch(ctx, {
+            id: -1,
+            method: "Page.navigate",
+            params: {
+              url: target.navigationHistory[historyIndex]?.url ?? url,
+              ...(historyEntryId !== null ? { _kitesurfHistoryEntryId: historyEntryId } : {}),
+              _kitesurfInternal: true,
+              _kitesurfInitiatorOrigin: initiatorOriginOf(isolateUrl) ?? "null",
+            },
+            sessionId: targetSessionsNetwork(target, sessionId)[0],
+          });
+        } catch (err) {
+          console.warn(
+            "kitesurf: history traversal Page.navigate failed:",
+            err instanceof Error ? err.message : String(err),
+          );
+        }
+      })();
+      return;
+    }
 
     if (crossDocument) {
       const settled =
@@ -4649,7 +4786,14 @@ function handleUpstreamFrameEvent(
     // Checked against the isolate's url because target.url is what this event would overwrite.
     if (!canRewriteDocumentUrl(isolateUrl, url)) return;
     target.url = url;
-    if (kind === "replaceState") {
+    if (traversal) {
+      // A traversal revisits an entry the page already pushed; recording it would duplicate it.
+      const historyIndex = traversalHistoryIndex(target, url, historyEntryId);
+      if (historyIndex >= 0) target.navigationHistoryIndex = historyIndex;
+    } else if (kind === "historyApi" && historyEntryId !== null) {
+      const historyIndex = target.navigationHistory.findIndex((e) => e.id === historyEntryId);
+      if (historyIndex >= 0) target.navigationHistoryIndex = historyIndex;
+    } else if (kind === "replaceState") {
       const live = target.navigationHistory[target.navigationHistoryIndex];
       if (live) {
         live.url = url;

@@ -30,6 +30,7 @@ import {
   pageUrl,
   cookieString,
   setCookieString,
+  type HistorySeed,
 } from "./state.js";
 import { boundFromGlobal } from "./registries.js";
 import { getDocId } from "./mutations/attached.js";
@@ -85,6 +86,11 @@ export function locUrl(): URL | null {
   }
 }
 
+// A fragment write commits in the same document, so its entry belongs to the history stack of the
+// window built for it. The `location` singleton lives outside buildWindow and reaches that stack
+// through this hook; a fresh document rebinds it, as it rebinds every other shared callback.
+let pushFragmentHistory: ((url: string) => void) | null = null;
+
 export function locationMutate(
   component: "hash" | "pathname" | "search" | "href",
   value: string,
@@ -120,7 +126,11 @@ export function locationMutate(
   } catch {
     return;
   }
-  setCurrentUrl(next.toString(), kind);
+  const target = next.toString();
+  // A fragment navigation is a push. replace() shares this path today, matching the engine,
+  // which records every same-document location change as a new entry.
+  if (kind === "hash" && target !== cur.toString()) pushFragmentHistory?.(target);
+  setCurrentUrl(target, kind);
 }
 
 type LocationSurface = Pick<
@@ -361,15 +371,42 @@ interface ParentWindowStub {
 export type ShimWindow = ReturnType<typeof installWindow>["windowObj"];
 
 // The return type is the window literal's own, inferred inside buildWindow.
-export function installWindow(document: DocumentImpl): ReturnType<typeof buildWindow> {
-  return buildWindow(document);
+export function installWindow(
+  document: DocumentImpl,
+  historySeed?: HistorySeed,
+): ReturnType<typeof buildWindow> {
+  return buildWindow(document, historySeed);
 }
 
-function buildWindow(document: DocumentImpl) {
-  type HistoryEntry = { url: string; state: unknown };
+function buildWindow(document: DocumentImpl, historySeed?: HistorySeed) {
+  type HistoryEntry = { url: string; state: unknown; entryId?: number; generation: number };
 
-  const historyStack: HistoryEntry[] = [{ url: getCurrentUrl() || "", state: null }];
-  let historyIndex = 0;
+  // Entries before this document keep the engine's session history so `history.length` and
+  // traversal match `Page.getNavigationHistory`. Only the seeded current entry is this document,
+  // so a visit to any other generation needs a real cross-document navigation.
+  const seededEntries = Array.isArray(historySeed?.entries) ? historySeed.entries : [];
+  const seededIndex =
+    seededEntries.length > 0
+      ? Math.min(Math.max(Number(historySeed?.index) | 0, 0), seededEntries.length - 1)
+      : 0;
+  const historyStack: HistoryEntry[] =
+    seededEntries.length > 0
+      ? seededEntries.map((entry, i) => ({
+          url: (i === seededIndex ? getCurrentUrl() : entry.url) || "",
+          state: null,
+          ...(typeof entry.entryId === "number" ? { entryId: entry.entryId } : {}),
+          generation: i === seededIndex ? 0 : -1,
+        }))
+      : [{ url: getCurrentUrl() || "", state: null, generation: 0 }];
+  let historyIndex = seededEntries.length > 0 ? seededIndex : 0;
+
+  // A fragment navigation truncates the forward entries and pushes here, exactly as the engine
+  // records it (`recordNavigationHistory` with a "link" transition).
+  pushFragmentHistory = (url: string) => {
+    historyStack.length = historyIndex + 1;
+    historyStack.push({ url, state: null, generation: 0 });
+    historyIndex = historyStack.length - 1;
+  };
 
   const resolveHistoryUrl = (
     rawUrl: string | null | undefined,
@@ -431,13 +468,13 @@ function buildWindow(document: DocumentImpl) {
     pushState(state: unknown, _title: string, url?: string | null) {
       const target = resolveHistoryUrl(url, "pushState");
       historyStack.length = historyIndex + 1;
-      historyStack.push({ url: target, state: state ?? null });
+      historyStack.push({ url: target, state: state ?? null, generation: 0 });
       historyIndex = historyStack.length - 1;
       if (setCurrentUrl) setCurrentUrl(target, "pushState");
     },
     replaceState(state: unknown, _title: string, url?: string | null) {
       const target = resolveHistoryUrl(url, "replaceState");
-      historyStack[historyIndex] = { url: target, state: state ?? null };
+      historyStack[historyIndex] = { url: target, state: state ?? null, generation: 0 };
       if (setCurrentUrl) setCurrentUrl(target, "replaceState");
     },
     go(n?: number) {
@@ -449,12 +486,31 @@ function buildWindow(document: DocumentImpl) {
       const prevUrl = prevEntry?.url ?? "";
       historyIndex = target;
       const nextEntry = historyStack[historyIndex];
-      const nextUrl = nextEntry?.url ?? "";
-      const sameDoc = prevUrl.split("#")[0] === nextUrl.split("#")[0];
-      if (setCurrentUrl) {
-        setCurrentUrl(nextUrl, sameDoc ? "hash" : "historyApi");
+      if (!nextEntry) return;
+      const nextUrl = nextEntry.url ?? "";
+      const hashOnly = prevUrl.split("#")[0] === nextUrl.split("#")[0];
+      const entryId = typeof nextEntry.entryId === "number" ? nextEntry.entryId : undefined;
+      if (nextEntry.generation !== 0) {
+        // A different document's entry: ask the engine to commit it. The new document reports
+        // its own traversal, so this one must not dispatch popstate for it.
+        if (setCurrentUrl) {
+          setCurrentUrl(
+            nextUrl,
+            "historyTraverse",
+            entryId !== undefined ? { entryId } : undefined,
+          );
+        }
+        return;
       }
-      const stateForPopstate = nextEntry?.state ?? null;
+      if (setCurrentUrl) {
+        setCurrentUrl(nextUrl, hashOnly ? "hash" : "historyApi", {
+          ...(entryId !== undefined ? { entryId } : {}),
+          traversal: true,
+        });
+      }
+      // A hash traversal is reported by setCurrentUrl's hash branch, popstate included.
+      if (hashOnly) return;
+      const stateForPopstate = nextEntry.state ?? null;
       const queuePopstate = (cb: () => void) => {
         try {
           ksGlobal.setTimeout(cb, 0);

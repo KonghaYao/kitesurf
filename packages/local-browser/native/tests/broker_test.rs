@@ -2136,7 +2136,11 @@ async fn page_session_endpoint_rejects_instance_targets() {
             Ok(_) => panic!("{target} must not back a page connection"),
             Err(error) => error,
         };
-        assert_eq!(error, super::PAGE_ENDPOINT_TARGET_MESSAGE, "{target}");
+        assert_eq!(
+            error.message(),
+            super::PAGE_ENDPOINT_TARGET_MESSAGE,
+            "{target}"
+        );
     }
     expect_no_request(&mut engine).await;
     // 普通 page target 仍能接入，证明拒绝只针对实例目标。
@@ -2207,7 +2211,11 @@ async fn page_session_endpoint_rejects_frames_and_popups() {
             Ok(_) => panic!("{target} must not back a page connection"),
             Err(error) => error,
         };
-        assert_eq!(error, super::PAGE_ENDPOINT_TARGET_MESSAGE, "{target}");
+        assert_eq!(
+            error.message(),
+            super::PAGE_ENDPOINT_TARGET_MESSAGE,
+            "{target}"
+        );
     }
     expect_no_request(&mut engine).await;
 
@@ -2466,7 +2474,27 @@ async fn page_session_allows_one_controller_but_keeps_viewers() {
         Ok(_) => panic!("second page controller must be rejected"),
         Err(error) => error,
     };
-    assert_eq!(error, "Another controller owns this page session");
+    assert_eq!(error.message(), "Another controller owns this page session");
+    assert_eq!(error.controller(), Some("alice"));
+    assert_eq!(error.target(), Some("page-a"));
+    // 观察者不能借 takeover 抢占控制权。
+    let takeover = broker
+        .reserve_with_takeover(
+            ReserveRequest {
+                endpoint: Endpoint::Page {
+                    target_id: "page-a".into(),
+                },
+                role: Role::Viewer,
+                owner: "viewer".to_string(),
+            },
+            true,
+        )
+        .await
+        .expect_err("viewer takeover");
+    assert_eq!(
+        takeover.message(),
+        "Viewer connections cannot take over a page session"
+    );
     let mut viewer = connect(
         &broker,
         Endpoint::Page {
@@ -2485,6 +2513,165 @@ async fn page_session_allows_one_controller_but_keeps_viewers() {
     engine.reply(request_id(&enable), json!({}));
     assert_eq!(next_frame(&mut viewer).await["id"], 1);
     expect_silence(&mut controller).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+// 显式 takeover 先退休旧控制者：结构化关闭、上游 detach，之后新控制者是唯一写入者。
+#[tokio::test]
+async fn page_takeover_retires_the_previous_controller() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["params"]["targetId"], "page-a");
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+    // 先让 attachment 结算：该请求只有在 attach 回复被处理后才会上行。
+    send(&alice, &broker, r#"{"id":1,"method":"Page.enable"}"#).await;
+    let enable = next_request(&mut engine).await;
+    assert_eq!(enable["sessionId"], "session-a");
+    engine.reply(request_id(&enable), json!({}));
+    assert_eq!(next_frame(&mut alice).await["id"], 1);
+
+    let reservation = broker
+        .reserve_with_takeover(
+            ReserveRequest {
+                endpoint: Endpoint::Page {
+                    target_id: "page-a".into(),
+                },
+                role: Role::Controller,
+                owner: "bob".to_string(),
+            },
+            true,
+        )
+        .await
+        .expect("takeover reservation");
+    let bob_id = reservation.id();
+    let (writer, frames) = mpsc::channel(64);
+    let (cancel, cancelled) = watch::channel(false);
+    assert!(broker.commit(reservation, writer, cancel).await, "commit");
+
+    let (code, reason) = next_close(&mut alice).await;
+    assert_eq!(code, 4001);
+    assert_eq!(reason, "Page session taken over by bob");
+    // 旧 attach 回复与新握手谁先到达取决于上游队列；两条命令都必须出现。
+    let mut detach = None;
+    let mut attach = None;
+    for _ in 0..2 {
+        let request = next_request(&mut engine).await;
+        match request["method"].as_str() {
+            Some("Target.detachFromTarget") => detach = Some(request),
+            Some("Target.attachToTarget") => attach = Some(request),
+            other => panic!("unexpected takeover request: {other:?}"),
+        }
+    }
+    let detach = detach.expect("old session detach");
+    assert_eq!(detach["params"]["sessionId"], "session-a");
+    let attach = attach.expect("new page attach");
+    assert_eq!(attach["params"]["targetId"], "page-a");
+    engine.reply(request_id(&detach), json!({}));
+    engine.reply(request_id(&attach), json!({"sessionId":"session-b"}));
+
+    // 旧控制者的帧不再产生上游请求；新控制者独占 session-b。
+    send(&alice, &broker, r#"{"id":3,"method":"Page.enable"}"#).await;
+    expect_no_request(&mut engine).await;
+    let mut bob = TestClient {
+        id: bob_id,
+        frames,
+        cancel: cancelled,
+    };
+    send(&bob, &broker, r#"{"id":2,"method":"Page.enable"}"#).await;
+    let enable = next_request(&mut engine).await;
+    assert_eq!(enable["sessionId"], "session-b");
+    engine.reply(request_id(&enable), json!({}));
+    assert_eq!(next_frame(&mut bob).await["id"], 2);
+
+    // 接管后普通控制连接仍被拒绝，并报告新的 owner。
+    let error = broker
+        .reserve(ReserveRequest {
+            endpoint: Endpoint::Page {
+                target_id: "page-a".into(),
+            },
+            role: Role::Controller,
+            owner: "carol".to_string(),
+        })
+        .await
+        .expect_err("second controller");
+    assert_eq!(error.controller(), Some("bob"));
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+// 接管早于旧 attach 回复：迟到 session 仍必须登记并被退休，不能留在上游。
+#[tokio::test]
+async fn page_takeover_before_attach_reply_retires_the_late_session() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let stale_attach = next_request(&mut engine).await;
+    assert_eq!(stale_attach["method"], "Target.attachToTarget");
+    assert_eq!(stale_attach["params"]["targetId"], "page-a");
+
+    let reservation = broker
+        .reserve_with_takeover(
+            ReserveRequest {
+                endpoint: Endpoint::Page {
+                    target_id: "page-a".into(),
+                },
+                role: Role::Controller,
+                owner: "bob".to_string(),
+            },
+            true,
+        )
+        .await
+        .expect("takeover reservation");
+    let bob_id = reservation.id();
+    let (writer, frames) = mpsc::channel(64);
+    let (cancel, cancelled) = watch::channel(false);
+    assert!(broker.commit(reservation, writer, cancel).await, "commit");
+    let (code, reason) = next_close(&mut alice).await;
+    assert_eq!(code, 4001);
+    assert_eq!(reason, "Page session taken over by bob");
+
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["method"], "Target.attachToTarget");
+    assert_eq!(attach["params"]["targetId"], "page-a");
+    // 迟到的旧 session 只登记清理身份，由 retirement 在上游回收。
+    engine.reply(request_id(&stale_attach), json!({"sessionId":"session-a"}));
+    engine.reply(request_id(&attach), json!({"sessionId":"session-b"}));
+    let detach = next_request(&mut engine).await;
+    assert_eq!(detach["method"], "Target.detachFromTarget");
+    assert_eq!(detach["params"]["sessionId"], "session-a");
+    engine.reply(request_id(&detach), json!({}));
+
+    let mut bob = TestClient {
+        id: bob_id,
+        frames,
+        cancel: cancelled,
+    };
+    send(&bob, &broker, r#"{"id":1,"method":"Page.enable"}"#).await;
+    let enable = next_request(&mut engine).await;
+    assert_eq!(enable["sessionId"], "session-b");
+    engine.reply(request_id(&enable), json!({}));
+    assert_eq!(next_frame(&mut bob).await["id"], 1);
+    send(&alice, &broker, r#"{"id":2,"method":"Page.enable"}"#).await;
+    expect_no_request(&mut engine).await;
     engine.kill();
     assert!(!broker.wait_terminal().await);
 }
@@ -3448,6 +3635,160 @@ fn test_host(broker: &BrokerHandle) -> crate::relay::HostServer {
         Arc::new(Observer::disabled()),
     )
     .unwrap()
+}
+
+// 只用于拒绝路径：读取完整 HTTP 应答，不参与协议升级。
+async fn upgrade_http(port: u16, path: &str) -> (u16, Value) {
+    use http_body_util::BodyExt;
+    use hyper::body::Bytes;
+    use hyper_util::rt::TokioIo;
+    let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .unwrap();
+    let task = tokio::spawn(connection);
+    let request = hyper::Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("host", format!("127.0.0.1:{port}"))
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(http_body_util::Full::new(Bytes::new()))
+        .unwrap();
+    let response = timeout(WAIT, sender.send_request(request))
+        .await
+        .expect("upgrade response")
+        .expect("upgrade status");
+    let status = response.status().as_u16();
+    let body = timeout(WAIT, response.into_body().collect())
+        .await
+        .expect("upgrade body")
+        .expect("upgrade body read")
+        .to_bytes();
+    task.abort();
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+async fn ws_upgrade(port: u16, path: &str) -> tokio_tungstenite::WebSocketStream<TcpStream> {
+    let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let (socket, response) = timeout(
+        WAIT,
+        tokio_tungstenite::client_async(format!("ws://127.0.0.1:{port}{path}"), stream),
+    )
+    .await
+    .expect("websocket handshake")
+    .expect("websocket upgrade");
+    assert_eq!(response.status().as_u16(), 101);
+    socket
+}
+
+// page 冲突必须在升级被拒绝前给出可解析的 409，而不是无原因的 1006。
+#[tokio::test]
+async fn page_upgrade_conflict_is_a_structured_409() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+    let host = test_host(&broker);
+    let port = host.port();
+
+    let (status, body) = upgrade_http(port, "/devtools/page/page-a").await;
+    assert_eq!(status, 409);
+    assert_eq!(body["error"], "Another controller owns this page session");
+    assert_eq!(body["controller"], "alice");
+    assert_eq!(body["targetId"], "page-a");
+    assert_eq!(body["takeover"], "force=true");
+
+    let (status, body) = upgrade_http(port, "/devtools/page/page-a?role=viewer&force=true").await;
+    assert_eq!(status, 409);
+    assert_eq!(
+        body["error"],
+        "Viewer connections cannot take over a page session"
+    );
+
+    // 冲突请求不改变现有控制权。
+    send(&alice, &broker, r#"{"id":1,"method":"Page.enable"}"#).await;
+    let enable = next_request(&mut engine).await;
+    assert_eq!(enable["sessionId"], "session-a");
+    engine.reply(request_id(&enable), json!({}));
+    assert_eq!(next_frame(&mut alice).await["id"], 1);
+    host.stop().await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+// `?force=true` 通过公共入口完成接管，旧控制者收到 4001 关闭帧。
+#[tokio::test]
+async fn page_upgrade_force_takes_over_and_closes_the_old_controller() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut alice = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+    let host = test_host(&broker);
+    let port = host.port();
+    let bob = ws_upgrade(port, "/devtools/page/page-a?force=true&owner=bob").await;
+
+    let (code, reason) = next_close(&mut alice).await;
+    assert_eq!(code, 4001);
+    assert_eq!(reason, "Page session taken over by bob");
+    // 旧 attach 回复与新握手谁先到达取决于上游队列；两条命令都必须出现。
+    let mut detach = None;
+    let mut attach = None;
+    for _ in 0..2 {
+        let request = next_request(&mut engine).await;
+        match request["method"].as_str() {
+            Some("Target.detachFromTarget") => detach = Some(request),
+            Some("Target.attachToTarget") => attach = Some(request),
+            other => panic!("unexpected takeover request: {other:?}"),
+        }
+    }
+    let detach = detach.expect("old session detach");
+    assert_eq!(detach["params"]["sessionId"], "session-a");
+    let attach = attach.expect("new page attach");
+    assert_eq!(attach["params"]["targetId"], "page-a");
+    engine.reply(request_id(&detach), json!({}));
+    engine.reply(request_id(&attach), json!({"sessionId":"session-b"}));
+
+    // 接管后的连接通过公共入口写入自己的 session。
+    let (mut sink, mut source) = bob.split();
+    sink.send(Message::Text(r#"{"id":7,"method":"Page.enable"}"#.into()))
+        .await
+        .unwrap();
+    let enable = next_request(&mut engine).await;
+    assert_eq!(enable["sessionId"], "session-b");
+    engine.reply(request_id(&enable), json!({}));
+    let reply = timeout(WAIT, source.next())
+        .await
+        .expect("takeover reply")
+        .expect("takeover stream")
+        .expect("takeover message");
+    let reply: Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
+    assert_eq!(reply["id"], 7);
+    drop(sink);
+    drop(source);
+    host.stop().await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
 }
 
 #[tokio::test]

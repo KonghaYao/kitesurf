@@ -6,6 +6,7 @@
 
 import { nanoid } from "nanoid";
 import { dispatch, type DispatchCtx, type SessionContext } from "./dispatch.ts";
+import { CdpCommandError } from "./errors.ts";
 import { traceSpan } from "../tracing.ts";
 import { endLocalTraceSession, localTraceEventWrap } from "../tracing-local.ts";
 import {
@@ -740,9 +741,14 @@ export class ClientConnection {
         }
       } catch (err) {
         console.error("[cdp dispatch threw]", req.method, err);
+        const commandError = err instanceof CdpCommandError ? err : null;
         this.deliver({
           id: req.id,
-          error: { code: -32000, message: String(err) },
+          error: {
+            code: commandError?.code ?? -32000,
+            message: err instanceof Error ? err.message : String(err),
+            ...(commandError?.data ? { data: commandError.data } : {}),
+          },
           sessionId: req.sessionId,
         });
       }

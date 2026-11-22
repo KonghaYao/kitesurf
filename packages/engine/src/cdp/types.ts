@@ -53,7 +53,7 @@ export class RawJsonResult {
 
 export interface CdpError {
   id: number;
-  error: { code: number; message: string };
+  error: { code: number; message: string; data?: unknown };
   sessionId?: string;
 }
 
@@ -327,6 +327,11 @@ export interface TargetState {
   docCspReportOnly?: string | null;
   docCharset?: string | null;
   blankReady?: Promise<void> | null;
+  // Set from the commit of a navigation until its replacement PageScript is published. Commands
+  // that need a ready isolate wait on it instead of routing to the isolate the navigation retires.
+  navigationReady?: Promise<void> | null;
+  navigationRelease?: (() => void) | null;
+  navigationGateDepth?: number;
   frames: Map<string, FrameState>;
   pageScript: PageScriptStub | null;
   // The url the page isolate was sealed with. Page.navigate moves target.url to the next

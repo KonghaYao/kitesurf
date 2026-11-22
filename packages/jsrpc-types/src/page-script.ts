@@ -57,6 +57,13 @@ export interface NavigateOptions {
   connectionId?: string;
   mainFrameId?: string;
   cookieKey?: string;
+  // The engine's committed session history at commit time. Page script seeds `history` from it so
+  // `history.length` and back/forward agree with `Page.getNavigationHistory`; entries other than
+  // `index` belong to earlier documents and need a real navigation to visit.
+  history?: {
+    entries: Array<{ url: string; entryId?: number }>;
+    index: number;
+  };
   // The browser context's localStorage area for the document's origin (engine
   // state/local-storage.ts). Absent for an opaque origin or a child frame, whose localStorage
   // stays in the isolate for this document only.
@@ -391,6 +398,10 @@ export interface UpstreamEvents {
     navigationType: "fragment" | "historyApi" | "other";
     kind: string;
     previousUrl: string;
+    /** The engine navigation-history entry being visited, when the seed supplied its id. */
+    entryId?: number;
+    /** A history traversal revisits an entry; the engine moves its cursor instead of pushing. */
+    traversal?: boolean;
   };
   "kitesurf.paintDirty": Record<never, never>;
   // The wasm module trapped and is poisoned; `message` is the trap's.

@@ -534,3 +534,165 @@ test("a CJK face whose shaping file lands after the full-font upgrade registers 
     [["register_cjk_region_font", size("JP") + 1, "JP"]],
   );
 });
+
+// System faces live on the host and a cold scan can take seconds. The loader must expose their
+// progress without making navigation wait for it.
+const SYSTEM_FACE_ID = "0123456789abcdef0123456789abcdef";
+const SYSTEM_ENDPOINT = "http://kitesurf-fonts/system/";
+
+function loadSystemFontLoader() {
+  const calls = [];
+  const matchWaiters = [];
+  let hold = true;
+  const face = {
+    id: SYSTEM_FACE_ID,
+    family: "Test Sans",
+    weight: 400,
+    style: "normal",
+    width: 100,
+    covered: true,
+    missing: 0,
+    bytes: 4,
+  };
+  const matchReply = () => ({
+    ok: true,
+    status: 200,
+    async json() {
+      return { faces: [face], covered: true };
+    },
+  });
+  const fetch = (url) => {
+    if (url.startsWith(`${SYSTEM_ENDPOINT}match?`)) {
+      if (!hold) return Promise.resolve(matchReply());
+      return new Promise((resolve) => matchWaiters.push(resolve));
+    }
+    if (url.startsWith(`${SYSTEM_ENDPOINT}face?id=`)) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        async arrayBuffer() {
+          return new ArrayBuffer(4);
+        },
+      });
+    }
+    throw new Error(`unexpected system font request: ${url}`);
+  };
+  const record =
+    (name) =>
+    (...args) => {
+      calls.push([name, ...args]);
+      return true;
+    };
+  const modules = {
+    "./wasm-glue.js": dependency({
+      register_system_face: (bytes, family, mono) => {
+        calls.push(["register_system_face", family, mono, bytes.byteLength]);
+        return true;
+      },
+      map_system_generic: record("map_system_generic"),
+      append_system_fallback: record("append_system_fallback"),
+      append_system_emoji: record("append_system_emoji"),
+      finish_system_fonts: () => {
+        calls.push(["finish_system_fonts"]);
+        return true;
+      },
+      uaFontProfile: () => "",
+    }),
+    "./fetch-slots.ts": dependency({
+      FetchSlots: class {
+        acquire() {
+          return Promise.resolve();
+        }
+        release() {}
+      },
+    }),
+    "./native-scheduling.ts": dependency({ NativePromise: Promise }),
+    "./startup-probe.ts": dependency({
+      startupFontDefer: false,
+      startupFontProfile: "noto",
+      startupPixelFree: false,
+      startupSystemFonts: true,
+    }),
+    "./source-scan.ts": dependency({
+      CJK_REGION_SCANS: sourceScan.CJK_REGION_SCANS,
+      CJK_SCAN: sourceScan.CJK_SCAN,
+      EMOJI_BMP_SCAN: sourceScan.EMOJI_BMP_SCAN,
+      SCRIPT_RANGES: sourceScan.SCRIPT_RANGES,
+    }),
+  };
+  const require = (name) => {
+    if (!Object.hasOwn(modules, name)) throw new Error(`Unexpected import: ${name}`);
+    return modules[name];
+  };
+  const exports = {};
+  // A vm context only gets V8's built-ins; the system match URL needs the host URLSearchParams.
+  const context = createContext({
+    exports,
+    require,
+    fetch,
+    URLSearchParams,
+    console: { log() {}, warn() {} },
+  });
+  runInContext(fontLoaderCode, context);
+  return {
+    loader: exports,
+    calls,
+    matches: () => matchWaiters.length,
+    releaseMatches: () => {
+      hold = false;
+      for (const resolve of matchWaiters.splice(0)) resolve(matchReply());
+    },
+  };
+}
+
+test("system fonts load behind navigation instead of blocking it", async () => {
+  const page = loadSystemFontLoader();
+  let upgrades = 0;
+  page.loader.setFontUpgradeCallback(() => {
+    upgrades++;
+  });
+
+  // A null return is the navigation contract: the work is running, do not await it.
+  assert.equal(page.loader.startNavigationFonts(scan("<p>Hello</p>")), null);
+  const pending = page.loader.systemFontsPending();
+  assert.ok(pending, "the system font work has no completion promise to await later");
+  await drainFetchCallbacks();
+  assert.equal(page.matches(), 1, "the system core scan did not reach the host");
+  assert.equal(page.loader.startNavigationFonts(scan("<p>Hello</p>")), null);
+  await drainFetchCallbacks();
+  assert.equal(page.matches(), 1, "the second start restarted the host scan");
+
+  let settled = false;
+  pending.then(() => {
+    settled = true;
+  });
+  await drainFetchCallbacks();
+  assert.equal(settled, false);
+  assert.deepEqual(page.calls, [], "a face registered before the host answered");
+
+  page.releaseMatches();
+  await pending;
+  assert.equal(settled, true);
+  assert.equal(upgrades, 1, "the committed document was not relaid out");
+  assert.equal(
+    page.calls.filter(([name]) => name === "register_system_face").length,
+    3,
+    "sans, sans-italic and system-ui faces should register",
+  );
+  assert.ok(page.calls.some(([name]) => name === "finish_system_fonts"));
+});
+
+test("a blocking fonts read waits for the background system fonts", async () => {
+  const page = loadSystemFontLoader();
+  const blocking = page.loader.ensureFontsRegistered(scan("<p>Hello</p>"));
+  let settled = false;
+  blocking.then(() => {
+    settled = true;
+  });
+  await drainFetchCallbacks();
+  assert.equal(settled, false);
+  page.releaseMatches();
+  await blocking;
+  assert.equal(settled, true);
+  assert.ok(page.calls.some(([name]) => name === "register_system_face"));
+});

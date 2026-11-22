@@ -311,6 +311,8 @@ export class PageSession {
   async ready(): Promise<PageScriptStub | null> {
     if (this.#pinned) return this.live();
     for (;;) {
+      const navigation = this.#target.navigationReady;
+      if (navigation) await navigation;
       const gate = this.#target.blankReady;
       if (gate) await gate;
       const stub = this.ensure();
@@ -364,6 +366,8 @@ export class PageSession {
   }
 
   async #settleBlank(): Promise<void> {
+    const navigation = this.#target.navigationReady;
+    if (navigation) await navigation;
     const blank = this.#target.blankReady;
     if (blank) await blank;
   }

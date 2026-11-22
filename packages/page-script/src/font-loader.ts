@@ -1010,9 +1010,43 @@ async function ensureSystemFonts(
   } catch {}
 }
 
+let systemFontsStarted: Promise<void> | null = null;
+
+// Host system faces are large and a scan can take seconds. Navigation must not wait for them:
+// the document commits with no faces, and the upgrade callback relayouts it once they land.
+// Render paths that need final metrics await `systemFontsPending`.
+export function startSystemFonts(scan?: SourceFontScan): Promise<void> {
+  if (systemFontsStarted) return systemFontsStarted;
+  systemFontsStarted = (async () => {
+    try {
+      await ensureSystemFonts(computeFontWants(scan), scan);
+    } catch (error) {
+      console.warn("[kitesurf-fonts] system fonts unavailable:", String(error));
+    } finally {
+      onUpgraded?.();
+    }
+  })();
+  return systemFontsStarted;
+}
+
+export function systemFontsPending(): Promise<void> | null {
+  return systemFontsStarted;
+}
+
+// The font work a navigation starts. Bundled faces are small and must exist before the first
+// DomHandle or text renders as tofu, so that path returns a promise to await. System faces load
+// behind the commit; a null return means the work is running and navigation must not wait.
+export function startNavigationFonts(scan?: SourceFontScan): Promise<void> | null {
+  if (startupSystemFonts) {
+    void startSystemFonts(scan);
+    return null;
+  }
+  return ensureFontsRegistered(scan);
+}
+
 export async function ensureFontsRegistered(scan?: SourceFontScan): Promise<void> {
   if (startupSystemFonts) {
-    await ensureSystemFonts(computeFontWants(scan), scan);
+    await startSystemFonts(scan);
     return;
   }
   decideFontMode(scan);

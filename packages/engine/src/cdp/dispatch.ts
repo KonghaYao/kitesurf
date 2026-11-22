@@ -13,6 +13,7 @@ import type {
   TargetState,
 } from "./types.ts";
 import type { RequestBlocker } from "../request-blocker.ts";
+import { CdpCommandError } from "./errors.ts";
 import { CDP_COMMAND_UNHANDLED } from "./types.ts";
 import {
   handleTarget,
@@ -245,9 +246,14 @@ export async function dispatch(ctx: DispatchCtx, req: CdpRequest): Promise<CdpRe
   } catch (err) {
     ctx.browser.networkEvents.drain();
     const message = err instanceof Error ? err.message : String(err);
+    const commandError = err instanceof CdpCommandError ? err : null;
     return {
       id: req.id,
-      error: { code: -32000, message },
+      error: {
+        code: commandError?.code ?? -32000,
+        message,
+        ...(commandError?.data ? { data: commandError.data } : {}),
+      },
       sessionId: req.sessionId,
     };
   }
