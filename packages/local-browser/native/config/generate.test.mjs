@@ -220,7 +220,8 @@ test("generate writes modules, manifests and three configs, replacing stale outp
     assert.match(config, /\(name = "LOCAL_FONTS", service = "fonts"\)/, name);
     assert.match(config, /\(name = "fonts", external = \(http = \(\)\)\)/, name);
   }
-  assert.equal(generate({ dist, assets, out, releaseVersion: "0.5.3" }).version, "0.5.3");
+  // 版本取自 Cargo 环境，必须覆盖 manifest 里的值；用一个不同的值证明覆盖生效。
+  assert.equal(generate({ dist, assets, out, releaseVersion: "0.5.4" }).version, "0.5.4");
   for (const name of [
     "modules.json",
     "modules-gc.capnp",
@@ -230,7 +231,7 @@ test("generate writes modules, manifests and three configs, replacing stale outp
     assert.ok(!existsSync(join(out, name)), `${name} is excluded from release`);
   }
   for (const name of ["local-public.capnp", "local-private.capnp"]) {
-    assert.match(readFileSync(join(out, name), "utf8"), /KITESURF_VERSION", text = "0\.5\.2"/);
+    assert.match(readFileSync(join(out, name), "utf8"), /KITESURF_VERSION", text = "0\.5\.4"/);
   }
 });
 
