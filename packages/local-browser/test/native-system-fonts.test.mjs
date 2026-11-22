@@ -486,6 +486,12 @@ test("each target keeps its own system font registration", { timeout: 180_000 },
   await until(async () => hasDiagnostic(cdp, first.targetId, "system core"), "first core");
   await until(async () => hasDiagnostic(cdp, second.targetId, "system core"), "second core");
   const initialFirst = new Set(await faceFamiliesFor(cdp, first.targetId));
+  // System fonts load behind the commit, so the serif role can register after the core
+  // diagnostic; wait for this target's own family before comparing the two targets.
+  await until(async () => {
+    const current = await faceFamiliesFor(cdp, second.targetId);
+    return current.some((family) => !initialFirst.has(family));
+  }, "the serif target's system family");
   const initialSecond = new Set(await faceFamiliesFor(cdp, second.targetId));
   const secondOnly = [...initialSecond].filter((family) => !initialFirst.has(family));
   assert.ok(
