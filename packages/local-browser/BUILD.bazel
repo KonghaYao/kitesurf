@@ -57,6 +57,26 @@ node_test(
     ],
 )
 
+# 发布内存验收：归档的可执行文件打开 4 个页面、96 次导航，PSS 来自 /proc，只在 linux-x64 判定。
+node_test(
+    name = "workerd_memory_test",
+    size = "large",
+    timeout = "long",
+    tags = ["manual"],
+    args = ["test/workerd-memory.test.mjs"],
+    data = [
+        ":node_modules/ws",
+        "//packages/local-browser/native:release_config",
+        "test/helpers.mjs",
+        "test/host-adapter.mjs",
+        "test/workerd-memory.test.mjs",
+    ],
+    env = {
+        "KITESURF_MEMORY_LIMIT_MIB": "800",
+        "KITESURF_RELEASE_CONFIG": "$(rootpath //packages/local-browser/native:release_config)",
+    },
+)
+
 node_test(
     name = "browser_test",
     size = "large",

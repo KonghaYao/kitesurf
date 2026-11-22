@@ -20,6 +20,10 @@ import { pathToFileURL } from "node:url";
 
 const MODULE_NAME = /^[A-Za-z0-9._/-]+$/;
 const VERSION = "0.5.3";
+// workerd 为每个新 isolate 上报内存压力，V8 因此刷新全进程的 Liftoff 代码，导航会重新编译
+// 引擎的 wasm。--no-flush-liftoff-code 保留它：4 个页面 96 次导航的 workerd 内存从
+// ~1107 MiB 降到 ~545 MiB。--expose-gc 让引擎回收退役页面 isolate。
+export const V8_FLAGS = ["--expose-gc", "--no-flush-liftoff-code"];
 const GC_WRAPPER = "__ks_gc_wrapper.js";
 const IGNORED = new Set(["engine-mf.json"]);
 const GC_WRAPPER_SOURCE = `import worker from "./index.js";
@@ -186,7 +190,7 @@ export function emitConfig(options) {
     `    (name = "internet", network = (allow = ${network}, tlsOptions = (trustBrowserCas = true))),`,
     "  ],",
     '  sockets = [(name = "engine", http = (), service = "main")],',
-    '  v8Flags = ["--expose-gc"],',
+    `  v8Flags = [${V8_FLAGS.map(capnpString).join(", ")}],`,
     ");",
     "",
   ].join("\n");

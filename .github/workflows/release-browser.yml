@@ -88,6 +88,14 @@ jobs:
           (cd "$unpacked" && shasum -a 256 -c SHA256SUMS)
           bazel test -c opt //packages/local-browser:binary_test \
             --test_env=KITESURF_TEST_BINARY="$unpacked/kitesurf" --test_output=errors
+      # The archived binary replays 4 pages and 96 navigations. The test prints the startup,
+      # post-navigation and after-close PSS and fails above 800 MiB on linux-x64.
+      - name: Check workerd memory on the archived executable
+        if: matrix.platform == 'linux-x64'
+        run: |
+          bazel test -c opt //packages/local-browser:workerd_memory_test \
+            --test_env=KITESURF_TEST_BINARY="$RUNNER_TEMP/browser-unpacked/kitesurf" \
+            --test_output=all
       - name: Verify system font and author font rendering
         env:
           KITESURF_REQUIRE_CJK: ${{ runner.os == 'Linux' && '1' || '0' }}
