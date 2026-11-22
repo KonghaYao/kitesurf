@@ -149,6 +149,42 @@ bazel test -c opt //packages/local-browser:native_soak_test --test_timeout=4200 
 
 Use `//packages/local-browser:soak_test` with the same timeout to run the Node host baseline.
 
+The release workflow also runs the memory acceptance on linux-x64 against the executable
+extracted from the archive; see [Memory](#memory).
+
+## Memory
+
+The generated workerd config passes `--expose-gc` and `--no-flush-liftoff-code` to the
+embedded workerd. workerd signals memory pressure for every new page isolate, so without the
+second flag V8 drops the process-wide Liftoff code and recompiles Kitesurf's wasm on each
+navigation. The v0.5.3 benchmark measured workerd on Linux x64: 4 live pages after 96
+navigations took 1,107 MiB by default and 545 MiB with the flag. Eight live pages measured
+about 457 MiB either way; eight pages typed in and screenshotted measured 568 and 585 MiB.
+After closing every page and waiting 30 seconds the process held 1,082 and 510 MiB, and
+reopening eight pages reached 1,234 MiB and 637 MiB (default first). The flag is part of the
+release, not a benchmark-only setting.
+
+`//packages/local-browser:workerd_memory_test` repeats the 4-page, 96-navigation case against
+the archived release executable on the linux-x64 release runner. It sums the PSS of the native
+host and its workerd child from `/proc/<pid>/smaps_rollup`, asserts the resolved workerd config
+contains both flags, and fails above 800 MiB. The budget sits above the 545 MiB flagged run and
+well below the 1,107 MiB default run. The test prints the startup, post-navigation and
+after-close PSS; the last one is taken 30 seconds after closing every page, like the benchmark.
+It skips on macOS and on non-x64 hosts, because that accounting is Linux-only and the budget is
+calibrated for the linux-x64 runner.
+
+Run it against a package built in this tree:
+
+```sh
+bazel run -c opt //packages/local-browser:package
+bazel test -c opt //packages/local-browser:workerd_memory_test \
+  --test_env=KITESURF_TEST_BINARY="$PWD/dist/local-browser/kitesurf"
+```
+
+This acceptance covers the Linux release binary with one host and one agent. It does not
+measure the macOS host or concurrent agents, and it reports but does not attribute the memory
+still held after every page closes.
+
 ## System fonts
 
 The browser needs a usable sans-serif font to start. On Debian and Ubuntu,

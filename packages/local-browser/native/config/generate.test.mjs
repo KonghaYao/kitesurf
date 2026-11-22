@@ -16,6 +16,7 @@ import {
   emitConfig,
   emitModules,
   generate,
+  V8_FLAGS,
 } from "./generate.mjs";
 
 function temp(t) {
@@ -146,7 +147,8 @@ test("emitConfig selects the network scope, system roots and explicit bindings",
   assert.ok(publicConfig.includes('(name = "FONT_ASSETS", service = "assets")'));
   assert.ok(publicConfig.includes('(name = "LOCAL_FONTS", service = "fonts")'));
   assert.ok(publicConfig.includes('(name = "fonts", external = (http = ()))'));
-  assert.ok(publicConfig.includes('v8Flags = ["--expose-gc"]'));
+  assert.deepEqual(V8_FLAGS, ["--expose-gc", "--no-flush-liftoff-code"]);
+  assert.ok(publicConfig.includes('v8Flags = ["--expose-gc", "--no-flush-liftoff-code"]'));
   const privateConfig = emitConfig({
     ...options,
     modulesConst: "modules-gc.capnp",
@@ -159,6 +161,7 @@ test("emitConfig selects the network scope, system roots and explicit bindings",
   );
   assert.ok(privateConfig.includes('(name = "KITESURF_ALLOW_PRIVATE_NETWORK", text = "1")'));
   assert.ok(privateConfig.includes('using M = import "modules-gc.capnp";'));
+  assert.ok(privateConfig.includes('v8Flags = ["--expose-gc", "--no-flush-liftoff-code"]'));
 });
 
 test("generate writes modules, manifests and three configs, replacing stale output", (t) => {
@@ -216,6 +219,11 @@ test("generate writes modules, manifests and three configs, replacing stale outp
   for (const name of ["local-public.capnp", "local-private.capnp", "local-gc.capnp"]) {
     const config = readFileSync(join(out, name), "utf8");
     assert.match(config, /KITESURF_SYSTEM_FONTS", text = "1"/, `${name} selects system fonts`);
+    assert.match(
+      config,
+      /v8Flags = \["--expose-gc", "--no-flush-liftoff-code"\]/,
+      `${name} keeps Liftoff code`,
+    );
     assert.match(config, /tlsOptions = \(trustBrowserCas = true\)/, `${name} trusts system roots`);
     assert.match(config, /\(name = "LOCAL_FONTS", service = "fonts"\)/, name);
     assert.match(config, /\(name = "fonts", external = \(http = \(\)\)\)/, name);
@@ -231,7 +239,9 @@ test("generate writes modules, manifests and three configs, replacing stale outp
     assert.ok(!existsSync(join(out, name)), `${name} is excluded from release`);
   }
   for (const name of ["local-public.capnp", "local-private.capnp"]) {
-    assert.match(readFileSync(join(out, name), "utf8"), /KITESURF_VERSION", text = "0\.5\.4"/);
+    const config = readFileSync(join(out, name), "utf8");
+    assert.match(config, /KITESURF_VERSION", text = "0\.5\.4"/);
+    assert.match(config, /--no-flush-liftoff-code/, `${name} keeps the release memory flag`);
   }
 });
 
