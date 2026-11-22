@@ -509,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "kitesurf-local-host"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "bytes",
  "futures-util",

@@ -1,4 +1,4 @@
-# Kitesurf local browser 0.5.3
+# Kitesurf local browser 0.5.4
 
 A local Kitesurf browser for agents, with one SQLite profile and one live browser session.
 The native Rust executable embeds workerd, engine modules and browser assets. It extracts the

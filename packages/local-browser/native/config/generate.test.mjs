@@ -173,7 +173,7 @@ test("generate writes modules, manifests and three configs, replacing stale outp
     "engine-mf.json": JSON.stringify({
       compatibilityDate: "2026-09-11",
       compatibilityFlags: ["nodejs_compat"],
-      bindings: { KITESURF_ENV: "local", KITESURF_VERSION: "0.5.3" },
+      bindings: { KITESURF_ENV: "local", KITESURF_VERSION: "0.5.4" },
       workerLoaders: { LOADER: {} },
       assets: { binding: "FONT_ASSETS" },
     }),
@@ -185,7 +185,7 @@ test("generate writes modules, manifests and three configs, replacing stale outp
   mkdirSync(out, { recursive: true });
   writeFileSync(join(out, "stale.txt"), "stale");
   const result = generate({ dist, assets, out });
-  assert.deepEqual(result, { modules: 2, assets: 2, version: "0.5.3" });
+  assert.deepEqual(result, { modules: 2, assets: 2, version: "0.5.4" });
   assert.ok(!existsSync(join(out, "stale.txt")));
   const manifest = JSON.parse(readFileSync(join(out, "modules.json"), "utf8"));
   assert.equal(manifest.entry, "index.js");
