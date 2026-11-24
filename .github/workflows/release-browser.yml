@@ -108,6 +108,10 @@ jobs:
         run: |
           pnpm run check
           bazel test //packages/local-browser:engine_loss_test --test_output=errors
+          # Regression gate: GC throttle/tail sweeps and the embedded bundle page discard.
+          bazel test --test_output=errors \
+            //packages/local-browser:engine_smoke_test \
+            //packages/local-browser/native:bundle_test
       # The legacy Node host is the v0.5.0 compatibility reference. The upstream engine merge
       # changed its storage/profile contract; the native host's engine_loss and font tests cover
       # the shipped browser. Keep the failure visible without losing the release artifact.
