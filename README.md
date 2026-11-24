@@ -31,19 +31,19 @@ reconnect behavior, control ownership, and build details.
 
 ## Install a release archive
 
-The current release is 0.5.4, with native archives for Linux x64, Linux arm64,
+The current release is 0.5.5, with native archives for Linux x64, Linux arm64,
 and macOS arm64. Install it with [mise](https://mise.jdx.dev/):
 
 ```bash
-mise use -g github:KonghaYao/kitesurf@0.5.4
+mise use -g github:KonghaYao/kitesurf@0.5.5
 kitesurf serve
 ```
 
 To install manually on macOS, download the archive and its checksum:
 
 ```bash
-archive=kitesurf-0.5.4-darwin-arm64.tar.gz
-release=https://github.com/KonghaYao/kitesurf/releases/download/v0.5.4
+archive=kitesurf-0.5.5-darwin-arm64.tar.gz
+release=https://github.com/KonghaYao/kitesurf/releases/download/v0.5.5
 curl -fLO "$release/$archive"
 curl -fLO "$release/$archive.sha256"
 shasum -a 256 -c "$archive.sha256"
