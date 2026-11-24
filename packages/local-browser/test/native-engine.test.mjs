@@ -375,7 +375,7 @@ test(
   },
 );
 
-function gcFixtureConfig(t, retirementTimes) {
+function gcFixtureConfig(t) {
   const directory = mkdtempSync(join(tmpdir(), "ks-native-gc-"));
   const modules = join(directory, "modules");
   mkdirSync(modules);
@@ -386,35 +386,22 @@ function gcFixtureConfig(t, retirementTimes) {
   for (const file of ["local-gc.capnp", "modules-gc.capnp"]) {
     copyFileSync(config(file), join(directory, file));
   }
-  // The engine reads gc and then the clock synchronously. Only that clock read is fixed.
-  // The wrapper calls the workerd V8 gc and reports the result after it returns.
+  // Log every real-clock gc call; retirements and sweeps share this one path. A call without the
+  // global receiver throws, which the engine's runGc must swallow.
   writeFileSync(
     join(modules, "__ks_gc_wrapper.js"),
     `import worker from "./index.js";
 export * from "./index.js";
 const get = Reflect.get;
 const now = Date.now;
-const retirementTimes = ${JSON.stringify([null, null, ...retirementTimes])};
-let attempt = 0;
 Reflect.get = function (target, key, ...args) {
   const gc = get(target, key, ...args);
   if (target !== globalThis || key !== "gc" || typeof gc !== "function") return gc;
-  const fixedAt = retirementTimes[attempt++];
-  if (fixedAt != null) {
-    const fixtureNow = () => {
-      Date.now = now;
-      return fixedAt;
-    };
-    Date.now = fixtureNow;
-    queueMicrotask(() => {
-      if (Date.now === fixtureNow) Date.now = now;
-    });
-  }
   return function (...args) {
+    if (this !== globalThis) throw new Error("gc lost its global receiver");
     const start = now();
-    const at = fixedAt ?? start;
     const result = Reflect.apply(gc, this, args);
-    console.log("[ks-gc] " + JSON.stringify({ at, done: at + Math.max(0, now() - start) }));
+    console.log("[ks-gc] " + JSON.stringify({ at: start, done: start + Math.max(0, now() - start) }));
     return result;
   };
 };
@@ -426,12 +413,10 @@ export default worker;
 }
 
 test(
-  "retired isolates are collected through the real gc, at most once a second",
+  "retirements collect at most once a second and trailing sweeps continue",
   { timeout: 180_000 },
   async (t) => {
-    const start = Date.now() + 24 * 60 * 60 * 1_000;
-    const retirementTimes = [start, start + 999, start + 1_000];
-    const host = await hostFor(t, { capnp: gcFixtureConfig(t, retirementTimes) });
+    const host = await hostFor(t, { capnp: gcFixtureConfig(t) });
     const site = await fixture(t);
     const cdp = await connect(host.port);
     t.after(() => cdp.disconnect());
@@ -439,37 +424,63 @@ test(
     assert.equal(await evaluate(cdp, page.sessionId, "typeof globalThis.gc"), "undefined");
     const collected = () => events(host, "gc");
     assert.equal(collected().length, 0);
-    await navigate(cdp, page.sessionId, `${site.url}/b`);
-    const first = await waitFor(() => collected()[0], "the first real-clock collection");
-    await waitFor(() => Date.now() >= first.at + 1_000, "the next real-clock window");
-    await navigate(cdp, page.sessionId, `${site.url}/c`);
-    const second = await waitFor(() => collected()[1], "the next real-clock collection");
-    assert.ok(second.at - first.at >= 1_000, `real gc gap ${second.at - first.at}`);
 
+    // Two closes in one throttle window: only the first retirement collects. The next two
+    // collections are the 150 ms and 350 ms sweeps, never the second retirement.
     const targets = [];
-    for (const at of retirementTimes) {
+    for (let index = 0; index < 2; index++) {
       const target = await open(cdp);
-      await setContent(cdp, target.sessionId, `<p>${at}</p>`);
+      await setContent(cdp, target.sessionId, `<p>${index}</p>`);
       targets.push(target.targetId);
     }
-    assert.deepEqual(collected(), [first, second]);
+    assert.equal(collected().length, 0, "opening targets does not retire an isolate");
     const before = await cdp.send("Kitesurf.getMemoryStats");
-    assert.ok(before.isolatesKilled >= 2, "navigation retires its spare isolates");
-    for (const targetId of targets) {
-      assert.deepEqual(await cdp.send("Target.closeTarget", { targetId }), { success: true });
-    }
-    const result = await waitFor(() => {
-      const observed = collected();
-      return observed.length >= 4 ? observed : null;
-    }, "collections at the start and end of the throttle window");
-    assert.deepEqual(
-      result.map(({ at }) => at),
-      [first.at, second.at, retirementTimes[0], retirementTimes[2]],
+    const closeStarted = Date.now();
+    const closes = await Promise.all(
+      targets.map((targetId) => cdp.send("Target.closeTarget", { targetId })),
     );
-    for (const event of result) assert.ok(event.done >= event.at);
+    for (const closed of closes) assert.deepEqual(closed, { success: true });
     const after = await cdp.send("Kitesurf.getMemoryStats");
     assert.equal(after.isolatesKilled - before.isolatesKilled, targets.length);
-    assert.deepEqual(collected(), result);
+
+    await waitFor(() => collected().length >= 3, "one retirement and two sweeps", 5_000);
+    await delay(300);
+    const burst = collected();
+    assert.equal(burst.length, 3, "only one retirement collects inside the throttle window");
+    assert.ok(burst[0].at >= closeStarted, "the close starts the first collection");
+    assert.ok(burst[1].at - burst[0].at >= 100, `first sweep gap ${burst[1].at - burst[0].at}`);
+    assert.ok(burst[2].at - burst[0].at >= 250, `second sweep gap ${burst[2].at - burst[0].at}`);
+    for (const event of burst) assert.ok(event.done >= event.at);
+
+    // The 5 s and 15.2 s tails finish; no retirement or navigation runs in this window.
+    await delay(16_000);
+    const quiet = collected().length;
+    await delay(500);
+    assert.equal(collected().length, quiet, "trailing sweeps stop after the last pass");
+
+    // A navigation after the window collects again and schedules its own first two sweeps.
+    const lastAt = collected().at(-1).at;
+    await delay(Math.max(0, lastAt + 1_100 - Date.now()));
+    const beforeNavigation = collected().length;
+    await navigate(cdp, page.sessionId, `${site.url}/b`);
+    const retirement = await waitFor(
+      () => collected()[beforeNavigation],
+      "a navigation retirement collection",
+    );
+    assert.ok(retirement.at - lastAt >= 1_000, `navigation gap ${retirement.at - lastAt}`);
+    await waitFor(
+      () => collected().length >= beforeNavigation + 3,
+      "trailing sweeps after a navigation",
+      5_000,
+    );
+    await delay(300);
+    const followed = collected();
+    assert.equal(followed.length, beforeNavigation + 3, "navigation kept the early sweep count");
+    assert.ok(followed[beforeNavigation + 1].at - retirement.at >= 100);
+    for (const event of followed.slice(beforeNavigation)) assert.ok(event.done >= event.at);
+
+    const stats = await cdp.send("Kitesurf.getMemoryStats");
+    assert.ok(stats.isolatesKilled >= 3, "retirements come from the closed targets and navigation");
   },
 );
 

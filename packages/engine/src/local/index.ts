@@ -3,6 +3,7 @@
 // https://opensource.org/licenses/Apache-2.0
 
 import { KitesurfEngine } from "../index.ts";
+import { sweepRetiredWorkers } from "../eval/retired-worker-gc.ts";
 import type { EngineHost } from "../host.ts";
 import type { ProfileSnapshot } from "../state/profile.ts";
 export { SandboxOutbound, DeniedOutbound, PageScriptTail, SpanSink } from "../index.ts";
@@ -10,6 +11,7 @@ export { SandboxOutbound, DeniedOutbound, PageScriptTail, SpanSink } from "../in
 export default class LocalBrowserEngine extends KitesurfEngine {
   protected override host(): EngineHost {
     return {
+      onSessionTick: sweepRetiredWorkers,
       connectionOptions: () => ({ idleTimeoutMs: 0, maxSessionMs: 0 }),
       openProfile: async (owner, env) => {
         const bridge = (env as Env & { LOCAL_PROFILE: Fetcher }).LOCAL_PROFILE;

@@ -34,6 +34,8 @@ export interface ConnectionOptions {
 }
 
 export interface EngineHost {
+  /** Optional maintenance on the live session's existing background tick. */
+  onSessionTick?(): void;
   /** Loads a profile before the WebSocket can accept any browser commands. */
   openProfile?(connectionId: string, env: Env): Promise<ProfilePersistence>;
   /** Handles unmatched routes; return `null` to keep the engine's 404 response. */

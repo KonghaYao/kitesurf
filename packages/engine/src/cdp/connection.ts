@@ -250,6 +250,7 @@ export class BrowserSession {
   #client: ClientConnection | null = null;
   readonly #openedAt: number;
   readonly #drainTimer: ReturnType<typeof setInterval>;
+  readonly #onSessionTick: EngineHost["onSessionTick"];
   #deadlineFired = false;
   // The client idled out: the drain stops while the socket closes.
   #idleClosed = false;
@@ -380,6 +381,7 @@ export class BrowserSession {
     this.#openedAt = Date.now();
     this.rejoinLocalTrace = localTraceEventWrap(env);
     this.arrivalClock = makeWallClock(this.#dispatchEnv);
+    this.#onSessionTick = opts.host?.onSessionTick;
     this.#drainTimer = setInterval(() => this.#tick(), BACKGROUND_EVENT_DRAIN_INTERVAL_MS);
   }
 
@@ -447,6 +449,7 @@ export class BrowserSession {
       this.#idleClosed = true;
       return;
     }
+    this.#onSessionTick?.();
     const ctx = this.#client?.ctx;
     const browser = this.browser;
     if (!ctx || browser.targets.size === 0) return;

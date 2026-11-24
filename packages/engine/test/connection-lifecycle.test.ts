@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { handleWebSocket } from "../src/cdp/connection.ts";
 import { getTracker } from "../src/cdp/network-events-registry.ts";
 import type { DispatchCtx } from "../src/cdp/dispatch.ts";
+import type { CdpRequest, CdpResponse } from "../src/cdp/types.ts";
 import type { EngineHost } from "../src/host.ts";
 import { SESSION_ID_HEADER, type TelemetryEvent } from "../src/observability.ts";
 
@@ -122,6 +123,52 @@ describe("handleWebSocket", () => {
     expect(server.closes[0]?.reason).toMatch(/idle for 1000 ms/);
     await vi.advanceTimersByTimeAsync(10_000);
     expect(server.closes).toHaveLength(1);
+  });
+
+  it("ticks the host hook with no targets and stops it at dispose", async () => {
+    vi.useFakeTimers();
+    const server = fakeServer();
+    let context: DispatchCtx | undefined;
+    let dispatch: ((request: CdpRequest) => Promise<CdpResponse>) | undefined;
+    const ticks: number[] = [];
+    const host: EngineHost = {
+      connectionOptions: () => ({ idleTimeoutMs: 0, maxSessionMs: 0 }),
+      onSessionTick: () => ticks.push(Date.now()),
+    };
+    await handleWebSocket(
+      new Request("https://x/devtools/browser"),
+      {} as Env,
+      createExecutionContext(),
+      (dctx) => {
+        context = dctx;
+      },
+      {
+        host,
+        onDispatch: (send) => {
+          dispatch = send;
+        },
+      },
+    );
+    await vi.advanceTimersByTimeAsync(400);
+    expect(ticks.length).toBeGreaterThanOrEqual(2);
+    expect(context?.browser.targets.size).toBe(2);
+    const targetId = createdTargetIds(server)[0] ?? "";
+    expect(targetId).not.toBe("");
+    await dispatch?.({ id: 9, method: "Target.closeTarget", params: { targetId } });
+    expect(context?.browser.targets.size).toBe(1);
+    const pageTargets = [...(context?.browser.targets.values() ?? [])].filter(
+      (target) => target.type === "page",
+    );
+    expect(pageTargets).toHaveLength(0);
+    const emptyTick = ticks.length;
+    await vi.advanceTimersByTimeAsync(200);
+    expect(ticks.length).toBeGreaterThan(emptyTick);
+
+    server.dispatchEvent(Object.assign(new Event("close"), { code: 1000, wasClean: true }));
+    await vi.advanceTimersByTimeAsync(0);
+    const disposedTick = ticks.length;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(ticks.length).toBe(disposedTick);
   });
 
   it("fails before it accepts a socket when the connectionOptions hook throws", async () => {

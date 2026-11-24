@@ -4,7 +4,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { collectRetiredWorkers } from "../src/eval/retired-worker-gc.ts";
+import { collectRetiredWorkers, sweepRetiredWorkers } from "../src/eval/retired-worker-gc.ts";
 
 // The throttle is module state, so each test starts a minute after the previous one.
 let epoch = Date.UTC(2026, 0, 1);
@@ -32,10 +32,14 @@ describe("collectRetiredWorkers", () => {
   });
 
   it("calls gc() once when it is available", () => {
-    const gc = vi.fn();
+    const contexts: unknown[] = [];
+    const gc = vi.fn(function (this: unknown) {
+      contexts.push(this);
+    });
     vi.stubGlobal("gc", gc);
     collectRetiredWorkers();
     expect(gc).toHaveBeenCalledTimes(1);
+    expect(contexts).toEqual([globalThis]);
   });
 
   it("collects at most once a second", () => {
@@ -62,6 +66,51 @@ describe("collectRetiredWorkers", () => {
     expect(gc, "the throttle restarts from the stepped-back time").toHaveBeenCalledTimes(2);
   });
 
+  it("collects the last retirement after a burst and stops after the quiet period", () => {
+    const gc = vi.fn();
+    vi.stubGlobal("gc", gc);
+    collectRetiredWorkers();
+    vi.setSystemTime(epoch + 100);
+    collectRetiredWorkers();
+    for (const elapsed of [100, 149]) {
+      vi.setSystemTime(epoch + 100 + elapsed);
+      sweepRetiredWorkers();
+    }
+    expect(gc).toHaveBeenCalledTimes(1);
+    for (const elapsed of [200, 400, 5_000, 5_200, 15_000, 15_200, 60_000]) {
+      vi.setSystemTime(epoch + 100 + elapsed);
+      sweepRetiredWorkers();
+      sweepRetiredWorkers();
+    }
+    expect(gc).toHaveBeenCalledTimes(7);
+  });
+
+  it("coalesces overdue passes and handles a clock step without retaining new work", () => {
+    const gc = vi.fn();
+    vi.stubGlobal("gc", gc);
+    collectRetiredWorkers();
+    vi.setSystemTime(epoch - 10_000);
+    sweepRetiredWorkers();
+    vi.setSystemTime(epoch - 9_800);
+    sweepRetiredWorkers();
+    vi.setSystemTime(epoch + 20_000);
+    sweepRetiredWorkers();
+    sweepRetiredWorkers();
+    expect(gc).toHaveBeenCalledTimes(3);
+  });
+
+  it("calls gc with the global receiver for retirements and sweeps", () => {
+    const contexts: unknown[] = [];
+    const gc = vi.fn(function (this: unknown) {
+      contexts.push(this);
+    });
+    vi.stubGlobal("gc", gc);
+    collectRetiredWorkers();
+    vi.setSystemTime(epoch + 200);
+    sweepRetiredWorkers();
+    expect(contexts).toEqual([globalThis, globalThis]);
+  });
+
   it("swallows a throwing gc()", () => {
     const gc = vi.fn(() => {
       throw new Error("gc failed");
@@ -69,5 +118,8 @@ describe("collectRetiredWorkers", () => {
     vi.stubGlobal("gc", gc);
     expect(() => collectRetiredWorkers()).not.toThrow();
     expect(gc).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(epoch + 200);
+    expect(() => sweepRetiredWorkers()).not.toThrow();
+    expect(gc).toHaveBeenCalledTimes(2);
   });
 });
