@@ -23,7 +23,42 @@ const MAX_PATH_BYTES: usize = 1024;
 #[cfg(feature = "embedded-runtime")]
 pub(super) fn unpack(run_dir: &Path, allow_private_network: bool) -> HostResult<RuntimePaths> {
     let bundle = include_bytes!(env!("KITESURF_RUNTIME_BUNDLE"));
-    unpack_payload(run_dir, bundle, allow_private_network)
+    let paths = unpack_payload(run_dir, bundle, allow_private_network)?;
+    discard_verified_bundle_pages(bundle);
+    Ok(paths)
+}
+
+// Only complete pages of the immutable, executable-backed payload may be discarded. Both
+// boundary pages can contain other linker data. A platform declining the hint is harmless.
+#[cfg(feature = "embedded-runtime")]
+fn discard_verified_bundle_pages(bundle: &'static [u8]) {
+    // SAFETY: sysconf reads a process constant and owns no resources.
+    let Ok(page_size) = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }) else {
+        return;
+    };
+    let Some((offset, len)) = complete_pages(bundle.as_ptr() as usize, bundle.len(), page_size)
+    else {
+        return;
+    };
+    // SAFETY: this aligned range lies entirely in an immutable file-backed static. Unpacking
+    // and checksum verification have finished. The original bytes can be faulted back from disk.
+    unsafe {
+        libc::madvise(
+            bundle.as_ptr().add(offset).cast_mut().cast(),
+            len,
+            libc::MADV_DONTNEED,
+        );
+    }
+}
+
+#[cfg(any(feature = "embedded-runtime", test))]
+fn complete_pages(address: usize, len: usize, page_size: usize) -> Option<(usize, usize)> {
+    if page_size == 0 {
+        return None;
+    }
+    let offset = (page_size - address % page_size) % page_size;
+    let full = len.checked_sub(offset)? / page_size * page_size;
+    (full != 0).then_some((offset, full))
 }
 
 fn unpack_payload(
@@ -176,6 +211,20 @@ mod tests {
             bytes.extend_from_slice(contents);
         }
         bytes
+    }
+
+    #[test]
+    fn discards_only_pages_wholly_owned_by_the_payload() {
+        assert_eq!(complete_pages(4096, 8192, 4096), Some((0, 8192)));
+        assert_eq!(complete_pages(4097, 8192, 4096), Some((4095, 4096)));
+        assert_eq!(complete_pages(4097, 8190, 4096), None);
+        assert_eq!(complete_pages(4097, 0, 4096), None);
+        assert_eq!(complete_pages(4096, 8192, 0), None);
+        assert_eq!(complete_pages(16_384, 32_768, 16_384), Some((0, 32_768)));
+        assert_eq!(
+            complete_pages(16_385, 32_768, 16_384),
+            Some((16_383, 16_384))
+        );
     }
 
     #[test]
