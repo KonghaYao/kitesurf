@@ -3,15 +3,15 @@
 # Kitesurf
 
 Kitesurf is an experimental browser engine that runs on Cloudflare Workers. It
-parses HTML, applies CSS, runs page JavaScript, and renders screenshots without
-Chrome or a browser container. It speaks the
+parses HTML, applies CSS, runs page JavaScript, and renders frames and
+screenshots without Chrome or a browser container. It speaks the
 [Chrome DevTools Protocol (CDP)](https://chromedevtools.github.io/devtools-protocol/),
 so CDP clients such as Puppeteer and Playwright can drive it.
 
-This fork adds a standalone **local browser** with a Rust host, embedded workerd
-and engine, and a persistent SQLite account profile. The browser uses installed
-system fonts and keeps pages alive when a CDP client disconnects. The executable
-runs locally and starts its bundled workerd as a child process.
+The repository also provides a standalone **local browser**. A Rust host embeds
+workerd and the engine, keeps a SQLite profile, uses installed system fonts, and
+keeps pages alive when a CDP client disconnects. The executable starts its
+bundled workerd as a child process.
 
 ## Run the native local browser
 
@@ -23,17 +23,16 @@ bazel run -c opt //packages/local-browser:package
 ./dist/local-browser/kitesurf serve
 ```
 
-On Linux, install Fontconfig and at least one sans-serif font. On macOS the browser
-uses Core Text. CDP clients connect to the browser at
+On Linux, install Fontconfig and at least one sans-serif font. On macOS the
+browser uses Core Text. CDP clients connect at
 `ws://127.0.0.1:8787/devtools/browser`. See the
 [local browser guide](packages/local-browser/README.md) for profile management,
 reconnect behavior, control ownership, and build details.
 
 ## Install a release archive
 
-The v0.5.4 release workflow prepares native packages for Linux x64, Linux arm64
-and macOS arm64. After the draft is published, install with
-[mise](https://mise.jdx.dev/):
+The current release is 0.5.4, with native archives for Linux x64, Linux arm64,
+and macOS arm64. Install it with [mise](https://mise.jdx.dev/):
 
 ```bash
 mise use -g github:KonghaYao/kitesurf@0.5.4
@@ -53,8 +52,7 @@ tar -xzf "$archive"
 ```
 
 On Linux, use `linux-x64` or `linux-arm64` in the archive name and
-`sha256sum -c` to verify it. The published v0.5.0 archive contains the earlier
-Node SEA local browser.
+`sha256sum -c` to verify it.
 
 ## CDP protocol
 
@@ -80,6 +78,13 @@ updates the page and accessibility tree but may not update the title reported by
 
 Kitesurf implements the CDP domains it needs. Unsupported commands and
 Chrome-only DevTools panels are not emulated.
+
+## Limitations
+
+Kitesurf is a proof of concept and implements a subset of the web platform. It
+does not run iframe JavaScript, service or shared workers, synchronous XHR,
+WebGL, WebGPU, WebAudio, or WebRTC. See [AGENTS.md](AGENTS.md) for the current
+out-of-scope areas.
 
 ## Core workflow: agents and Chrome DevTools
 
@@ -138,9 +143,9 @@ heap snapshots may fail. Puppeteer and Playwright remain the stable baseline.
 > [!IMPORTANT]
 > Deploying the engine to Cloudflare requires Dynamic Workers, which are part
 > of the [Workers Paid plan](https://developers.cloudflare.com/dynamic-workers/pricing/).
-> The local browser above does not use Cloudflare. The rest of this document
-> covers the upstream engine, local development with `wrangler dev`, and the
-> optional Cloudflare deployment.
+> The local browser above does not use Cloudflare. The remaining sections cover
+> the engine, local development with `wrangler dev`, and the optional Cloudflare
+> deployment.
 
 > [!WARNING]
 > Do not open untrusted sites with a local Kitesurf. This includes the
@@ -172,7 +177,7 @@ npm install --global pnpm@9.15.4
 
 ## Build and run the engine locally
 
-Clone this fork and install its dependencies:
+Clone the repository and install its dependencies:
 
 ```bash
 git clone https://github.com/KonghaYao/kitesurf.git
@@ -205,18 +210,13 @@ KITESURF_PORT=8799 pnpm run dev
 
 ### Run many navigations locally
 
-Each navigation starts a new page isolate and stops the previous one. A local
-engine keeps a stopped isolate in memory until the engine's garbage collector
-runs. If you run many navigations in parallel, these isolates can use many
-gigabytes of memory.
+Each navigation starts a new page isolate and retires the previous one. A
+retired isolate stays in memory until the engine collects it, so long parallel
+runs can use a lot of memory.
 
-`pnpm run dev` starts the runtime with the V8 flag `--expose-gc`. The engine
-then runs garbage collection after it stops a page isolate. Pages do not get
-`gc()`. In one test, five parallel connections loaded 940 pages in total.
-Without the flag, the runtime stopped with a V8 out-of-memory error after about
-300 pages. With the flag, all 940 pages loaded and memory stayed below 4 GB.
-
-If you start `wrangler dev` directly, for example in a container, set the flag
+`pnpm run dev` starts workerd with the V8 flag `--expose-gc`, and the engine
+then collects retired isolates. Pages and workers do not see `gc()`. If you
+start `wrangler dev` directly, for example in a container, set the flag
 yourself. Run this from `packages/engine` and add your other options:
 
 ```bash
@@ -230,13 +230,15 @@ the default. Include `--expose-gc` in it.
 
 The Docker image runs the engine on workerd, the open-source Workers runtime,
 without Node.js. It needs no Cloudflare account. Use it, for example, to run
-end-to-end tests with Playwright or Puppeteer in CI. Tagged releases publish
-the image to `ghcr.io/cloudflare/kitesurf` for `linux/amd64` and `linux/arm64`.
+end-to-end tests with Playwright or Puppeteer in CI. The Docker workflow targets
+`ghcr.io/<owner>/<repository>`; the commands below build a local image.
 
-Start the engine:
+Build the image from the repository root, then start it. The build needs no
+Bazel, Node.js or Rust on the host:
 
 ```bash
-docker run --rm -p 127.0.0.1:8787:8787 ghcr.io/cloudflare/kitesurf
+docker build -f docker/Dockerfile -t kitesurf .
+docker run --rm -p 127.0.0.1:8787:8787 kitesurf
 ```
 
 The engine starts in under a second. On its first request, the image opens one
@@ -244,13 +246,6 @@ page to warm up and logs `[kitesurf] warmed up`. Docker's health check sends
 that request within a second of start. Until the warm-up ends, `/health`
 answers `503`, so a CI service that waits for a healthy engine gets a fast
 first page.
-
-To build the image yourself, run this command from the repository root. You do
-not need Bazel, Node.js or Rust on the host:
-
-```bash
-docker build -f docker/Dockerfile -t kitesurf .
-```
 
 The first build compiles the Rust core, which takes a while. Docker keeps
 Bazel's cache in a build cache mount, so later builds are faster. Add
@@ -369,8 +364,7 @@ discovers targets with plain HTTP and WebSocket connections. The `chrome://inspe
 workflow cannot reach an HTTPS engine. Use it with a local engine instead.
 
 Kitesurf provides a CDP endpoint, not a full Chrome implementation. Some Chrome
-DevTools features do not work yet. We are working to add more support over time.
-Puppeteer and other CDP clients can connect to
+DevTools features do not work. Puppeteer and other CDP clients can connect to
 `ws://127.0.0.1:8787/devtools/browser`.
 
 ### Use the bundled DevTools frontend
@@ -404,16 +398,6 @@ echo 'common --config=devtools' >> .bazelrc.user
 The build copies the frontend to `packages/engine/public/inspector/`. Git
 ignores this directory. A build without the option removes it. To turn the
 frontend off, remove the line from `.bazelrc.user`.
-
-#### Run the frontend locally
-
-1. Build the frontend as described above.
-2. Start the engine with `pnpm run dev`. The engine serves the bundled frontend
-   when the build includes it, and the hosted frontend when it does not.
-3. Open `http://127.0.0.1:8787/` in Chrome. Enter a URL to inspect, or select
-   one of the example pages. DevTools opens in the tab on that page.
-
-To start on a page, open `http://127.0.0.1:8787/?url=https://example.com`.
 
 #### Rebuild the frontend
 
@@ -458,12 +442,12 @@ Keep the two pins on the same Chrome version. After you change
 
 ## Build and test
 
-The pnpm scripts are front ends to Bazel:
+These pnpm scripts wrap Bazel:
 
 ```bash
 pnpm run build                    # bazel run //packages/engine:dev_build
 pnpm run check                    # type checks, bundles, and repository checks
-pnpm run test:unit                # engine vitest and Rust host tests
+pnpm run test:unit                # engine vitest, Rust host tests, and CLI tests
 pnpm run test:e2e <file-substring>
 pnpm run format:check             # oxfmt; pnpm run format rewrites the same files
 pnpm run format:rust              # format Rust with Bazel's pinned rustfmt
@@ -478,15 +462,23 @@ the source tree, where `wrangler dev` reads them. Other targets run directly,
 for example `bazel test //tests/e2e:gate` for the full e2e suite. Another Bazel
 workspace can depend on this repository as a module.
 
-## Releases
+To package a native local-browser release, run:
 
-Pushing a `v0.5.*` tag matching the local browser version runs the release workflow.
-It builds a Rust executable for Linux x64, Linux arm64 and macOS arm64, then tests
-the executable extracted from each archive. The draft release includes each
-`.tar.gz` and its `.sha256` checksum. Manual runs upload the same archives as
-workflow artifacts.
+```bash
+bazel run -c opt //packages/local-browser:package -- --archive "$PWD/dist"
+```
 
-The Rust terminal client keeps its own `cli-v*` tag trigger.
+The `v0.5.*` tag runs the release workflow; `cli-v*` releases the terminal
+client.
+
+## Architecture
+
+Each CDP WebSocket session runs in one engine Worker. The engine parses HTML,
+runs page JavaScript in per-page sub-isolates, and renders frames with Blitz
+(Stylo, Taffy, Parley, and vello_cpu). The Rust core compiles to WebAssembly
+behind a TypeScript layer. The local browser embeds workerd and the engine in a
+Rust host that owns the SQLite profile, the CDP connection, and the system-font
+service.
 
 ## Technology stack
 
@@ -602,11 +594,15 @@ documentation before planning a Cloudflare deployment.
 | Package                                        | Description                                    |
 | ---------------------------------------------- | ---------------------------------------------- |
 | [`engine`](packages/engine/)                   | Cloudflare Worker and CDP server               |
+| [`engine-server`](packages/engine-server/)     | Miniflare host for the built engine            |
 | [`local-browser`](packages/local-browser/)     | Standalone local browser and profile host      |
 | [`page-script`](packages/page-script/)         | Page DOM and JavaScript runtime                |
 | [`page-renderer`](packages/page-renderer/)     | Renderer for recorded page scenes              |
+| [`worker-script`](packages/worker-script/)     | Runtime for page `new Worker()` workers        |
 | [`dom-shim`](packages/dom-shim/)               | DOM APIs inside the page worker                |
-| [`core`](packages/core/)                       | Rust layout, paint, and JavaScript engine code |
+| [`script-gate`](packages/script-gate/)         | Shared script-execution policy                 |
+| [`jsrpc-types`](packages/jsrpc-types/)         | Type-only JSRPC contracts                      |
+| [`core`](packages/core/)                       | Rust layout, paint, PDF, and evaluation        |
 | [`renderer-core`](packages/renderer-core/)     | Rust scene rasterizer for page rendering       |
 | [`scene-host-wasm`](packages/scene-host-wasm/) | Local scene rasterizer for the terminal client |
 | [`kitesurf-cli`](packages/kitesurf-cli/)       | Terminal client                                |
