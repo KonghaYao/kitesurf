@@ -4,6 +4,7 @@
 
 // Wraps page fetch with gateway metadata, request validation, redirects, and response handling.
 
+import type { ParserImageRequestMode } from "@kitesurf/jsrpc-types/page-script";
 import { isDisallowedError } from "./defer-shim.ts";
 import {
   cancelResponseBody,
@@ -23,7 +24,7 @@ import {
 } from "./native-http.ts";
 import { ksGlobal, ksGlobalByKey, state } from "./state.ts";
 import { takeTrustedRequestMeta } from "./trusted-fetch.ts";
-import { routeViaSession } from "./session-outbound.ts";
+import { routeViaSession, type RoutedFetch } from "./session-outbound.ts";
 import { serializeMimeType, setBlobMimeType } from "./mime-type.ts";
 
 // Capture before page code can replace Reflect.apply.
@@ -701,6 +702,7 @@ interface RedirectContext {
   mode: string;
   inputRequest: PageRequest | null;
   checkRedirect: ((url: string) => string | null) | undefined;
+  parserImage: ParserImageRequestMode | null;
 }
 
 function redirectDowngradesToGet(status: number, method: string): boolean {
@@ -734,10 +736,19 @@ async function throwIfBlocked(response: Response): Promise<void> {
 }
 
 async function followRedirects(
-  realFetch: typeof globalThis.fetch,
+  realFetch: RoutedFetch,
   first: Response,
   firstUrl: string,
-  { pageOrigin, headers, init, redirectMode, mode, inputRequest, checkRedirect }: RedirectContext,
+  {
+    pageOrigin,
+    headers,
+    init,
+    redirectMode,
+    mode,
+    inputRequest,
+    checkRedirect,
+    parserImage,
+  }: RedirectContext,
 ): Promise<{ response: Response; url: string; hops: number; tainting: "basic" | "cors" }> {
   // The shim owns redirects so each hop receives updated origin and referrer carriers.
   let response = first;
@@ -844,7 +855,7 @@ async function followRedirects(
     hops += 1;
     init.method = method;
     init.headers = headers;
-    response = await realFetch(currentUrl, init);
+    response = await realFetch(currentUrl, init, parserImage);
     await throwIfBlocked(response);
   }
 }
@@ -896,6 +907,10 @@ export function installFetchShim(): void {
     }
     // Only metadata in the private WeakMap may set engine-owned request attribution.
     const trustedMeta = takeTrustedRequestMeta(init);
+    let parserImage: ParserImageRequestMode | null =
+      trustedMeta?.resourceType === "Image" && trustedMeta.initiator === "parser"
+        ? "allow-retry"
+        : null;
     hdrSet(requestHeaders, "x-kitesurf-initiator", trustedMeta?.initiator || "script");
     hdrSet(requestHeaders, "x-kitesurf-resource-type", trustedMeta?.resourceType || "Fetch");
     if (!hdrHas(requestHeaders, "x-kitesurf-credentials")) {
@@ -1023,7 +1038,12 @@ export function installFetchShim(): void {
     }
     let response: Response;
     try {
-      response = await realFetch(resolved, mergedInit);
+      response = await realFetch(
+        resolved,
+        mergedInit,
+        parserImage,
+        trustedMeta?.onStylesheetDispatch,
+      );
     } catch (error) {
       const retryMethod = String(
         mergedInit.method ??
@@ -1045,7 +1065,13 @@ export function installFetchShim(): void {
         );
       const aborted = mergedInit.signal?.aborted === true;
       if (!isRetriableInternalError(error) || !methodOk || !bodiless || aborted) throw error;
-      response = await realFetch(resolved, mergedInit);
+      if (parserImage) parserImage = "no-retry";
+      response = await realFetch(
+        resolved,
+        mergedInit,
+        parserImage,
+        trustedMeta?.onStylesheetDispatch,
+      );
     }
     const blockedReason = responseHeaderGet(response, "x-kitesurf-blocked");
     if (responseStatus(response) === 403 && blockedReason) {
@@ -1066,6 +1092,7 @@ export function installFetchShim(): void {
       mode: String(mergedInit.mode ?? inputRequest?.mode ?? "cors"),
       inputRequest,
       checkRedirect: trustedMeta?.checkRedirect,
+      parserImage,
     });
     response = followed.response;
     response = restoreCarriedStatus(response);

@@ -14,6 +14,7 @@ export function captureTrustedFetch(): void {
 export interface TrustedRequestMeta {
   resourceType?: string;
   initiator?: string;
+  onStylesheetDispatch?: () => Promise<void>;
   /** Called before each redirect hop is requested: the URL to request, or null to refuse. */
   checkRedirect?: (url: string) => string | null;
 }

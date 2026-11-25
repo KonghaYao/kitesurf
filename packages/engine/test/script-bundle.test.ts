@@ -44,6 +44,14 @@ describe("buildScriptBundle.classicRegularSource", () => {
     expect(src.indexOf('"classic-1"')).toBeLessThan(src.indexOf('"classic-2"'));
   });
 
+  it("preserves adjacent declaration boundaries and repeated function hoists", () => {
+    const code = "class A{}class B{}var first=1;function f(){return 1}function f(){return 2}";
+    const body = buildScriptBundle([classic(code)]).classicRegularSource!;
+    expect(body).toContain("A = class A{};B = class B{};    first=1;");
+    expect(body).toContain("function __ks_fn0_f(){return 1}function __ks_fn1_f(){return 2}");
+    expect(body).toContain("f = __ks_fn1_f;");
+  });
+
   it("routes classic-async-external into the async bucket, not regular", () => {
     const bundle = buildScriptBundle([
       classic("globalThis.didRegular = true;"),

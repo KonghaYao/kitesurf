@@ -16,3 +16,29 @@ export function directExternalFetch(
 ): Promise<Response> {
   return externalOutbound ? externalOutbound.fetch(request) : fetch(request);
 }
+
+/** Reissue a parser image GET once when native egress loses the connection before headers. */
+export async function fetchParserImage(request: Request): Promise<Response> {
+  try {
+    return await fetch(request);
+  } catch (error) {
+    if (
+      request.signal.aborted ||
+      !(error instanceof Error) ||
+      error.message !== "Network connection lost." ||
+      ("retryable" in error && error.retryable === false)
+    ) {
+      throw error;
+    }
+  }
+  try {
+    return await fetch(request);
+  } catch (error) {
+    const message = String(error instanceof Error ? error.message : error);
+    if (message.startsWith("internal error")) {
+      // The page shim retries an internal error. Keep this failure within the egress budget.
+      throw new Error(`Parser image retry failed: ${message}`, { cause: error });
+    }
+    throw error;
+  }
+}

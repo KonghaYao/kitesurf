@@ -23,7 +23,8 @@ import {
   fontDefer as startupFontDefer,
   systemFonts as startupSystemFonts,
   fontProfile as startupFontProfile,
-  scriptDescriptors as startupScriptDescriptors,
+  scriptDescriptorCount as startupScriptDescriptorCount,
+  scriptDescriptorSample as startupScriptDescriptorSample,
   url as startupUrl,
   userAgent as startupUserAgent,
   referrer as startupReferrer,
@@ -121,7 +122,7 @@ export {
   startupModuleScriptCount,
   startupModuleScriptUrls,
   startupJsonModuleUrls,
-  startupScriptDescriptors,
+  startupScriptDescriptorCount,
   startupUrl,
   startupUserAgent,
   startupReferrer,
@@ -130,29 +131,13 @@ export {
   startupMetaCsp,
 };
 
-const STARTUP_SCRIPT_DESCRIPTOR_SAMPLE_SIZE = 5;
-
 export const startupInputSnapshot = {
   hasHtml: startupHasHtml,
   htmlLength: startupHtmlLength,
   url: startupUrl,
   hasCookies: typeof startupCookies === "string" && startupCookies.length > 0,
-  scriptDescriptorCount: Array.isArray(startupScriptDescriptors)
-    ? startupScriptDescriptors.length
-    : 0,
-  scriptDescriptorSample: Array.isArray(startupScriptDescriptors)
-    ? startupScriptDescriptors
-        .slice(0, STARTUP_SCRIPT_DESCRIPTOR_SAMPLE_SIZE)
-        .map((descriptor) => ({
-          src: descriptor.src,
-          kind: descriptor.kind,
-          defer: descriptor.defer,
-          async: descriptor.async,
-          bodyLen: typeof descriptor.body === "string" ? descriptor.body.length : 0,
-          prefetchedLen: descriptor.prefetchedLength ?? 0,
-          prefetchError: descriptor.prefetchError || null,
-        }))
-    : [],
+  scriptDescriptorCount: startupScriptDescriptorCount,
+  scriptDescriptorSample: startupScriptDescriptorSample,
 };
 
 let dynamicImport: ((spec: string) => Promise<Record<string, unknown>>) | null = null;

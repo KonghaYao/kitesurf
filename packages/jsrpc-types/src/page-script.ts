@@ -458,14 +458,23 @@ export type ReceivedUpstreamParams = {
   ]?: unknown;
 };
 
+export type ParserImageRequestMode = "allow-retry" | "no-retry";
+
 export interface SessionOutboundRequest {
   url: string;
   method: string;
   headers: Array<[string, string]>;
   body: ArrayBuffer | ReadableStream<Uint8Array> | null;
+  /** Set by the parser image loader through the private fetch bridge. */
+  parserImage?: ParserImageRequestMode | null;
 }
 
-export type SessionOutbound = (request: SessionOutboundRequest) => Promise<Response>;
+export type StylesheetDispatchAck = () => Promise<void>;
+
+export type SessionOutbound = (
+  request: SessionOutboundRequest,
+  acknowledgeStylesheetDispatch?: StylesheetDispatchAck,
+) => Promise<Response>;
 
 export interface OpenSessionInit {
   upstream: (message: UpstreamMessage) => void;

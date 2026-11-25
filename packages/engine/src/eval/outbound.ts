@@ -5,7 +5,11 @@
 // Applies page-origin, cookie, CORS, interception, and egress rules to page requests.
 
 import { WorkerEntrypoint } from "cloudflare:workers";
-import type { SessionOutbound, SessionOutboundRequest } from "@kitesurf/jsrpc-types/page-script";
+import type {
+  SessionOutbound,
+  SessionOutboundRequest,
+  StylesheetDispatchAck,
+} from "@kitesurf/jsrpc-types/page-script";
 import {
   CONNECTION_ID_HEADER,
   FRAME_ID_HEADER,
@@ -37,7 +41,11 @@ import {
   preflightCacheLookup,
 } from "./cors.ts";
 import { wbaHeadersFor, type WbaEnv } from "./web-bot-auth.ts";
-import { directExternalFetch, type ExternalOutbound } from "./external-outbound.ts";
+import {
+  directExternalFetch,
+  fetchParserImage,
+  type ExternalOutbound,
+} from "./external-outbound.ts";
 import { looksLikeSvg, sniffImageDims } from "./image-dims.ts";
 import { MAX_ENTRY_BYTES, putAuthorFont, putOpaqueImage } from "./resource-store.ts";
 import { MAX_SHAPED_FONT_BYTES, shapeFontBytes } from "./font-shaping.ts";
@@ -112,6 +120,7 @@ export interface OutboundProps {
 }
 
 const ASSET_SENTINEL_HOST = "kitesurf-fonts";
+const SYSTEM_CORE_ALTERNATES_PATH = "/system/core-alternates";
 
 const MAX_SYSTEM_FONT_BYTES = 24 * 1024 * 1024;
 
@@ -227,15 +236,19 @@ export interface SandboxOutboundOverride {
   readonly external: boolean;
   parent(props: CallerOutboundProps): Fetcher;
   loaded(props: CallerOutboundProps): Fetcher;
-  session(props: CallerOutboundProps): SessionOutbound;
+  session(props: CallerOutboundProps, imageLifetime?: AbortSignal): SessionOutbound;
   final(request: Request): Promise<Response>;
 }
 
-function sessionRequest(req: SessionOutboundRequest): Request {
+const retryableParserImageRequests = new WeakSet<Request>();
+const stylesheetDispatchAcks = new WeakMap<Request, StylesheetDispatchAck>();
+
+function sessionRequest(req: SessionOutboundRequest, signal?: AbortSignal): Request {
   return new Request(req.url, {
     method: req.method,
     headers: req.headers,
     body: req.body,
+    signal,
     redirect: "manual",
   });
 }
@@ -322,10 +335,31 @@ export function createSandboxOutboundOverride(
     loaded(props) {
       return exports.SandboxOutbound({ props: { ...seal(props), pageRealm: true } });
     },
-    session(props) {
+    session(props, imageLifetime) {
       const sealed = { ...seal(props), pageRealm: true };
-      return async (req) =>
-        rpcSafeResponse(await SandboxOutbound.handle(env, sealed, sessionRequest(req)));
+      return async (req, acknowledgeStylesheetDispatch) => {
+        const mode = Object.hasOwn(req, "parserImage") ? req.parserImage : null;
+        const parserImage =
+          !externalOutbound &&
+          !egress &&
+          (mode === "allow-retry" || mode === "no-retry") &&
+          req.method === "GET" &&
+          req.body === null;
+        const request = sessionRequest(req, parserImage ? imageLifetime : undefined);
+        if (parserImage && imageLifetime && mode === "allow-retry") {
+          retryableParserImageRequests.add(request);
+        }
+        if (
+          acknowledgeStylesheetDispatch &&
+          request.method === "GET" &&
+          request.body === null &&
+          request.headers.get("x-kitesurf-resource-type") === "Stylesheet" &&
+          request.headers.get("x-kitesurf-initiator") === "parser"
+        ) {
+          stylesheetDispatchAcks.set(request, acknowledgeStylesheetDispatch);
+        }
+        return rpcSafeResponse(await SandboxOutbound.handle(env, sealed, request));
+      };
     },
     final(request) {
       return directExternalFetch(externalOutbound ?? egress, request);
@@ -450,6 +484,10 @@ export class SandboxOutbound extends WorkerEntrypoint<SandboxOutboundEnv, Outbou
         return new Response("text sample too large", { status: 400 });
       path = "match";
       body = JSON.stringify({ family, script, locale, style, weight, text });
+    } else if (parsedUrl.pathname === SYSTEM_CORE_ALTERNATES_PATH) {
+      if (parsedUrl.search) return new Response("invalid system font query", { status: 400 });
+      path = "match-core-alternates";
+      body = "{}";
     } else {
       const id = params.get("id") ?? "";
       if (!/^[0-9a-f]{32}$/.test(id)) return new Response("invalid font id", { status: 400 });
@@ -475,6 +513,9 @@ export class SandboxOutbound extends WorkerEntrypoint<SandboxOutboundEnv, Outbou
     }
     if (!response.ok) {
       await response.body?.cancel().catch(() => {});
+      if (path === "match-core-alternates" && response.status === 404) {
+        return new Response(null, { status: 404 });
+      }
       return new Response("system font request failed", { status: 502 });
     }
     const cap = path === "face" ? MAX_SYSTEM_FONT_BYTES : 64 * 1024;
@@ -530,7 +571,11 @@ export class SandboxOutbound extends WorkerEntrypoint<SandboxOutboundEnv, Outbou
       parsedUrl = new URL(request.url);
     } catch {}
     if (parsedUrl && parsedUrl.hostname === ASSET_SENTINEL_HOST) {
-      if (parsedUrl.pathname === "/system/match" || parsedUrl.pathname === "/system/face")
+      if (
+        parsedUrl.pathname === "/system/match" ||
+        parsedUrl.pathname === "/system/face" ||
+        parsedUrl.pathname === SYSTEM_CORE_ALTERNATES_PATH
+      )
         return SandboxOutbound.fetchSystemFont(env, parsedUrl, props);
       return SandboxOutbound.fetchAsset(env, parsedUrl);
     }
@@ -1059,10 +1104,19 @@ export class SandboxOutbound extends WorkerEntrypoint<SandboxOutboundEnv, Outbou
         ? AbortSignal.any([forwardRequest.signal, egressAbortCtl.signal])
         : egressAbortCtl.signal;
     try {
-      resp = await directExternalFetch(
-        transport,
-        new Request(forwardRequest, { signal: egressSignal }),
-      );
+      const upstream = new Request(forwardRequest, { signal: egressSignal });
+      const pendingResponse =
+        retryableParserImageRequests.has(request) && upstream.method === "GET" && !upstream.body
+          ? fetchParserImage(upstream)
+          : directExternalFetch(transport, upstream);
+      const acknowledgeStylesheetDispatch = stylesheetDispatchAcks.get(request);
+      if (acknowledgeStylesheetDispatch) {
+        // The real outbound operation is in flight. This signal never waits on the response.
+        try {
+          void acknowledgeStylesheetDispatch().catch(() => {});
+        } catch {}
+      }
+      resp = await pendingResponse;
       clearTimeout(egressAbortTimer);
       const __egressMs = Date.now() - __egressT0;
       if (__egressMs > SLOW_EGRESS_HEADERS_THRESHOLD_MS) {

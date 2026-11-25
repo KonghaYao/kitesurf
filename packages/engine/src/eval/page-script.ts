@@ -187,6 +187,8 @@ function emptyWasmBytes(): ArrayBuffer {
   return new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]).buffer;
 }
 
+const STARTUP_SCRIPT_DESCRIPTOR_SAMPLE_SIZE = 5;
+
 interface GetOrCreatePageScriptOptions {
   env: {
     LOADER: WorkerLoader;
@@ -246,13 +248,9 @@ export function getOrCreatePageScript({
   const htmlLength = typeof startupInput.html === "string" ? startupInput.html.length : 0;
   const url = typeof startupInput.url === "string" ? startupInput.url : null;
   const cookies = typeof startupInput.cookies === "string" ? startupInput.cookies : "";
-  // The classic bundle already carries every body. A copy here stayed live as
-  // module text and literals for the page's life: ~11 MiB of V8 heap on a large single-page app.
-  const scriptDescriptors = (
-    Array.isArray(startupInput.scriptDescriptors) ? startupInput.scriptDescriptors : []
-  ).map(({ prefetchedSource, ...d }) =>
-    typeof prefetchedSource === "string" ? { ...d, prefetchedLength: prefetchedSource.length } : d,
-  );
+  const scriptDescriptors = Array.isArray(startupInput.scriptDescriptors)
+    ? startupInput.scriptDescriptors
+    : [];
   const userAgent =
     typeof startupInput.userAgent === "string" && startupInput.userAgent
       ? startupInput.userAgent
@@ -261,6 +259,19 @@ export function getOrCreatePageScript({
   const referrerPolicy =
     typeof startupInput.referrerPolicy === "string" ? startupInput.referrerPolicy : "";
   const cdpDebug = startupInput.cdpDebug === true;
+  // Script source already lives in the bundle. Keep only its length in debug samples.
+  const scriptDescriptorSample = cdpDebug
+    ? scriptDescriptors.slice(0, STARTUP_SCRIPT_DESCRIPTOR_SAMPLE_SIZE).map((descriptor) => ({
+        src: descriptor.src,
+        kind: descriptor.kind,
+        defer: descriptor.defer,
+        async: descriptor.async,
+        bodyLen: typeof descriptor.body === "string" ? descriptor.body.length : 0,
+        prefetchedLen:
+          typeof descriptor.prefetchedSource === "string" ? descriptor.prefetchedSource.length : 0,
+        prefetchError: descriptor.prefetchError || null,
+      }))
+    : [];
   const pixelFree = startupInput.pixelFree === true;
   const fontDefer = startupInput.fontDefer === true;
   const systemFonts = env.KITESURF_SYSTEM_FONTS === "1";
@@ -292,7 +303,8 @@ export const hasHtml = ${JSON.stringify(hasHtml)};
 export const htmlLength = ${JSON.stringify(htmlLength)};
 export const url = ${JSON.stringify(url)};
 export const cookies = ${JSON.stringify(cookies)};
-export const scriptDescriptors = ${JSON.stringify(scriptDescriptors)};
+export const scriptDescriptorCount = ${scriptDescriptors.length};
+export const scriptDescriptorSample = ${JSON.stringify(scriptDescriptorSample)};
 export const userAgent = ${JSON.stringify(userAgent)};
 export const referrer = ${JSON.stringify(referrer)};
 export const referrerPolicy = ${JSON.stringify(referrerPolicy)};
@@ -458,9 +470,11 @@ export const manifest = ${JSON.stringify(wasmBake ? wasmBake.manifest : {})};
         }
       }
     : spanWrap;
+  const imageLifetime = new AbortController();
   const session = openPageScriptRpcSession(entrypoint, {
     now: makeWallClock(env),
-    outbound: sandboxOutbound.session(outboundProps),
+    outbound: sandboxOutbound.session(outboundProps, imageLifetime.signal),
+    onDead: () => imageLifetime.abort(),
     wallCapMs: caps.wallMs > 0 ? caps.wallMs : undefined,
     scriptName: name,
     getTraceParent: tracer ? () => tracer.getSpanContext()?.spanId ?? null : undefined,

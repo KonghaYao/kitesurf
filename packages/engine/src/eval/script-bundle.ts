@@ -165,7 +165,6 @@ function buildClassicSegment(
 
   const scan = extractTopLevelDecls(source);
   const blockedNames = new Set(["module", "exports", "require"]);
-  let bodySource = source;
   // Top-level let/const/class share one global lexical scope across scripts.
   // https://html.spec.whatwg.org/multipage/webappapis.html#run-a-classic-script
   type SourceEdit = { start: number; end: number; text: string };
@@ -218,9 +217,19 @@ function buildClassicSegment(
           `__ks_state_local.markRenamed(${internal}, ${JSON.stringify(internal)}, ${JSON.stringify(name)}); `,
       )
       .join("");
-  edits.sort((a, b) => b.start - a.start || b.end - a.end);
-  for (const edit of edits) {
-    bodySource = bodySource.slice(0, edit.start) + edit.text + bodySource.slice(edit.end);
+  let bodySource = source;
+  if (edits.length > 0) {
+    // At a shared boundary, close the preceding class before inserting the next class name.
+    // Zero-width insertions precede a replacement that consumes source at the same offset.
+    edits.sort((a, b) => a.start - b.start || a.end - b.end);
+    const parts: string[] = [];
+    let cursor = 0;
+    for (const edit of edits) {
+      parts.push(source.slice(cursor, edit.start), edit.text);
+      cursor = edit.end;
+    }
+    parts.push(source.slice(cursor));
+    bodySource = parts.join("");
   }
   const liveVarNames = scan.varNames.filter((n) => !blockedNames.has(n));
   const predeclareHead =

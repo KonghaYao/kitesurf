@@ -2,7 +2,7 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 // https://opensource.org/licenses/Apache-2.0
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import type { ExternalOutbound } from "../src/eval/external-outbound.ts";
 import {
   createSandboxOutboundOverride,
@@ -66,5 +66,50 @@ describe("host egress", () => {
     await outbound.final(new Request("https://cdn.example/final"));
     expect(egress.seen).toHaveLength(0);
     expect(external.seen).toHaveLength(2);
+  });
+
+  it("does not forward parser image cancellation to host egress", async () => {
+    const lifetime = new AbortController();
+    lifetime.abort();
+    const egress = recorder("egress");
+    const outbound = createSandboxOutboundOverride(exports, env, undefined, egress);
+    const response = await outbound.session(
+      { pageOrigin: "https://page.example" },
+      lifetime.signal,
+    )({
+      url: "https://page.example/cover.png",
+      method: "GET",
+      headers: [],
+      body: null,
+      parserImage: "allow-retry",
+    });
+    expect(await response.text()).toBe("egress");
+    expect(egress.seen[0]?.signal.aborted).toBe(false);
+    expect(egress.seen).toHaveLength(1);
+  });
+
+  it("does not renew the parser image retry budget on a page-level retry", async () => {
+    const outbound = createSandboxOutboundOverride(exports, env);
+    const send = outbound.session(
+      { pageOrigin: "https://page.example" },
+      new AbortController().signal,
+    );
+    const failure = new Error("Network connection lost.");
+    const native = vi.fn().mockRejectedValue(failure);
+    vi.stubGlobal("fetch", native);
+    try {
+      await expect(
+        send({
+          url: "https://page.example/cover.png",
+          method: "GET",
+          headers: [],
+          body: null,
+          parserImage: "no-retry",
+        }),
+      ).rejects.toBe(failure);
+      expect(native).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

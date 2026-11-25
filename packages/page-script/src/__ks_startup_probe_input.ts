@@ -3,20 +3,21 @@
 // https://opensource.org/licenses/Apache-2.0
 
 // @ks-declaration-twin for the synthetic sibling generated per navigation.
-// External bodies ride the classic bundle; descriptors retain their byte length.
+// Script bodies stay in the bundle; the debug sample records their UTF-16 lengths.
 
 export declare const hasHtml: boolean;
 export declare const htmlLength: number;
 export declare const url: string | null;
 export declare const cookies: string;
-export declare const scriptDescriptors: Array<{
+export declare const scriptDescriptorCount: number;
+export declare const scriptDescriptorSample: Array<{
   src: string | null;
   kind: "classic" | "module";
   defer: boolean;
   async: boolean;
-  body: string;
-  prefetchedLength?: number;
-  prefetchError?: string;
+  bodyLen: number;
+  prefetchedLen: number;
+  prefetchError: string | null;
 }>;
 export declare const userAgent: string | null;
 export declare const referrer: string;

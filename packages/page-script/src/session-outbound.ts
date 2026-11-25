@@ -4,7 +4,12 @@
 
 // Routes page and dedicated-worker fetches through the session-owned engine stub.
 
-import type { SessionOutbound, SessionOutboundRequest } from "@kitesurf/jsrpc-types/page-script";
+import type {
+  ParserImageRequestMode,
+  SessionOutbound,
+  SessionOutboundRequest,
+  StylesheetDispatchAck,
+} from "@kitesurf/jsrpc-types/page-script";
 import {
   cancelResponseBody,
   defineOwn,
@@ -102,8 +107,15 @@ function abortError(signal: AbortSignal): unknown {
 /** Routes eligible HTTP(S) fetches through the session stub; WebSocket upgrades bypass it.
  * Followed redirects use native fetch; routed aborts reject locally without canceling engine work.
  */
-export function routeViaSession(native: typeof globalThis.fetch): typeof globalThis.fetch {
-  return async function fetch(input, init) {
+export type RoutedFetch = (
+  input: Parameters<typeof globalThis.fetch>[0],
+  init?: Parameters<typeof globalThis.fetch>[1],
+  parserImage?: ParserImageRequestMode | null,
+  acknowledgeStylesheetDispatch?: StylesheetDispatchAck,
+) => Promise<Response>;
+
+export function routeViaSession(native: typeof globalThis.fetch): RoutedFetch {
+  return async function fetch(input, init, parserImage = null, acknowledgeStylesheetDispatch) {
     const stub = outbound;
     if (!stub) return native(input, init);
     const request = newNativeRequest(input, init);
@@ -131,12 +143,16 @@ export function routeViaSession(native: typeof globalThis.fetch): typeof globalT
     // Keep egress on the engine stub rather than opening sockets in the loaded worker. The
     // continuation is private: the page must not receive the promise or the response it holds.
     const call = (async (): Promise<Response> => {
-      const response = await stub({
+      const request: SessionOutboundRequest = {
         url,
         method,
         headers: hdrEntries(headers),
         body,
-      });
+        parserImage,
+      };
+      const response = acknowledgeStylesheetDispatch
+        ? await stub(request, acknowledgeStylesheetDispatch)
+        : await stub(request);
       withRequestUrl(response, url);
       freezeHeaders(response);
       return response;
@@ -161,5 +177,5 @@ export function routeViaSession(native: typeof globalThis.fetch): typeof globalT
         }
       })();
     });
-  } as typeof globalThis.fetch;
+  };
 }

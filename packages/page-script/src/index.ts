@@ -72,7 +72,7 @@ import {
   startupModuleScriptCount,
   startupModuleScriptUrls,
   startupPixelFree,
-  startupScriptDescriptors,
+  startupScriptDescriptorCount,
   startupUserAgent,
   startupReferrer,
   startupReferrerPolicy,
@@ -94,6 +94,7 @@ import { determineReferrer, parseReferrerPolicy } from "@kitesurf/script-gate/re
 import { invokeSessionMethod } from "./session-methods.ts";
 import { clearSessionOutbound, setSessionOutbound } from "./session-outbound.ts";
 import {
+  InitialParserResources,
   installResourceFetchBridge,
   fontsIdle,
   fontsInflightCount,
@@ -3251,7 +3252,7 @@ export class PageScript extends WorkerEntrypoint implements PageScriptSession {
       typeof performance !== "undefined" && performance.now
         ? () => performance.now()
         : () => Date.now();
-    const phases = {};
+    const phases: Record<string, number> = {};
 
     const isTraced = !!(navigateOptions && navigateOptions.traced === true);
     awaitingIframeInstalls =
@@ -3397,13 +3398,17 @@ export class PageScript extends WorkerEntrypoint implements PageScriptSession {
     const marker = sourceDoctype
       ? `__kitesurf_doctype_${Math.random().toString(36).slice(2)}__`
       : null;
-    const navigateDom = DomHandle.newUtf8(
-      source.utf8,
-      sourceDoctype?.utf8End ?? 0,
-      marker ? `<!--${marker}-->` : "",
-      safeUrl,
+    using initialResources = new InitialParserResources();
+    const parseSource = source;
+    const navigateDom = initialResources.capture(() =>
+      DomHandle.newUtf8(
+        parseSource.utf8,
+        sourceDoctype?.utf8End ?? 0,
+        marker ? `<!--${marker}-->` : "",
+        safeUrl,
+      ),
     );
-    const hasScriptObservers = startupScriptDescriptors.length > 0 || source.eventHandlerAttributes;
+    const hasScriptObservers = startupScriptDescriptorCount > 0 || source.eventHandlerAttributes;
     // Free the source before scripts and first layout so it does not count against the isolate
     // limit at the Wasm peak.
     releaseNavigateSource(source);
@@ -3437,6 +3442,17 @@ export class PageScript extends WorkerEntrypoint implements PageScriptSession {
     invalidatePaintDom();
     emitNavigateDiagnostic("end", "parse");
     markPhase("parseMs");
+    if (initialResources.dispatched && navigateDom.hasPendingCriticalResources()) {
+      const STYLESHEET_DISPATCH_WAIT_MS = 12;
+      const sent = await NativePromise.race([
+        initialResources.dispatched,
+        nativeSleep(STYLESHEET_DISPATCH_WAIT_MS).then(() => false),
+        sessionClosingSignal.then(() => false),
+      ]);
+      if (sessionClosing) throw SESSION_CLOSED_ERROR;
+      phases.initialStylesheetDispatched = sent ? 1 : 0;
+      markPhase("initialStylesheetDispatchMs");
+    }
     emitNavigateDiagnostic("start", "shim");
 
     installNativeToString();
@@ -3828,6 +3844,7 @@ export class PageScript extends WorkerEntrypoint implements PageScriptSession {
         built.applyDeclarativeShadowRoots();
       } catch {}
     }
+    initialResources.release();
     emitNavigateDiagnostic("end", "shim");
     markPhase("shimMs");
     if (fontDeferActive() && hasScriptObservers) {
@@ -3964,7 +3981,7 @@ export class PageScript extends WorkerEntrypoint implements PageScriptSession {
       emitNavigateDiagnostic("end", "module_scripts");
       markPhase("moduleScriptsMs");
 
-      scriptCount = Array.isArray(startupScriptDescriptors) ? startupScriptDescriptors.length : 0;
+      scriptCount = startupScriptDescriptorCount;
     } else {
       const scripts = extractScripts();
       const plan = planScripts(scripts);

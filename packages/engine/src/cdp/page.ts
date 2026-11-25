@@ -881,7 +881,6 @@ export async function handlePage(
       target.html = "";
       target.fallbackHtmlReleased = false;
       releaseTargetDom(target);
-      target.docScan = null;
       target.docCsp = null;
       target.docCspReportOnly = null;
       target.docReferrerPolicy = null;
@@ -1165,6 +1164,7 @@ export async function handlePage(
 
         const ct = resp.headers.get("content-type") ?? "text/html";
         let pageHtml: string;
+        let docScan: DocScan;
         let networkBody: { body: string; length: number } | null = null;
         if (docKind === "html") {
           const read = await traceSpan(ctx.env.HOST_TRACER, "navigate.read_document_body", () =>
@@ -1187,13 +1187,13 @@ export async function handlePage(
           target.html = html;
           target.fallbackHtmlReleased = false;
           releaseTargetDom(target);
-          target.docScan = traceSpan(
+          docScan = traceSpan(
             ctx.env.HOST_TRACER,
             "navigate.scan_document",
             () => scanDocument(html),
             { bytes: html.length },
           );
-          target.title = target.docScan.title;
+          target.title = docScan.title;
           pageHtml = html;
         } else {
           const read = await readCappedBytes(resp, MAX_DOCUMENT_BYTES, ctx.connectionId);
@@ -1221,7 +1221,7 @@ export async function handlePage(
                   : `<html><head></head><body><pre>${escapeHtml(text)}</pre></body></html>`;
           }
           releaseTargetDom(target);
-          target.docScan = scanDocument(wrapper);
+          docScan = scanDocument(wrapper);
           target.html = wrapper;
           target.fallbackHtmlReleased = false;
           pageHtml = wrapper;
@@ -1248,15 +1248,15 @@ export async function handlePage(
         }
         emitFrameNavigated(ctx, target, mainFrame(target), req.sessionId);
 
-        let inlinedPageHtml = pageHtml;
-        if (target.docScan) {
-          inlinedPageHtml = removeHtmlTagSpans(pageHtml, htmlTagSpans(pageHtml, "noscript", true));
-        }
+        const inlinedPageHtml = removeHtmlTagSpans(
+          pageHtml,
+          htmlTagSpans(pageHtml, "noscript", true),
+        );
 
         // One admission owner for every child frame and child DOM this navigation retains,
         // shared by discovery and every load branch.
         const childBudget = newChildFrameBudget();
-        rebuildFrameTreeChildren(target, childBudget);
+        discoverChildFramesFromScan(target, mainFrame(target), docScan.iframes, childBudget);
         const childFrames = [...target.frames.values()].filter(
           (frame) => frame.parentFrameId !== null && frame.lifecycle === "init",
         );
@@ -1288,7 +1288,14 @@ export async function handlePage(
           console: capturedConsole,
           cdpMutations,
           exceptions,
-        } = await pushNavigateToPageScript(ctx, target, inlinedPageHtml, finalUrl, armedIframeGate);
+        } = await pushNavigateToPageScript(
+          ctx,
+          target,
+          inlinedPageHtml,
+          finalUrl,
+          docScan,
+          armedIframeGate,
+        );
         if (target.pageScript) {
           releaseTargetDom(target);
           releaseFallbackHtml(target);
@@ -1395,14 +1402,15 @@ export async function handlePage(
       target.docCharset = null;
       // Scan every document, synthetic origin included: the scan is what puts its scripts
       // through the script gate and into the bundle.
-      target.docScan = scanDocument(html);
-      target.title = target.docScan.title;
+      const docScan = scanDocument(html);
+      target.title = docScan.title;
+      const scannedIframes = docScan.iframes;
       ctx.browser.dedicatedWorkers.terminateTarget(target.targetId, "setDocumentContent");
       const {
         console: capturedConsole,
         cdpMutations,
         exceptions,
-      } = await pushNavigateToPageScript(ctx, target, html, url);
+      } = await pushNavigateToPageScript(ctx, target, html, url, docScan);
       teardownOopifStubs(target, "setDocumentContent", ctx);
       target.frames = new Map();
       target.frames.set(
@@ -1417,7 +1425,7 @@ export async function handlePage(
       // emit it earlier, before the isolate builds the document.
       emitFrameStartedLoading(ctx, target, mainFrame(target), req.sessionId);
       emitFrameNavigated(ctx, target, mainFrame(target), req.sessionId);
-      emitNavigationLifecycle(ctx, target, req.sessionId);
+      emitNavigationLifecycle(ctx, target, req.sessionId, scannedIframes);
       emitExecutionContextCreated(ctx, target, req.sessionId);
       emitCapturedConsole(ctx, target, capturedConsole, req.sessionId);
       emitCapturedExceptions(ctx, target, exceptions, req.sessionId);
@@ -1944,6 +1952,7 @@ async function pushNavigateToPageScript(
   target: TargetState,
   html: string,
   url: string,
+  scannedDocument?: DocScan,
   owesIframeInstalls = false,
 ): Promise<NavigatePushResult> {
   if (target.type !== "page") return { console: [] };
@@ -1951,7 +1960,14 @@ async function pushNavigateToPageScript(
   const gate = new Promise<void>((r) => (release = r));
   target.blankReady = gate;
   try {
-    return await pushNavigateToPageScriptInner(ctx, target, html, url, owesIframeInstalls);
+    return await pushNavigateToPageScriptInner(
+      ctx,
+      target,
+      html,
+      url,
+      scannedDocument,
+      owesIframeInstalls,
+    );
   } finally {
     if (target.blankReady === gate) target.blankReady = null;
     release();
@@ -1970,9 +1986,12 @@ async function pushNavigateToPageScriptInner(
   target: TargetState,
   html: string,
   url: string,
+  scannedDocument: DocScan | undefined,
   owesIframeInstalls = false,
 ): Promise<NavigatePushResult> {
-  const docScan = target.docScan ?? scanDocument(html);
+  // Script and import map bodies are needed to bake this navigation's modules.
+  const docScan = scannedDocument ?? scanDocument(html);
+  const metaCsp = scannedDocument?.metaCsp ?? [];
   const scriptBaseUrl = documentBaseUrl(url, docScan.baseHref);
   const preloadSeeds = modulePreloadSeeds(docScan.modulePreloads, scriptBaseUrl);
   target.wheelTeardownDepth += 1;
@@ -2019,7 +2038,7 @@ async function pushNavigateToPageScriptInner(
   let scriptBundle: ScriptBundle | null = null;
   let wasmBake: WasmBake | null = null;
   try {
-    const raw = target.docScan ? docScan.scripts : extractScriptDescriptorsFromDom(target.dom);
+    const raw = scannedDocument ? docScan.scripts : extractScriptDescriptorsFromDom(target.dom);
     const preNav: ParentScriptDescriptor[] = [];
     if (ctx.browser.preNavScripts.size > 0) {
       for (const source of ctx.browser.preNavScripts.values()) {
@@ -2349,7 +2368,7 @@ async function pushNavigateToPageScriptInner(
             referrerPolicy: target.docReferrerPolicy ?? null,
             referrer: target.docReferrer ?? null,
             csp: target.docCsp ? [target.docCsp] : [],
-            metaCsp: target.docScan?.metaCsp ?? [],
+            metaCsp,
           },
           attributionHeaders: ctx.browser.attributionHeaders,
           mainLoaderId: target.loaderId,
@@ -2461,7 +2480,7 @@ async function pushNavigateToPageScriptInner(
         scriptPolicy: {
           cspHeaders: target.docCsp ? [target.docCsp] : [],
           cspReportOnlyHeaders: target.docCspReportOnly ? [target.docCspReportOnly] : [],
-          metaCsp: target.docScan?.metaCsp ?? [],
+          metaCsp,
         },
         bindingNames:
           ctx.browser.pendingBindings.size > 0
@@ -3334,8 +3353,14 @@ function emitNavigationLifecycle(
   ctx: DispatchCtx,
   target: TargetState,
   sessionId: string | undefined,
+  scannedIframes?: DocScan["iframes"],
 ): void {
-  rebuildFrameTreeChildren(target, newChildFrameBudget());
+  const budget = newChildFrameBudget();
+  if (scannedIframes) {
+    discoverChildFramesFromScan(target, mainFrame(target), scannedIframes, budget);
+  } else if (target.dom) {
+    discoverChildFramesFor(target, mainFrame(target), target.dom, budget);
+  }
   const childFrames = [...target.frames.values()].filter(
     (frame) => frame.parentFrameId !== null && frame.lifecycle === "init",
   );
@@ -4195,24 +4220,15 @@ function teardownOopifStubForFrame(
   f.pageScriptSandbox = undefined;
 }
 
-function rebuildFrameTreeChildren(target: TargetState, budget: ChildFrameBudget): void {
-  if (target.docScan) {
-    discoverChildFramesFromScan(target, mainFrame(target), target.docScan, budget);
-    return;
-  }
-  if (!target.dom) return;
-  discoverChildFramesFor(target, mainFrame(target), target.dom, budget);
-}
-
 function discoverChildFramesFromScan(
   target: TargetState,
   parentFrame: FrameState,
-  scan: DocScan,
+  iframes: DocScan["iframes"],
   budget: ChildFrameBudget,
 ): FrameState[] {
   const baseUrl = frameBaseUrl(parentFrame, target.url);
   const registered: FrameState[] = [];
-  for (const ifr of scan.iframes) {
+  for (const ifr of iframes) {
     if (!admitChildFrame(budget, baseUrl)) break;
     const srcdoc = ifr.srcdoc ?? null;
     const resolvedUrl = childFrameUrl(ifr.src, srcdoc, baseUrl);

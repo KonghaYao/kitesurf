@@ -30,3 +30,33 @@ test("Page.setDocumentContent announces its frame commit", async ({ page, cdpSes
   expect(await page.evaluate(() => document.title)).toBe("Set");
   expect(events).toEqual(["frameStartedLoading", `frameNavigated:${A}`]);
 }, 120_000);
+
+test("an installed document keeps its frames and serves source to a late debugger", async ({
+  page,
+  cdpSession,
+}) => {
+  await page.goto(A, { waitUntil: "domcontentloaded" });
+  const { frameTree } = await cdpSession.send("Page.getFrameTree");
+  await cdpSession.send("Page.setDocumentContent", {
+    frameId: frameTree.frame.id,
+    html: `<!doctype html><iframe name="scannedChild" srcdoc="<p>child</p>"></iframe>
+      <script>globalThis.scanSourceMarker = 4803;</script>`,
+  });
+
+  const installed = await cdpSession.send("Page.getFrameTree");
+  expect(installed.frameTree.childFrames?.map(({ frame }) => frame.name)).toEqual(["scannedChild"]);
+  const scriptIds: string[] = [];
+  cdpSession.on("Debugger.scriptParsed", (script) => {
+    if (script.url === "/__ks_user_classic_regular.js") scriptIds.push(script.scriptId);
+  });
+  await cdpSession.send("Debugger.enable");
+  const [scriptId] = scriptIds;
+  if (scriptId === undefined) throw new Error("Debugger did not announce the classic bundle");
+  const source = await cdpSession.send("Debugger.getScriptSource", { scriptId });
+  expect(source.scriptSource).toContain("globalThis.scanSourceMarker = 4803;");
+  const evaluated = await cdpSession.send("Runtime.evaluate", {
+    expression: "globalThis.scanSourceMarker",
+    returnByValue: true,
+  });
+  expect(evaluated.result.value).toBe(4803);
+}, 120_000);

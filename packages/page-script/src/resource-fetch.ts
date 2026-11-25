@@ -10,6 +10,7 @@ import {
   KITESURF_NOSNIFF_HEADER,
   responseIsOpaque,
 } from "@kitesurf/script-gate/gateway-headers";
+import type { StylesheetDispatchAck } from "@kitesurf/jsrpc-types/page-script";
 import { __setBridgeFetchResource, DomHandle } from "./wasm-glue.js";
 import {
   CLASS_IMAGE_VIEWPORT,
@@ -112,14 +113,14 @@ export function externalSheetRulesForNode(
   nodeId: number,
 ): { state: "clean"; text: string } | { state: "denied" } | { state: "pending" } {
   const dom = state.dom as {
-    nodeInfo?: (id: number) => { attributes?: unknown[] } | null;
+    attributeList?: (id: number) => { attributes?: unknown[] } | null;
     baseURL?: () => string;
   } | null;
-  if (!dom?.nodeInfo) return { state: "pending" };
+  if (!dom?.attributeList) return { state: "pending" };
 
   let href = "";
   try {
-    const attrs = dom.nodeInfo(nodeId)?.attributes;
+    const attrs = dom.attributeList(nodeId)?.attributes;
     if (Array.isArray(attrs)) {
       for (
         let i = 0;
@@ -255,6 +256,50 @@ export function getStylesheetDeliverySeq(): number {
   return stylesheetDeliverySeq;
 }
 
+let capturingParserResources: InitialParserResources | undefined;
+
+// Only the synchronous DOM constructor can nominate the first parser stylesheet. If
+// navigation yields to dispatch it, keep resource delivery and other egress behind the shim.
+export class InitialParserResources {
+  dispatched: Promise<boolean> | undefined;
+  readyForDelivery: Promise<void> | undefined;
+  private releaseDelivery: (() => void) | undefined;
+
+  capture<T>(parse: () => T): T {
+    capturingParserResources = this;
+    try {
+      return parse();
+    } finally {
+      capturingParserResources = undefined;
+    }
+  }
+
+  claimStylesheet(): { acknowledge: StylesheetDispatchAck; settled: () => void } | undefined {
+    if (this.dispatched) return undefined;
+    let finish!: (sent: boolean) => void;
+    this.dispatched = new NativePromise<boolean>((resolve) => {
+      finish = resolve;
+    });
+    this.readyForDelivery = new NativePromise<void>((resolve) => {
+      this.releaseDelivery = resolve;
+    });
+    return {
+      acknowledge: async () => finish(true),
+      settled: () => finish(false),
+    };
+  }
+
+  release(): void {
+    this.releaseDelivery?.();
+    this.releaseDelivery = undefined;
+    this.readyForDelivery = undefined;
+  }
+
+  [Symbol.dispose](): void {
+    this.release();
+  }
+}
+
 const fetchPhaseStats = {
   count: 0,
   errors: 0,
@@ -354,15 +399,15 @@ export function blockingInflightCount(): number {
 function collectImageHints(url: string): Array<{ priority: string; lazy: boolean }> | null {
   const dom = state.dom as {
     pendingImageNodes?: (url: string) => ArrayLike<number>;
-    nodeInfo?: (id: number) => { attributes?: unknown[] } | null;
+    attributeList?: (id: number) => { attributes?: unknown[] } | null;
   } | null;
-  if (!dom?.pendingImageNodes || !dom.nodeInfo) return null;
+  if (!dom?.pendingImageNodes || !dom.attributeList) return null;
   const hints: Array<{ priority: string; lazy: boolean }> = [];
   try {
     for (const id of Array.from(dom.pendingImageNodes(url))) {
       let priority = "";
       let lazy = false;
-      const attrs = dom.nodeInfo(id)?.attributes;
+      const attrs = dom.attributeList(id)?.attributes;
       if (!Array.isArray(attrs)) {
         hints.push({ priority, lazy });
         continue;
@@ -408,10 +453,10 @@ let iframeDocumentHints = new Map<string, { lazy: boolean; crossOrigin: boolean 
 function iframeDocumentHint(url: string): { lazy: boolean; crossOrigin: boolean } | null {
   const dom = state.dom as {
     querySelectorAll?: (selector: string) => ArrayLike<number>;
-    nodeInfo?: (id: number) => { attributes?: unknown[] } | null;
+    attributeList?: (id: number) => { attributes?: unknown[] } | null;
     baseURL?: () => string;
   } | null;
-  if (!dom?.querySelectorAll || !dom.nodeInfo) return null;
+  if (!dom?.querySelectorAll || !dom.attributeList) return null;
   const seq = getInternalState().mutationSeq | 0;
   if (dom === iframeDocumentHintDom && seq === iframeDocumentHintSeq) {
     return iframeDocumentHints.get(url) ?? null;
@@ -421,7 +466,7 @@ function iframeDocumentHint(url: string): { lazy: boolean; crossOrigin: boolean 
     const base = dom.baseURL?.() || "about:blank";
     const baseOrigin = new URL(base).origin;
     for (const id of Array.from(dom.querySelectorAll("iframe"))) {
-      const attrs = dom.nodeInfo(id)?.attributes;
+      const attrs = dom.attributeList(id)?.attributes;
       if (!Array.isArray(attrs)) continue;
       let src = "";
       let lazy = false;
@@ -460,8 +505,14 @@ function iframeDocumentHint(url: string): { lazy: boolean; crossOrigin: boolean 
   return hints.get(url) ?? null;
 }
 
-async function acquireFetchSlot(url: string, kind: string): Promise<void> {
+async function acquireFetchSlot(
+  url: string,
+  kind: string,
+  initialResources?: InitialParserResources,
+): Promise<void> {
   await NativePromise.resolve();
+  const hold = initialResources?.readyForDelivery;
+  if (kind !== "Stylesheet" && hold) await hold;
   let resourceClass = classForKind(kind);
   if (kind === "Image") {
     const hints = collectImageHints(url);
@@ -580,9 +631,15 @@ const inflightFetches = new Map<string, SharedFetch>();
 const nativeDeliverResource = DomHandle.prototype.deliverResource;
 const nativeDeliverFontResource = DomHandle.prototype.deliverFontResource;
 
-async function doRealFetch(url: string, kind: string, corsMode: string = ""): Promise<FetchResult> {
+async function doRealFetch(
+  url: string,
+  kind: string,
+  corsMode = "",
+  initialResources?: InitialParserResources,
+  onStylesheetDispatch?: StylesheetDispatchAck,
+): Promise<FetchResult> {
   const queuedAt = Date.now();
-  await acquireFetchSlot(url, kind);
+  await acquireFetchSlot(url, kind, initialResources);
   const slotStartedAt = Date.now();
   let released = false;
   const release = (): void => {
@@ -609,7 +666,7 @@ async function doRealFetch(url: string, kind: string, corsMode: string = ""): Pr
     const response = await trustedFetch(
       url,
       { headers },
-      { resourceType: kind || "Other", initiator: "parser" },
+      { resourceType: kind || "Other", initiator: "parser", onStylesheetDispatch },
     );
     // Release at response headers so body reads do not hold admission capacity.
     release();
@@ -761,6 +818,7 @@ export async function fetchResource(
   kind: string,
   corsMode: string = "",
 ): Promise<void> {
+  const initialResources = capturingParserResources;
   if (kind === "Font" && fontDeferActive() && !fontDemandFired()) {
     parkedFonts.push({ id, url, corsMode });
     try {
@@ -771,6 +829,8 @@ export async function fetchResource(
   let blocksLoad = true;
   if (kind === "Document") {
     await NativePromise.resolve();
+    const hold = initialResources?.readyForDelivery;
+    if (hold) await hold;
     const hint = iframeDocumentHint(url);
     if (hint === null || hint.crossOrigin) {
       try {
@@ -828,13 +888,22 @@ export async function fetchResource(
     const coalesceKey = `${corsMode}\n${url}`;
     let shared = mapGet(inflightFetches, coalesceKey);
     if (!shared) {
+      const firstStylesheet =
+        kind === "Stylesheet" ? initialResources?.claimStylesheet() : undefined;
       // The stored record exposes only a void completion promise; the result stays in this
       // private closure until a waiter has awaited it.
       const entry: SharedFetch = { done: null, result: undefined };
       entry.done = (async () => {
         try {
-          entry.result = await doRealFetch(url, kind, corsMode);
+          entry.result = await doRealFetch(
+            url,
+            kind,
+            corsMode,
+            initialResources,
+            firstStylesheet?.acknowledge,
+          );
         } finally {
+          firstStylesheet?.settled();
           if (mapGet(inflightFetches, coalesceKey) === entry) {
             mapDelete(inflightFetches, coalesceKey);
           }
@@ -851,6 +920,8 @@ export async function fetchResource(
 
     if (!shared.done) throw new Error("missing resource completion");
     await shared.done;
+    const hold = initialResources?.readyForDelivery;
+    if (hold) await hold;
     const result = shared.result;
     if (!result) throw new Error("missing resource result");
     if (!result.ok) {
@@ -943,6 +1014,8 @@ export async function fetchResource(
       if (pending) await pending;
     }
   } catch {
+    const hold = initialResources?.readyForDelivery;
+    if (hold) await hold;
     const pending = runPageTaskWhenUnpaused(reportError);
     if (pending) await pending;
   } finally {

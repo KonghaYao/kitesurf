@@ -163,7 +163,14 @@ test("other startup inputs survive generation and reach the probe", () => {
     cdpDebug: true,
     fontProfile: "macos",
     scriptDescriptors: [
-      { src: "/app.js", kind: "classic", body: "body", prefetchedSource: "source" },
+      {
+        src: "/app.js",
+        kind: "classic",
+        defer: true,
+        async: false,
+        body: "a😀b",
+        prefetchedSource: "source",
+      },
     ],
   };
   const generated = startupExports(startupModule(input));
@@ -174,14 +181,58 @@ test("other startup inputs survive generation and reach the probe", () => {
   assert.equal(generated.referrer, input.referrer);
   assert.equal(generated.cdpDebug, true);
   assert.equal(generated.fontProfile, "macos");
-  // The descriptors come from the generated module's realm, so compare them as plain JSON.
-  assert.deepEqual(JSON.parse(JSON.stringify(generated.scriptDescriptors)), [
-    { src: "/app.js", kind: "classic", body: "body", prefetchedLength: 6 },
-  ]);
-
   const snapshot = startupSnapshot(generated);
   assert.equal(snapshot.url, input.url);
   assert.equal(snapshot.hasCookies, true);
   assert.equal(snapshot.scriptDescriptorCount, 1);
-  assert.equal(snapshot.scriptDescriptorSample[0].prefetchedLen, 6);
+  assert.deepEqual(JSON.parse(JSON.stringify(snapshot.scriptDescriptorSample)), [
+    {
+      src: "/app.js",
+      kind: "classic",
+      defer: true,
+      async: false,
+      bodyLen: 4,
+      prefetchedLen: 6,
+      prefetchError: null,
+    },
+  ]);
+});
+
+test("startup input omits script source and bounds diagnostics to the first five scripts", () => {
+  const marker = "STARTUP_SCRIPT_PAYLOAD_MARKER";
+  const descriptors = (payloadLength) => {
+    const payload = marker + "x".repeat(payloadLength - marker.length);
+    return Array.from({ length: 8 }, (_, index) => ({
+      src: index === 0 ? null : `/script-${index}.js`,
+      kind: "classic",
+      defer: false,
+      async: false,
+      body: index === 0 ? payload : "",
+      ...(index === 1 ? { prefetchedSource: payload } : {}),
+      ...(index === 2 ? { prefetchError: "failed to fetch" } : {}),
+    }));
+  };
+
+  for (const cdpDebug of [false, true]) {
+    const small = startupModule({ cdpDebug, scriptDescriptors: descriptors(100000) });
+    const large = startupModule({ cdpDebug, scriptDescriptors: descriptors(900000) });
+    assert.equal(small.length, large.length);
+    assert.equal(large.includes(marker), false);
+    const generated = startupExports(large);
+    assert.equal(Object.hasOwn(generated, "scriptDescriptors"), false);
+
+    const snapshot = startupSnapshot(generated);
+    assert.equal(snapshot.scriptDescriptorCount, 8);
+    const sample = JSON.parse(JSON.stringify(snapshot.scriptDescriptorSample));
+    assert.equal(sample.length, cdpDebug ? 5 : 0);
+    if (cdpDebug) {
+      assert.deepEqual(
+        sample.map(({ src }) => src),
+        [null, "/script-1.js", "/script-2.js", "/script-3.js", "/script-4.js"],
+      );
+      assert.equal(sample[0].bodyLen, 900000);
+      assert.equal(sample[1].prefetchedLen, 900000);
+      assert.equal(sample[2].prefetchError, "failed to fetch");
+    }
+  }
 });

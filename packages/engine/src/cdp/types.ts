@@ -193,7 +193,7 @@ export interface ScreencastState {
   framesDropped: number;
 }
 
-import type { DomHandle, DocScan } from "../wasm.ts";
+import type { DomHandle } from "../wasm.ts";
 import type { PageScriptStub, PageIsolateCapOverrides } from "../eval/page-script.ts";
 import type { PageSession } from "./page-session.ts";
 import type { CookieJar } from "../cookies.ts";
@@ -312,7 +312,6 @@ export interface TargetState {
   // must fail rather than report an empty page.
   fallbackHtmlReleased: boolean;
   dom: DomHandle | null;
-  docScan: DocScan | null;
   domEpoch: number;
   loaderId: string;
   frameId: string;
