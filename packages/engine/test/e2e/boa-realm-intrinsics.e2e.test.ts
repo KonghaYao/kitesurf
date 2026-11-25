@@ -91,3 +91,56 @@ test("an intrinsic stored on a bridged object keeps its boa identity", async ({ 
     }),
   ).toBe(true);
 });
+
+test("Web IDL value iterables retain each script realm's Array methods", async ({ page }) => {
+  await setContent(
+    page,
+    `<script>
+    const keys = ["entries", "keys", "values", "forEach", Symbol.iterator];
+    const prototypes = [CSSUnparsedValue, CSSNumericArray, CSSTransformValue].map(C => C.prototype);
+    window.pageIdentities = prototypes.every(p => keys.every(k => p[k] === Array.prototype[k]));
+    window.isPageValues = f => f === Array.prototype.values;
+    window.pageMethod = () => "from page";
+    CSSNumericArray.prototype.keys = window.pageMethod;
+  <\/script>`,
+    { waitUntil: "domcontentloaded" },
+  );
+
+  const result = await page.evaluate(() => {
+    const g = globalThis as any;
+    const p = g.CSSUnparsedValue.prototype;
+    const array = Array.prototype as any;
+    const descriptors = ["entries", "keys", "values", "forEach", Symbol.iterator].map((key) => {
+      const d = Object.getOwnPropertyDescriptor(p, key);
+      return (
+        !!d &&
+        d.value === array[key] &&
+        d.value === p[key] &&
+        d.writable &&
+        d.configurable &&
+        d.enumerable === (typeof key === "string")
+      );
+    });
+    const remembered = array.values;
+    array.values = () => "replacement";
+    const stillIntrinsic = p.values === remembered && p.values !== array.values;
+    array.values = remembered;
+    const ownKeys = g.CSSNumericArray.prototype.keys;
+    return {
+      native: g.pageIdentities,
+      descriptors,
+      stillIntrinsic,
+      roundTrip: g.isPageValues(remembered),
+      override: ownKeys(),
+      values: [...new g.CSSUnparsedValue(["a", "b"])],
+    };
+  });
+  expect(result).toEqual({
+    native: true,
+    descriptors: [true, true, true, true, true],
+    stillIntrinsic: true,
+    roundTrip: true,
+    override: "from page",
+    values: ["a", "b"],
+  });
+});

@@ -291,7 +291,49 @@ const isFormOwnMember = (name: string): boolean => {
 const isArrayIndex = (name: string): boolean =>
   /^(?:0|[1-9]\d*)$/.test(name) && Number(name) < 4294967295;
 
+// These prototypes historically expose even their non-IDL string members as enumerable.
+const legacyEnumerableInterfaces = new Set<InterfaceClass>([
+  NodeBase,
+  Element,
+  HTMLElement,
+  CharacterDataNode,
+  DocumentTypeNode,
+  DocumentImpl,
+  DocumentFragmentImpl,
+  HTMLInputElement,
+  HTMLTextAreaElement,
+  HTMLSelectElement,
+  HTMLOptionElement,
+  HTMLOptGroupElement,
+  HTMLButtonElement,
+  HTMLLabelElement,
+  HTMLFieldSetElement,
+  HTMLOutputElement,
+  HTMLProgressElement,
+  HTMLMeterElement,
+  HTMLFormElement,
+  HTMLAnchorElement,
+  HTMLAreaElement,
+  HTMLImageElement,
+  HTMLLinkElement,
+  HTMLScriptElement,
+  HTMLMetaElement,
+  HTMLStyleElement,
+  HTMLBaseElement,
+  HTMLTableElement,
+  HTMLTableRowElement,
+  HTMLTableSectionElement,
+  HTMLTitleElement,
+  HTMLDetailsElement,
+  HTMLDialogElement,
+]);
+
+type InterfaceClass = { readonly prototype: object };
+let documentBuildStarted = false;
+
 const buildDocumentBody = function buildDocument(dom: DomHandle, opts: BuildDocumentOpts) {
+  const isFirstBuild = !documentBuildStarted;
+  documentBuildStarted = true;
   initState(dom, opts.pageUrl, opts.initialCookieString, opts);
   installDetachedWrapperHooks(dom);
   installCurrentScriptHook();
@@ -511,8 +553,6 @@ const buildDocumentBody = function buildDocument(dom: DomHandle, opts: BuildDocu
 
   installIdlHandlersOn(DocumentImpl.prototype);
 
-  // An interface class: what these helpers read off it.
-  type InterfaceClass = { readonly prototype: object };
   function installAsOwn(
     target: InterfaceClass | null | undefined,
     sourceProto: object | null | undefined,
@@ -571,42 +611,10 @@ const buildDocumentBody = function buildDocument(dom: DomHandle, opts: BuildDocu
       } catch {}
     }
   }
-  for (const cls of [
-    NodeBase,
-    Element,
-    HTMLElement,
-    CharacterDataNode,
-    DocumentTypeNode,
-    DocumentImpl,
-    DocumentFragmentImpl,
-    HTMLInputElement,
-    HTMLTextAreaElement,
-    HTMLSelectElement,
-    HTMLOptionElement,
-    HTMLOptGroupElement,
-    HTMLButtonElement,
-    HTMLLabelElement,
-    HTMLFieldSetElement,
-    HTMLOutputElement,
-    HTMLProgressElement,
-    HTMLMeterElement,
-    HTMLFormElement,
-    HTMLAnchorElement,
-    HTMLAreaElement,
-    HTMLImageElement,
-    HTMLLinkElement,
-    HTMLScriptElement,
-    HTMLMetaElement,
-    HTMLStyleElement,
-    HTMLBaseElement,
-    HTMLTableElement,
-    HTMLTableRowElement,
-    HTMLTableSectionElement,
-    HTMLTitleElement,
-    HTMLDetailsElement,
-    HTMLDialogElement,
-  ]) {
-    forceEnumerableProtoOwnProps(cls);
+  // A rebuild can run page callbacks when createModelContext aborts prior tool calls.
+  // Keep the early sweep in that case, before any callbacks can inspect the prototypes.
+  if (!isFirstBuild) {
+    for (const cls of legacyEnumerableInterfaces) forceEnumerableProtoOwnProps(cls);
   }
   if (!Object.prototype.hasOwnProperty.call(Element.prototype, "webkitMatchesSelector")) {
     Object.defineProperty(Element.prototype, "webkitMatchesSelector", {
@@ -664,10 +672,11 @@ const buildDocumentBody = function buildDocument(dom: DomHandle, opts: BuildDocu
   }
 
   const BRANDED_NODE = { brandOps: true, brandDuck: true, brandAttrs: true };
+  const LEGACY_NODE = isFirstBuild ? { ...BRANDED_NODE, enumerableInternal: true } : BRANDED_NODE;
   finalizeInterface(KsEventTarget, idlInterfaceMeta("EventTarget", { brandOps: true }));
-  finalizeInterface(NodeBase, idlInterfaceMeta("Node", BRANDED_NODE));
-  finalizeInterface(Element, idlInterfaceMeta("Element", BRANDED_NODE));
-  finalizeInterface(HTMLElement, idlInterfaceMeta("HTMLElement", BRANDED_NODE));
+  finalizeInterface(NodeBase, idlInterfaceMeta("Node", LEGACY_NODE));
+  finalizeInterface(Element, idlInterfaceMeta("Element", LEGACY_NODE));
+  finalizeInterface(HTMLElement, idlInterfaceMeta("HTMLElement", LEGACY_NODE));
   finalizeInterface(
     KsAnimationTimeline,
     idlInterfaceMeta("AnimationTimeline", { brandAttrs: true }),
@@ -698,7 +707,7 @@ const buildDocumentBody = function buildDocument(dom: DomHandle, opts: BuildDocu
   finalizeInterface(
     CharacterDataNode,
     idlInterfaceMeta("CharacterData", {
-      ...BRANDED_NODE,
+      ...LEGACY_NODE,
       strictInstance: true,
     }),
   );
@@ -710,16 +719,16 @@ const buildDocumentBody = function buildDocument(dom: DomHandle, opts: BuildDocu
   finalizeInterface(
     DocumentTypeNode,
     idlInterfaceMeta("DocumentType", {
-      ...BRANDED_NODE,
+      ...LEGACY_NODE,
       strictInstance: true,
     }),
   );
-  finalizeInterface(DocumentFragmentImpl, idlInterfaceMeta("DocumentFragment", BRANDED_NODE));
+  finalizeInterface(DocumentFragmentImpl, idlInterfaceMeta("DocumentFragment", LEGACY_NODE));
   finalizeInterface(ShadowRootImpl, idlInterfaceMeta("ShadowRoot", BRANDED_NODE));
   finalizeInterface(AttrCls, idlInterfaceMeta("Attr", { ...BRANDED_NODE, parent: NodeBase }));
   installIdlHandlersOn(DetachedDocument.prototype);
   finalizeInterface(DetachedDocument, idlInterfaceMeta("Document", BRANDED_NODE));
-  finalizeInterface(DocumentImpl, idlInterfaceMeta("Document", BRANDED_NODE));
+  finalizeInterface(DocumentImpl, idlInterfaceMeta("Document", LEGACY_NODE));
   finalizeInterface(XMLDocument, idlInterfaceMeta("XMLDocument"));
   finalizeInterface(
     DOMImplementationCls,
@@ -935,7 +944,11 @@ const buildDocumentBody = function buildDocument(dom: DomHandle, opts: BuildDocu
   for (const name of Object.keys(
     HTML_ELEMENT_INTERFACES,
   ) as (keyof typeof HTML_ELEMENT_INTERFACES)[]) {
-    finalizeInterface(HTML_ELEMENT_INTERFACES[name], idlInterfaceMeta(name, BRANDED_NODE));
+    const C = HTML_ELEMENT_INTERFACES[name];
+    finalizeInterface(
+      C,
+      idlInterfaceMeta(name, legacyEnumerableInterfaces.has(C) ? LEGACY_NODE : BRANDED_NODE),
+    );
   }
 
   installFastpath(document);

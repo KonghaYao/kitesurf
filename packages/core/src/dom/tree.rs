@@ -1415,6 +1415,16 @@ impl DomHandle {
         }
     }
 
+    /// Read the last raw DOM child without allocating handles for its siblings.
+    #[wasm_bindgen(js_name = "lastChildId")]
+    pub fn last_child_id(&self, node_id: u32) -> Option<u32> {
+        let internal_id = self.resolve_node_id(node_id)?;
+        let doc = self.doc.try_borrow().ok()?;
+        let child_id = doc.get_node(internal_id)?.children().last()?;
+        doc.get_node(child_id)?;
+        Some(self.external_node_id(child_id))
+    }
+
     #[wasm_bindgen(js_name = "parentId")]
     pub fn parent_id(&self, node_id: u32) -> i32 {
         let Some(internal_id) = self.resolve_node_id(node_id) else {

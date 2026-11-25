@@ -137,6 +137,8 @@ export type AdoptableNode = {
 
 // Above this many children, sibling walks reuse one built child list instead of rescanning ids.
 const MAX_UNLISTED_CHILD_SCAN = 32;
+const nativeObjectHasOwn = Object.hasOwn;
+const isDetachedDocumentHost = hostIdToDoc.has.bind(hostIdToDoc);
 
 // Repeated reads under one parent reuse the ids until a child list changes anywhere.
 let cachedChildIds: Uint32Array = new Uint32Array(0);
@@ -146,15 +148,14 @@ let cachedChildIdsSeq = -1;
 // Child ids of `parent` when one neighbour can be read without building and wrapping the whole
 // child list (prepend and insertBefore read ends and siblings of nodes never listed). Documents
 // keep their own list because it repositions the synthetic doctype.
-function unlistedChildIds(parent: NodeBase | DetachedDocument): Uint32Array | null {
-  if (
-    !(parent instanceof NodeBase) ||
-    parent._id < 0 ||
-    nodeListCache.has(parent) ||
-    parent.nodeType === DOCUMENT_NODE
-  ) {
-    return null;
+function isUnlistedChildParent(parent: NodeBase | DetachedDocument): parent is NodeBase {
+  if (!(parent instanceof NodeBase) || parent._id < 0 || nodeListCache.has(parent)) {
+    return false;
   }
+  return true;
+}
+
+function unlistedChildIds(parent: NodeBase): Uint32Array | null {
   const seq = ksState().childSeq | 0;
   if (cachedChildIdsParent !== parent._id || cachedChildIdsSeq !== seq) {
     cachedChildIds = dom.childIds(parent._id);
@@ -200,10 +201,31 @@ function ownChildArray(parent: NodeBase | DetachedDocument): ArrayLike<NodeBase>
   return get ? get() : list;
 }
 
+// 只读取元素的原始尾子节点；不可包装时返回 null，调用方继续走原有回退。
+function knownLastChild(node: NodeBase, nodeType: number): NodeBase | null {
+  if (nodeType !== ELEMENT_NODE) return null;
+  if (nativeObjectHasOwn(node, "nodeType")) return null;
+  if (typeof dom.lastChildId !== "function") return null;
+  const nodeId = node._id;
+  if (nodeId === 0 || isDetachedDocumentHost(nodeId)) return null;
+  const id = dom.lastChildId(nodeId);
+  if (id === undefined) return null;
+  return cache.get(id) || nodeFor(id);
+}
+
 function edgeChild(node: NodeBase, edge: "first" | "last"): NodeBase | null {
-  const ids = unlistedChildIds(node);
-  if (ids) {
-    return edge === "first" ? wrapperFrom(ids, 0, 1) : wrapperFrom(ids, ids.length - 1, -1);
+  if (isUnlistedChildParent(node)) {
+    const nodeType = node.nodeType;
+    if (nodeType !== DOCUMENT_NODE) {
+      // Appending needs one previous sibling for mutation events. Read the raw last child of an
+      // element without walking its siblings. If it cannot be wrapped, keep looking as before.
+      const child = edge === "last" ? knownLastChild(node, nodeType) : null;
+      if (child) return child;
+      const ids = unlistedChildIds(node);
+      if (ids) {
+        return edge === "first" ? wrapperFrom(ids, 0, 1) : wrapperFrom(ids, ids.length - 1, -1);
+      }
+    }
   }
   const kids = ownChildArray(node);
   if (kids.length === 0) return null;
@@ -215,7 +237,10 @@ function adjacentSibling(node: NodeBase, side: "next" | "previous"): NodeBase | 
   if (!parent) return null;
 
   const step = side === "next" ? 1 : -1;
-  const ids = node._id < 0 ? null : unlistedChildIds(parent);
+  const ids =
+    node._id < 0 || !isUnlistedChildParent(parent) || parent.nodeType === DOCUMENT_NODE
+      ? null
+      : unlistedChildIds(parent);
   if (ids) {
     const index = ids.indexOf(node._id);
     return index < 0 ? null : wrapperFrom(ids, index + step, step);
@@ -1233,7 +1258,9 @@ class NodeBase extends KsEventTarget implements Idl.Node {
       }
       dom.appendChildNode(this._id, child._id);
       bumpMutationSeq(undefined, true);
-      {
+      // Mutation hooks can create a range. Only copy the child ids if a live range needs them
+      // after those hooks finish.
+      if (hasLiveRanges()) {
         const newIdx = dom.childIds(this._id).length - 1;
         if (newIdx >= 0) rangeAfterInsert(this, newIdx, 1);
       }

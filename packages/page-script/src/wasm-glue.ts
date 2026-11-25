@@ -58,6 +58,7 @@ export declare function ks_cycle_stats(): string;
 export declare function ks_boa_force_collect(): string;
 export declare function ks_is_bridged(v: unknown): boolean;
 export declare function ks_bridge_buffer_bytes(v: unknown): Uint8Array | undefined;
+export declare function ks_bridge_capture_intrinsics(): void;
 export declare function ks_bridge_install_desc_helpers(
   data: (value: unknown, flags: number) => object,
   accessor: (get: unknown, set: unknown, flags: number) => object,

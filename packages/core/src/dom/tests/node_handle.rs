@@ -4,6 +4,28 @@
 
 use crate::{DomHandle, NodeHandleMap, NodeId};
 
+#[test]
+fn last_child_id_tracks_raw_children_and_live_handles() {
+    let dom = DomHandle::new(
+        "<p id='parent'><b></b>text<!--tail--></p>",
+        "https://example.test/",
+    );
+    let parent = dom.get_element_by_id("parent") as u32;
+    let children = dom.child_ids(parent);
+    assert_eq!(children.len(), 3);
+    assert_eq!(dom.last_child_id(parent), Some(children[2]));
+    assert!(dom.drop_node(children[2]));
+    assert_eq!(dom.last_child_id(parent), Some(children[1]));
+
+    let detached = dom.create_element("section");
+    assert_eq!(dom.last_child_id(detached), None);
+    assert!(dom.append_child_node(detached, children[1]));
+    assert_eq!(dom.last_child_id(parent), Some(children[0]));
+    assert_eq!(dom.last_child_id(detached), Some(children[1]));
+    assert!(dom.drop_node(detached));
+    assert_eq!(dom.last_child_id(detached), None);
+}
+
 /// Frees a node and its slot, as a script dropping it does; returns whether it
 /// was there.
 fn remove_and_drop(dom: &DomHandle, id: NodeId) -> bool {

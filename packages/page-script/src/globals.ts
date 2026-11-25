@@ -10,6 +10,7 @@ import type { BuildDocumentResult, ShimDocument, ShimNavigator, ShimWindow } fro
 import {
   ks_bridge_buffer_bytes,
   ks_bridge_ever_minted,
+  ks_bridge_capture_intrinsics,
   ks_eval_page,
   ks_import,
   ks_is_bridged,
@@ -1537,22 +1538,9 @@ export function installGlobals(
     ] as const satisfies readonly (keyof BuildDocumentResult)[]) {
       if (built[constructorName]) ksGlobalByKey[constructorName] = built[constructorName];
     }
-    ks_eval_page(`
-      for (const valueConstructor of [
-        CSSUnparsedValue,
-        CSSNumericArray,
-        CSSTransformValue,
-      ]) {
-        for (const name of ["entries", "keys", "values", "forEach"]) {
-          Object.defineProperty(valueConstructor.prototype, name, {
-            value: Array.prototype[name], writable: true, enumerable: true, configurable: true
-          });
-        }
-        Object.defineProperty(valueConstructor.prototype, Symbol.iterator, {
-          value: Array.prototype[Symbol.iterator], writable: true, enumerable: false, configurable: true
-        });
-      }
-    `);
+    // Keep native function identity in both realms without creating Boa on every navigation.
+    // Snapshot after installing the Window constructors and before the first page script.
+    ks_bridge_capture_intrinsics();
     if (built.AbstractRange) globalThis.AbstractRange = built.AbstractRange;
     if (built.Range) globalThis.Range = built.Range;
     if (built.StaticRange) globalThis.StaticRange = built.StaticRange;

@@ -88,6 +88,11 @@ pub fn ks_is_bridged(v: JsValue) -> bool {
     super::boa_bridge::is_our_wrapper(&v)
 }
 
+#[wasm_bindgen]
+pub fn ks_bridge_capture_intrinsics() {
+    super::boa_bridge::capture_v8_intrinsics();
+}
+
 // Installed once at startup by page-script; the bridge falls back to building
 // descriptors field by field when they are absent (the parent engine's instance).
 #[wasm_bindgen]

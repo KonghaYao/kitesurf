@@ -18,6 +18,7 @@ export interface InterfaceMeta {
   brandOps?: boolean;
   brandAttrs?: boolean;
   brandDuck?: boolean;
+  enumerableInternal?: boolean;
   parent?: InterfaceObject;
   strictInstance?: boolean;
   promiseOps?: string[];
@@ -37,6 +38,7 @@ const FINALIZED_NAME = Symbol("ks-finalized-name");
 
 const isProtoOf = Object.prototype.isPrototypeOf;
 const hasOwn = Object.prototype.hasOwnProperty;
+const isEnumerable = Object.prototype.propertyIsEnumerable;
 
 function makeBrandCheck(proto: object, duck: boolean | undefined): (v: unknown) => boolean {
   // isPrototypeOf answers false for a primitive, so `v != null` keeps
@@ -55,6 +57,7 @@ function brandWrapOp(
   required: number | undefined,
   check: (v: unknown) => boolean,
   promiseReturning?: boolean,
+  length = fn.length,
 ): Function {
   if (isBrandWrapped(fn)) return fn;
   const wrapped = function (this: unknown) {
@@ -83,7 +86,7 @@ function brandWrapOp(
     configurable: true,
   });
   Object.defineProperty(wrapped, "length", {
-    value: fn.length,
+    value: length,
     writable: false,
     enumerable: false,
     configurable: true,
@@ -173,18 +176,34 @@ export function finalizeInterface(C: InterfaceObject, meta: InterfaceMeta): void
     });
   }
   const check = makeBrandCheck(proto, meta.brandDuck);
+  const methodLengths = meta.methodLengths;
+  let existingMethods: Map<string, Function> | undefined;
   for (const key of Object.getOwnPropertyNames(proto)) {
-    if (key === "constructor" || key.startsWith("_")) continue;
     const d = Object.getOwnPropertyDescriptor(proto, key);
-    if (!d || !d.configurable) continue;
+    if (!d) continue;
+    const method = typeof d.value === "function" ? d.value : undefined;
+    const hasLength = !!method && !!methodLengths && isEnumerable.call(methodLengths, key);
+    const canFinalize = d.configurable && key !== "constructor" && !key.startsWith("_");
+    const wrap = canFinalize && method && meta.brandOps && !isBrandWrapped(method);
+    if (method && hasLength && !wrap) {
+      (existingMethods ??= new Map()).set(key, method);
+    }
+    if (!canFinalize) {
+      if (meta.enumerableInternal && d.configurable && !d.enumerable && key.startsWith("_")) {
+        d.enumerable = true;
+        Object.defineProperty(proto, key, d);
+      }
+      continue;
+    }
     let changed = !d.enumerable;
     d.enumerable = true;
-    if (meta.brandOps && typeof d.value === "function" && !isBrandWrapped(d.value)) {
+    if (wrap) {
       d.value = brandWrapOp(
-        d.value,
-        meta.methodLengths ? meta.methodLengths[key] : undefined,
+        method,
+        methodLengths?.[key],
         check,
-        meta.promiseOps ? meta.promiseOps.includes(key) : false,
+        meta.promiseOps?.includes(key),
+        hasLength ? methodLengths?.[key] : undefined,
       );
       changed = true;
     }
@@ -223,12 +242,13 @@ export function finalizeInterface(C: InterfaceObject, meta: InterfaceMeta): void
     it.enumerable = false;
     Object.defineProperty(proto, Symbol.iterator, it);
   }
-  if (meta.methodLengths) {
-    for (const m of Object.keys(meta.methodLengths)) {
-      const d = Object.getOwnPropertyDescriptor(proto, m);
-      if (d && typeof d.value === "function") {
-        redefine(d.value, "length", {
-          value: meta.methodLengths[m],
+  if (existingMethods && methodLengths) {
+    // Aliases of an existing function still resolve in metadata order.
+    for (const name of Object.keys(methodLengths)) {
+      const method = existingMethods.get(name);
+      if (method) {
+        redefine(method, "length", {
+          value: methodLengths[name],
           writable: false,
           enumerable: false,
           configurable: true,
@@ -240,17 +260,19 @@ export function finalizeInterface(C: InterfaceObject, meta: InterfaceMeta): void
     for (const name of Object.keys(meta.staticMethodLengths)) {
       const d = Object.getOwnPropertyDescriptor(C, name);
       if (!d || typeof d.value !== "function" || !d.configurable) continue;
-      if (!isBrandWrapped(d.value)) {
-        d.value = brandWrapOp(d.value, meta.staticMethodLengths[name], () => true, false);
-      }
+      const length = meta.staticMethodLengths[name];
+      const wrap = !isBrandWrapped(d.value);
+      if (wrap) d.value = brandWrapOp(d.value, length, () => true, false, length);
       d.enumerable = true;
       Object.defineProperty(C, name, d);
-      redefine(d.value, "length", {
-        value: meta.staticMethodLengths[name],
-        writable: false,
-        enumerable: false,
-        configurable: true,
-      });
+      if (!wrap) {
+        redefine(d.value, "length", {
+          value: length,
+          writable: false,
+          enumerable: false,
+          configurable: true,
+        });
+      }
     }
   }
 }

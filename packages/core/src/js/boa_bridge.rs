@@ -1208,13 +1208,63 @@ fn v8_intrinsic(name: &str) -> Option<JsValue> {
     v.is_function().then_some(v)
 }
 
-fn v8_intrinsic_ctor_name(v: &JsValue) -> Option<&'static str> {
-    // Every name is a constructor, so only a function can match.
+// Web IDL value iterables use the realm's Array methods, including values for @@iterator.
+// Capture the native functions before a page can replace them. No Boa context is needed here.
+const ARRAY_ITERABLE_KEYS: [&str; 4] = ["entries", "keys", "values", "forEach"];
+
+struct BoaArrayMethods([JsObject; 4]);
+impl boa_engine::gc::Finalize for BoaArrayMethods {}
+// SAFETY: all four function objects are traced with their owning realm.
+unsafe impl boa_engine::gc::Trace for BoaArrayMethods {
+    boa_engine::gc::custom_trace!(this, mark, {
+        for method in &this.0 {
+            mark(method);
+        }
+    });
+}
+impl boa_engine::JsData for BoaArrayMethods {}
+
+fn capture_boa_array_methods(ctx: &mut Context) {
+    let proto = ctx.intrinsics().constructors().array().prototype();
+    let methods = ARRAY_ITERABLE_KEYS.map(|key| {
+        proto
+            .get(JsString::from(key), ctx)
+            .expect("fresh Array prototype")
+            .as_object()
+            .expect("intrinsic Array method")
+    });
+    ctx.realm()
+        .host_defined_mut()
+        .insert(BoaArrayMethods(methods));
+}
+
+fn boa_intrinsic_for_v8(v: &JsValue, ctx: &Context) -> Option<JsObject> {
     if !v.is_function() {
         return None;
     }
-    let i = v8_intrinsics().by_fn.get(v).as_f64()?;
-    INTRINSIC_CTOR_NAMES.get(i as usize).copied()
+    let i = v8_intrinsics().by_fn.get(v).as_f64()? as usize;
+    if let Some(name) = INTRINSIC_CTOR_NAMES.get(i) {
+        return boa_intrinsic_ctor(name, ctx);
+    }
+    ctx.realm()
+        .host_defined()
+        .get::<BoaArrayMethods>()?
+        .0
+        .get(i - INTRINSIC_CTOR_NAMES.len())
+        .cloned()
+}
+
+fn v8_intrinsic_for_boa(o: &JsObject, ctx: &Context) -> Option<JsValue> {
+    if let Some(name) = boa_intrinsic_ctor_name(o, ctx) {
+        return v8_intrinsic(name);
+    }
+    let data = ctx.realm().host_defined();
+    let i = data
+        .get::<BoaArrayMethods>()?
+        .0
+        .iter()
+        .position(|method| JsObject::equals(o, method))?;
+    v8_intrinsics().array_methods[i].clone()
 }
 
 thread_local! {
@@ -1272,7 +1322,8 @@ fn v8_key(key: &str) -> JsValue {
 struct V8Intrinsics {
     // Indexed like INTRINSIC_CTOR_NAMES.
     ctors: Vec<Option<JsValue>>,
-    // Constructor identity -> index in INTRINSIC_CTOR_NAMES. globals.ts swaps
+    array_methods: [Option<JsValue>; ARRAY_ITERABLE_KEYS.len()],
+    // Constructor identity -> constructor index, followed by ARRAY_ITERABLE_KEYS. globals.ts swaps
     // globalThis.Function for a wrapper, so this also holds the realm's real Function, which
     // page code reaches through the wrapper (`fn.constructor`).
     by_fn: js_sys::Map,
@@ -1322,6 +1373,16 @@ fn v8_intrinsics() -> Rc<V8Intrinsics> {
             Some(v)
         })
         .collect();
+    let array_proto = v8_builtin_prototype("Array");
+    let array_methods = ARRAY_ITERABLE_KEYS.map(|key| own_data_value(array_proto.as_ref()?, key));
+    for (i, method) in array_methods.iter().enumerate() {
+        if let Some(method) = method {
+            by_fn.set(
+                method,
+                &JsValue::from((INTRINSIC_CTOR_NAMES.len() + i) as u32),
+            );
+        }
+    }
     let by_proto = js_sys::Map::new();
     for (i, ctor) in ctors.iter().enumerate() {
         let Some(proto) = ctor.as_ref().and_then(|c| own_data_value(c, "prototype")) else {
@@ -1346,10 +1407,15 @@ fn v8_intrinsics() -> Rc<V8Intrinsics> {
     }
     let snapshot = Rc::new(V8Intrinsics {
         ctors,
+        array_methods,
         by_fn,
         by_proto,
     });
     V8_INTRINSICS.with(|c| c.borrow_mut().get_or_insert(snapshot).clone())
+}
+
+pub(crate) fn capture_v8_intrinsics() {
+    v8_intrinsics();
 }
 
 fn boa_intrinsic_ctor(name: &str, ctx: &Context) -> Option<JsObject> {
@@ -1871,10 +1937,8 @@ fn v8_object_to_boa(v: JsValue, ctx: &mut Context) -> BoaValue {
             return o.into();
         }
     }
-    if let Some(name) = v8_intrinsic_ctor_name(&v) {
-        if let Some(o) = boa_intrinsic_ctor(name, ctx) {
-            return o.into();
-        }
+    if let Some(o) = boa_intrinsic_for_v8(&v, ctx) {
+        return o.into();
     }
     if v.is_function() {
         // Function.prototype is callable, so the identity check has to precede the proxy: a
@@ -1985,7 +2049,7 @@ pub(crate) fn boa_to_v8(v: &BoaValue, ctx: &mut Context) -> JsValue {
                 return get_v8(n);
             }
             if o.is_callable() {
-                if let Some(v8) = boa_intrinsic_ctor_name(o, ctx).and_then(v8_intrinsic) {
+                if let Some(v8) = v8_intrinsic_for_boa(o, ctx) {
                     return v8;
                 }
             }
@@ -2031,10 +2095,8 @@ fn v8_property_to_boa(
         }
     }
     if value.is_function() {
-        if let Some(name) = v8_intrinsic_ctor_name(&value) {
-            if let Some(object) = boa_intrinsic_ctor(name, ctx) {
-                return object.into();
-            }
+        if let Some(object) = boa_intrinsic_for_v8(&value, ctx) {
+            return object.into();
         }
         // Intrinsic prototypes cross as plain property values too (`fn.prototype`, a descriptor
         // value), and Function.prototype is callable, so the identity check must precede the
@@ -3090,7 +3152,7 @@ fn shim_get(target: JsValue, key: JsValue, recv: JsValue) -> JsValue {
                     if let Some(h) = bridged_v8_handle(&fobj, ctx) {
                         return get_v8(h);
                     }
-                    match boa_intrinsic_ctor_name(&fobj, ctx).and_then(v8_intrinsic) {
+                    match v8_intrinsic_for_boa(&fobj, ctx) {
                         Some(v8) => v8,
                         None if inherited => boa_to_v8(&bv, ctx),
                         None if fobj.is_constructor() => boa_to_v8(&bv, ctx),
@@ -4127,6 +4189,7 @@ fn live_export_resolve(
 }
 
 pub(crate) fn install_global_bridge(ctx: &mut Context) {
+    capture_boa_array_methods(ctx);
     capture_symbol_builtins(ctx);
     boa_engine::module::set_live_resolve_hook(live_export_resolve);
     let handle = pin(js_sys::global().into());
@@ -4135,6 +4198,7 @@ pub(crate) fn install_global_bridge(ctx: &mut Context) {
 }
 
 pub(crate) fn install_realm_bridge(v8_global: JsValue, ctx: &mut Context) -> u64 {
+    capture_boa_array_methods(ctx);
     let handle = pin(v8_global);
     let proxy = make_v8_proxy(handle, None, false, ctx);
     let global = ctx.global_object();

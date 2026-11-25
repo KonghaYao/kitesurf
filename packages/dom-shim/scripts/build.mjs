@@ -64,9 +64,10 @@ async function run() {
 
   {
     const raw = await readFile(BUNDLE_OUT, "utf8");
+    // Vite has already renamed identifiers and preserved their original runtime names.
     const minified = await esbuildTransform(raw, {
-      minify: true,
-      keepNames: true,
+      minifyWhitespace: true,
+      minifySyntax: true,
       target: "esnext",
       format: "esm",
       legalComments: "none",
