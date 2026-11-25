@@ -2,7 +2,7 @@ name: Release local browser
 
 on:
   push:
-    tags: ["v0.5.*"]
+    tags: ["v0.*"]
   workflow_dispatch:
 
 permissions:
@@ -112,6 +112,7 @@ jobs:
           # unit suite and the embedded bundle page discard until it is fixed.
           bazel test --test_output=errors \
             //packages/engine:vitest \
+            //packages/core:host_tests \
             //packages/local-browser/native:bundle_test
       # The legacy Node host is the v0.5.0 compatibility reference. The upstream engine merge
       # changed its storage/profile contract; the native host's engine_loss and font tests cover

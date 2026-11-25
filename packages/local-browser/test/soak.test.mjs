@@ -38,7 +38,7 @@ async function startNativeBrowser(directory) {
   });
   const options = { cwd: directory, env };
   const cli = async (...args) => (await exec(binary, args, { ...options, timeout: 30_000 })).stdout;
-  assert.equal(await cli("--version"), "kitesurf 0.5.5\n", "use the Rust release executable");
+  assert.equal(await cli("--version"), "kitesurf 0.6.0\n", "use the Rust release executable");
   const child = spawn(binary, ["serve", "--port", "0", "--allow-private-network"], {
     ...options,
     detached: true,

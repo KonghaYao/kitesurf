@@ -18,7 +18,7 @@ import { startBrowser } from "../src/server.mjs";
 import { required, startNativeHost, waitFor } from "./host-adapter.mjs";
 
 const kind = process.env.KITESURF_BROKER_KIND || "native";
-const expectedVersion = kind === "node" ? "0.5.0" : "0.5.5";
+const expectedVersion = kind === "node" ? "0.5.0" : "0.6.0";
 const engine = resolve(import.meta.dirname, "../../engine");
 const dist = process.env.KITESURF_TEST_DIST || join(engine, "local_dist");
 const assets = process.env.KITESURF_TEST_ASSETS || join(engine, "public");

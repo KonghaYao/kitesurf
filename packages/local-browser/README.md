@@ -1,4 +1,4 @@
-# Kitesurf local browser 0.5.5
+# Kitesurf local browser 0.6.0
 
 A local Kitesurf browser for agents, with one SQLite profile and one live browser session.
 The native Rust executable embeds workerd, engine modules and browser assets. It extracts the
@@ -133,7 +133,7 @@ pnpm run check
 The directory `dist/local-browser` contains `kitesurf`, the licenses, a component inventory
 and `SHA256SUMS`. Pass `-- --archive "$PWD/dist"` to also create a versioned `.tar.gz` and its
 archive checksum. The browser release workflow builds from source on each platform and tests
-the executable extracted from the archive with an empty `PATH`. A matching `v0.5.*` tag
+the executable extracted from the archive with an empty `PATH`. A matching `v0.*` tag
 prepares a draft GitHub release. Manual runs upload the archives as workflow artifacts.
 The upstream terminal client has a separate `cli-v*` release trigger.
 
