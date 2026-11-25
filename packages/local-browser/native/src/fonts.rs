@@ -98,6 +98,10 @@ enum FontCommand {
         reply: oneshot::Sender<Result<MatchResponse, HostError>>,
         _lease: RequestLease,
     },
+    MatchCoreAlternates {
+        reply: oneshot::Sender<[Option<MatchResponse>; 2]>,
+        _lease: RequestLease,
+    },
     Face {
         id: String,
         reply: oneshot::Sender<Result<Arc<Vec<u8>>, HostError>>,
@@ -591,6 +595,21 @@ fn run_worker(
             } => {
                 let _ = reply.send(backend.match_faces(&request));
             }
+            FontCommand::MatchCoreAlternates { reply, _lease } => {
+                let matches =
+                    [("sans", "italic"), ("system-ui", "normal")].map(|(family, style)| {
+                        backend
+                            .match_faces(&MatchRequest {
+                                family: Some(family.to_string()),
+                                style: Some(style.to_string()),
+                                weight: Some(400.0),
+                                text: Some("Aa".to_string()),
+                                ..MatchRequest::default()
+                            })
+                            .ok()
+                    });
+                let _ = reply.send(matches);
+            }
             FontCommand::Face { id, reply, _lease } => {
                 let _ = reply.send(backend.face_bytes(&id));
             }
@@ -754,6 +773,13 @@ impl From<&MatchResponse> for MatchOutput {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CoreAlternatesOutput {
+    italic: Option<MatchOutput>,
+    system_ui: Option<MatchOutput>,
+}
+
+#[derive(Serialize)]
 struct StatsOutput {
     faces: usize,
     cached_faces: usize,
@@ -815,6 +841,7 @@ impl FontHandler {
         };
         match path.as_str() {
             "/match" => self.match_response(&body, lease).await,
+            "/match-core-alternates" => self.match_core_alternates_response(&body, lease).await,
             "/face" => self.face_response(&body, lease).await,
             "/stats" => self.stats_response(lease).await,
             _ => leased_empty(StatusCode::NOT_FOUND, lease),
@@ -866,6 +893,38 @@ impl FontHandler {
             Ok(Ok(Err(error))) => font_error_response(error, lease),
             Ok(Ok(Ok(response))) => {
                 let output = MatchOutput::from(&response);
+                match bounded_json(&output, MAX_MATCH_RESPONSE_BYTES) {
+                    Some(bytes) => leased_json(StatusCode::OK, &bytes, lease),
+                    None => unavailable(lease),
+                }
+            }
+        }
+    }
+
+    async fn match_core_alternates_response(
+        &self,
+        body: &[u8],
+        lease: RequestLease,
+    ) -> Response<Full<Bytes>> {
+        if body != b"{}" {
+            return invalid_request(lease);
+        }
+        let (reply, receiver) = oneshot::channel();
+        if let Err(status) = self.enqueue(FontCommand::MatchCoreAlternates {
+            reply,
+            _lease: lease.clone(),
+        }) {
+            return leased_status(status, lease);
+        }
+        let _pending = PendingGuard(self.pending.clone());
+        match tokio::time::timeout(self.limits.request, receiver).await {
+            Err(_) => leased_json(StatusCode::BAD_GATEWAY, br#"{"error":"timeout"}"#, lease),
+            Ok(Err(_)) => unavailable(lease),
+            Ok(Ok([italic, system_ui])) => {
+                let output = CoreAlternatesOutput {
+                    italic: italic.as_ref().map(MatchOutput::from),
+                    system_ui: system_ui.as_ref().map(MatchOutput::from),
+                };
                 match bounded_json(&output, MAX_MATCH_RESPONSE_BYTES) {
                     Some(bytes) => leased_json(StatusCode::OK, &bytes, lease),
                     None => unavailable(lease),

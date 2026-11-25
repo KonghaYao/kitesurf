@@ -581,6 +581,11 @@ interface SystemMatch {
   reason?: string;
 }
 
+interface SystemCoreAlternates {
+  italic: SystemMatch | null;
+  systemUi: SystemMatch | null;
+}
+
 function safeFamilyName(value: string): string {
   return value.replace(/[\u0000-\u001f\u007f]/g, "?").slice(0, 200);
 }
@@ -642,6 +647,28 @@ async function systemMatch(
     (response) => response.json() as Promise<SystemMatch>,
   );
   return body && typeof body === "object" ? body : {};
+}
+
+async function systemCoreAlternates(): Promise<SystemCoreAlternates | null> {
+  try {
+    const result: unknown = await fetchSystemFont(
+      "/core-alternates",
+      "system core alternatives",
+      (response) => response.json(),
+    );
+    if (result && typeof result === "object" && "italic" in result && "systemUi" in result) {
+      const { italic, systemUi } = result;
+      if (isSystemMatchOrNull(italic) && isSystemMatchOrNull(systemUi)) return { italic, systemUi };
+    }
+  } catch {}
+  // A failed batch leaves both roles unresolved, so use the individual lookups.
+  return null;
+}
+
+function isSystemMatchOrNull(value: unknown): value is SystemMatch | null {
+  return (
+    value === null || (typeof value === "object" && "faces" in value && Array.isArray(value.faces))
+  );
 }
 
 async function systemFetchFace(id: string): Promise<Uint8Array> {
@@ -740,18 +767,18 @@ function systemFallbackMatch(kind: string, match: SystemMatch) {
   return { face, covered };
 }
 
-async function ensureSystemRole(
-  role: "sans" | "sans-italic" | "serif" | "mono" | "system-ui",
-  family: string,
-  options: {
-    weight?: number;
-    style?: string;
-    text?: string;
-    generics?: string[];
-    mono?: boolean;
-  },
+type SystemRole = "sans" | "sans-italic" | "serif" | "mono";
+
+interface SystemRoleOptions {
+  generics?: string[];
+  mono?: boolean;
+}
+
+async function installMatchedSystemRole(
+  role: SystemRole,
+  match: SystemMatch,
+  options: SystemRoleOptions,
 ): Promise<void> {
-  const match = await systemMatch(family, options);
   const face = firstFace(match);
   if (!face) {
     if (role === "sans") {
@@ -771,6 +798,14 @@ async function ensureSystemRole(
   });
 }
 
+async function ensureSystemRole(
+  role: SystemRole,
+  family: string,
+  options: SystemRoleOptions & { weight?: number; style?: string; text?: string },
+): Promise<void> {
+  await installMatchedSystemRole(role, await systemMatch(family, options), options);
+}
+
 async function ensureSystemCore(): Promise<void> {
   if (systemCorePromise) return systemCorePromise;
   systemCorePromise = (async () => {
@@ -782,17 +817,23 @@ async function ensureSystemCore(): Promise<void> {
       text: "Aa",
       generics: ["sans-serif", "ui-sans-serif"],
     });
-    await ensureSystemRole("sans-italic", "sans", {
-      weight: 400,
-      style: "italic",
-      text: "Aa",
-      generics: ["sans-serif", "ui-sans-serif"],
-    }).catch(() => {});
+    // The helper matches both optional roles with one queue entry. Keep the mandatory face,
+    // bytes and generic registrations in their original order, including on older helpers.
+    const alternates = await systemCoreAlternates();
+    const italicOptions = { weight: 400, style: "italic", text: "Aa" };
+    const italics = { generics: ["sans-serif", "ui-sans-serif"] };
+    const italicMatch = alternates
+      ? alternates.italic
+      : await systemMatch("sans", italicOptions).catch(() => null);
+    if (italicMatch) {
+      await installMatchedSystemRole("sans-italic", italicMatch, italics).catch(() => {});
+    }
     let systemUi: SystemFace | null = null;
     try {
-      systemUi = firstFace(
-        await systemMatch("system-ui", { weight: 400, style: "normal", text: "Aa" }),
-      );
+      const match = alternates
+        ? alternates.systemUi
+        : await systemMatch("system-ui", { weight: 400, style: "normal", text: "Aa" });
+      if (match) systemUi = firstFace(match);
     } catch {}
     if (systemUi) {
       await registerSystemFace(systemUi, { generics: ["system-ui"] });

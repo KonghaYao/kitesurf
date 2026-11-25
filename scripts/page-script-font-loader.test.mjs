@@ -538,10 +538,12 @@ test("a CJK face whose shaping file lands after the full-font upgrade registers 
 // System faces live on the host and a cold scan can take seconds. The loader must expose their
 // progress without making navigation wait for it.
 const SYSTEM_FACE_ID = "0123456789abcdef0123456789abcdef";
+const SYSTEM_ITALIC_ID = "123456789abcdef0123456789abcdef0";
 const SYSTEM_ENDPOINT = "http://kitesurf-fonts/system/";
 
-function loadSystemFontLoader() {
+function loadSystemFontLoader({ batchReply, missingSans = false } = {}) {
   const calls = [];
+  const requested = [];
   const matchWaiters = [];
   let hold = true;
   const face = {
@@ -554,17 +556,25 @@ function loadSystemFontLoader() {
     missing: 0,
     bytes: 4,
   };
-  const matchReply = () => ({
+  const italic = { ...face, id: SYSTEM_ITALIC_ID, family: "Test Italic", style: "italic" };
+  const match = (matched) => ({ faces: matched ? [matched] : [], covered: !!matched });
+  const matchReply = (matched) => ({
     ok: true,
     status: 200,
     async json() {
-      return { faces: [face], covered: true };
+      return match(matched);
     },
   });
   const fetch = (url) => {
+    requested.push(new URL(url));
     if (url.startsWith(`${SYSTEM_ENDPOINT}match?`)) {
-      if (!hold) return Promise.resolve(matchReply());
+      const matchFace = new URL(url).searchParams.get("style") === "italic" ? italic : face;
+      if (!hold) return Promise.resolve(matchReply(matchFace));
       return new Promise((resolve) => matchWaiters.push(resolve));
+    }
+    if (url === `${SYSTEM_ENDPOINT}core-alternates`) {
+      const alternates = { italic: match(italic), systemUi: match(face) };
+      return batchReply ? batchReply(alternates) : Response.json(alternates);
     }
     if (url.startsWith(`${SYSTEM_ENDPOINT}face?id=`)) {
       return Promise.resolve({
@@ -600,10 +610,16 @@ function loadSystemFontLoader() {
     }),
     "./fetch-slots.ts": dependency({
       FetchSlots: class {
+        #held = false;
         acquire() {
+          assert.equal(this.#held, false, "the previous font request did not release its slot");
+          this.#held = true;
           return Promise.resolve();
         }
-        release() {}
+        release() {
+          assert.equal(this.#held, true);
+          this.#held = false;
+        }
       },
     }),
     "./native-scheduling.ts": dependency({ NativePromise: Promise }),
@@ -637,10 +653,11 @@ function loadSystemFontLoader() {
   return {
     loader: exports,
     calls,
+    requested,
     matches: () => matchWaiters.length,
     releaseMatches: () => {
       hold = false;
-      for (const resolve of matchWaiters.splice(0)) resolve(matchReply());
+      for (const resolve of matchWaiters.splice(0)) resolve(matchReply(missingSans ? null : face));
     },
   };
 }
@@ -695,4 +712,83 @@ test("a blocking fonts read waits for the background system fonts", async () => 
   await blocking;
   assert.equal(settled, true);
   assert.ok(page.calls.some(([name]) => name === "register_system_face"));
+});
+
+test("font registration and shared byte reuse survive an unavailable or invalid metadata batch", async () => {
+  const batchReplies = [
+    undefined,
+    () => new Response(null, { status: 404 }),
+    () => new Response(null, { status: 502 }),
+    () => new Response("invalid JSON"),
+    () => Response.json({}),
+  ];
+  for (const batchReply of batchReplies) {
+    const page = loadSystemFontLoader({ batchReply });
+    const ready = page.loader.startSystemFonts();
+    await drainFetchCallbacks();
+    assert.deepEqual(
+      page.requested.map((url) => url.pathname),
+      ["/system/match"],
+    );
+    page.releaseMatches();
+    await ready;
+    const requestTags = page.requested.map((url) => {
+      if (url.pathname === "/system/match") return url.searchParams.get("style");
+      if (url.pathname === "/system/face") return url.searchParams.get("id");
+      return url.pathname;
+    });
+    assert.deepEqual(requestTags.slice(0, 3), [
+      "normal",
+      SYSTEM_FACE_ID,
+      "/system/core-alternates",
+    ]);
+    assert.deepEqual(
+      requestTags.slice(3),
+      batchReply ? ["italic", SYSTEM_ITALIC_ID, "normal"] : [SYSTEM_ITALIC_ID],
+    );
+    assert.deepEqual(
+      page.calls.filter(([name]) => name !== "finish_system_fonts"),
+      [
+        ["register_system_face", "Test Sans", false, 4],
+        ["map_system_generic", "sans-serif", "Test Sans"],
+        ["map_system_generic", "ui-sans-serif", "Test Sans"],
+        ["register_system_face", "Test Italic", false, 4],
+        ["map_system_generic", "sans-serif", "Test Italic"],
+        ["map_system_generic", "ui-sans-serif", "Test Italic"],
+        ["register_system_face", "Test Sans", false, 4],
+        ["map_system_generic", "system-ui", "Test Sans"],
+      ],
+    );
+  }
+});
+
+test("a valid batch with an unavailable italic role still installs system-ui", async () => {
+  const page = loadSystemFontLoader({
+    batchReply: ({ systemUi }) => Response.json({ italic: null, systemUi }),
+  });
+  const ready = page.loader.startSystemFonts();
+  await drainFetchCallbacks();
+  page.releaseMatches();
+  await ready;
+  assert.deepEqual(
+    page.requested.map((url) => url.pathname),
+    ["/system/match", "/system/face", "/system/core-alternates"],
+  );
+  assert.ok(
+    page.calls.some(([name, generic]) => name === "map_system_generic" && generic === "system-ui"),
+  );
+  assert.ok(!page.calls.some((entry) => entry.includes("Test Italic")));
+});
+
+test("missing normal sans aborts before optional metadata or face reads", async () => {
+  const page = loadSystemFontLoader({ missingSans: true });
+  const ready = page.loader.startSystemFonts();
+  await drainFetchCallbacks();
+  page.releaseMatches();
+  await ready;
+  assert.deepEqual(
+    page.requested.map((url) => url.pathname),
+    ["/system/match"],
+  );
+  assert.deepEqual(page.calls, []);
 });
