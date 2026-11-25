@@ -497,6 +497,13 @@ fn tty_ua_sheet() -> Option<UserAgentStylesheet> {
     TTY_UA_SHEET.with(|c| c.borrow().clone())
 }
 
+/// Initializes only the immutable built-in UA sheet. A build-time Wasm constructor may
+/// run this before the module is shipped; document, font and origin state stay per instance.
+#[wasm_bindgen]
+pub fn ks_prepare_default_stylesheet() {
+    drop(UserAgentStylesheet::default_sheet());
+}
+
 static DARK_COLOR_SCHEME: AtomicBool = AtomicBool::new(false);
 
 #[wasm_bindgen(js_name = "setDarkColorScheme")]

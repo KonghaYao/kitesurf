@@ -21,6 +21,7 @@ import { getPatchedVendorCrates } from "./get-patched-vendor-crates.mjs";
 import { WASM_BINDGEN_VERSION, getWasmBindgen } from "./get-wasm-bindgen.mjs";
 import { rewriteWasmMemoryViews } from "./wasm-memory-views.mjs";
 import { getWasmOpt } from "./wasm-opt.mjs";
+import { preinitializeUaStylesheet } from "./preinitialize-ua-stylesheet.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const CORE_DIR = resolve(ROOT, "packages/core");
@@ -83,6 +84,7 @@ function shouldRebuild() {
     SELF,
     resolve(dirname(SELF), "get-patched-vendor-crates.mjs"),
     resolve(dirname(SELF), "wasm-memory-views.mjs"),
+    resolve(dirname(SELF), "preinitialize-ua-stylesheet.mjs"),
   ];
   function walkPatches(dir) {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -227,6 +229,19 @@ if (memprof) {
     console.log(`[build-wasm] wasm-opt: ${beforeBytes} → ${afterBytes} bytes (-${pct}%)`);
   } else {
     console.log(`[build-wasm] wasm-opt not found at ${WASM_OPT} — skipping post-pass`);
+  }
+  const moduleBytes = readFileSync(WASM_OUT);
+  if (WebAssembly.JSTag && WebAssembly.validate(moduleBytes)) {
+    const prepared = preinitializeUaStylesheet(moduleBytes);
+    writeFileSync(WASM_OUT, prepared);
+    console.log(
+      `[build-wasm] initialized default UA rules (+${prepared.length - moduleBytes.length} bytes)`,
+    );
+  } else {
+    // The local build tool may run an older V8 than the workerd that will execute the module.
+    console.log(
+      "[build-wasm] build runtime cannot instantiate the core; UA rules initialize on demand",
+    );
   }
 }
 

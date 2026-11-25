@@ -116,6 +116,7 @@ js_library(
     srcs = [
         "get-patched-vendor-crates.mjs",
         "get-wasm-bindgen.mjs",
+        "preinitialize-ua-stylesheet.mjs",
         "wasm-memory-views.mjs",
         "wasm-opt.mjs",
     ],
