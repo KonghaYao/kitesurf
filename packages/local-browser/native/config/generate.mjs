@@ -19,7 +19,7 @@ import { join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const MODULE_NAME = /^[A-Za-z0-9._/-]+$/;
-const VERSION = "0.6.0";
+const VERSION = "0.7.0";
 // workerd 为每个新 isolate 上报内存压力，V8 因此刷新全进程的 Liftoff 代码，导航会重新编译
 // 引擎的 wasm。--no-flush-liftoff-code 保留它：4 个页面 96 次导航的 workerd 内存从
 // ~1107 MiB 降到 ~545 MiB。--expose-gc 让引擎回收退役页面 isolate。

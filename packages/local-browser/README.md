@@ -1,4 +1,4 @@
-# Kitesurf local browser 0.6.0
+# Kitesurf local browser 0.7.0
 
 A local Kitesurf browser for agents, with one SQLite profile and one live browser session.
 The native Rust executable embeds workerd, engine modules and browser assets. It extracts the
@@ -30,6 +30,48 @@ For a graphical login, open `chrome://inspect/#devices` in Chrome, enable networ
 discovery, add `127.0.0.1:8787`, and inspect the desired tab. Use the DevTools screencast to enter
 the website and log in. Disconnect the agent controller before connecting DevTools. Close the
 DevTools window when finished; the browser keeps the same tabs and profile for the agent.
+
+### Vercel agent-browser
+
+Start `kitesurf serve --port 8787` in one terminal. In another terminal, use the
+native agent-browser CLI (tested with v0.45.0) to attach to the existing browser:
+
+```sh
+agent-browser --session work connect 8787
+agent-browser --session work open https://example.org
+agent-browser --session work snapshot -i
+agent-browser --session work tab new https://example.com
+agent-browser --session work tab
+agent-browser --session work close
+```
+
+Use the references printed by the latest snapshot with `fill` and `click`.
+`agent-browser close` detaches its externally connected daemon. The Kitesurf
+process, profile and open tabs survive. Both programs run as native executables.
+
+For simultaneous clients, keep one browser-level controller to allocate tabs.
+`agent-browser --session pool --json tab new about:blank` returns
+`data.targetId` after `agent-browser --session pool connect 8787`. Give each
+client a different named CLI session and the matching page WebSocket URL
+from `GET /json/list`:
+
+```sh
+agent-browser --session worker-a connect 'ws://127.0.0.1:8787/devtools/page/<targetId-A>'
+agent-browser --session worker-b connect 'ws://127.0.0.1:8787/devtools/page/<targetId-B>'
+```
+
+Each worker navigates its allocated tab. Page discovery is scoped to the tab
+and its owned targets. The workers share the browser profile and its cookies.
+The pool can reclaim a finished worker's tab with
+`agent-browser --session pool tab close <targetId>`. Naming two CLI sessions and connecting both to port 8787
+requests two browser-level controllers; the second connection receives HTTP 409.
+
+For an MCP client, start the same executable with `agent-browser mcp` over
+stdio. Set `AGENT_BROWSER_CDP` to the allocated page WebSocket URL, or to
+`http://127.0.0.1:8787` for the single browser-level controller. Use the same
+`session` in the MCP tool arguments throughout the workflow. Call
+`agent_browser_close` when returning the controller. In v0.45.0, closing
+the stdio input ends the MCP process and can leave its named daemon attached.
 
 ## Profiles and durability
 
@@ -67,7 +109,7 @@ credentials in plaintext and are created with owner-only file permissions.
 
 ## Control and network
 
-Only one controlling CDP connection is active at a time. The default owner is `default`.
+Only one browser-level controlling CDP connection is active at a time. The default owner is `default`.
 An agent can connect with `?owner=agent-name&session=SESSION_ID`. A viewer connection uses
 `?role=viewer` and can read the page and screenshots, but cannot evaluate arbitrary JavaScript,
 type, navigate, or close the browser. Explicit takeover fences the old controller immediately:

@@ -25,7 +25,7 @@ import {
 } from "./host-adapter.mjs";
 
 const kind = process.env.KS_HOST_KIND || "native";
-const hostVersion = kind === "legacy" ? "0.5.0" : "0.6.0";
+const hostVersion = kind === "legacy" ? "0.5.0" : "0.7.0";
 const legacyOnly = { skip: kind !== "legacy" && "035a014 Node host baseline only" };
 const nativeOnly = { skip: kind !== "native" && "native T2 test-profile probe only" };
 let host;

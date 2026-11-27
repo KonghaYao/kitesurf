@@ -356,13 +356,13 @@ test(
       rmSync(directory, { recursive: true, force: true });
     });
 
-    assert.equal(cli(["--version"]), "kitesurf 0.6.0\n");
+    assert.equal(cli(["--version"]), "kitesurf 0.7.0\n");
     assert.match(cli(["--help"]), /kitesurf.*serve/);
     const first = await start(profile, true);
     const status = JSON.parse(cli(["status", "--port", String(port)]));
     assert.equal(status.generation, first.generation);
     let page = await openPage(cdp, `${fixture.url}/before-crash`);
-    assert.equal(await evaluate(cdp, page.sessionId, "navigator.userAgent"), "Kitesurf/0.6.0");
+    assert.equal(await evaluate(cdp, page.sessionId, "navigator.userAgent"), "Kitesurf/0.7.0");
     await evaluate(cdp, page.sessionId, "document.getElementById('username').focus()");
     await cdp.send("Input.insertText", { text: "Alice" }, page.sessionId);
     assert.equal(

@@ -185,7 +185,7 @@ test("generate writes modules, manifests and three configs, replacing stale outp
   mkdirSync(out, { recursive: true });
   writeFileSync(join(out, "stale.txt"), "stale");
   const result = generate({ dist, assets, out });
-  assert.deepEqual(result, { modules: 2, assets: 2, version: "0.6.0" });
+  assert.deepEqual(result, { modules: 2, assets: 2, version: "0.7.0" });
   assert.ok(!existsSync(join(out, "stale.txt")));
   const manifest = JSON.parse(readFileSync(join(out, "modules.json"), "utf8"));
   assert.equal(manifest.entry, "index.js");
