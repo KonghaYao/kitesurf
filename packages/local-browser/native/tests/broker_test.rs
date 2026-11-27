@@ -430,7 +430,15 @@ mod request_allocations {
             &mut budget.json_scratch(),
         )
         .unwrap();
-        drop(cdp_raw::serialize_event(&warm, true, &budget, &mut budget.json_scratch()).unwrap());
+        drop(
+            cdp_raw::serialize_event(
+                &warm,
+                cdp_raw::EventSession::Page(None),
+                &budget,
+                &mut budget.json_scratch(),
+            )
+            .unwrap(),
+        );
         drop(warm);
         let warm =
             LeasedRaw::accounted("{}".into(), runtime.block_on(budget.receive(true)), &budget)
@@ -497,7 +505,12 @@ mod request_allocations {
                     .unwrap()
             } else {
                 let mut scratch = budget.json_scratch();
-                cdp_raw::serialize_event(&received.raw, page, &budget, &mut scratch).unwrap()
+                let session = if page {
+                    cdp_raw::EventSession::Page(None)
+                } else {
+                    cdp_raw::EventSession::Browser
+                };
+                cdp_raw::serialize_event(&received.raw, session, &budget, &mut scratch).unwrap()
             };
             let held = budget.used();
             assert!(held.0 >= MAX_FRAME_BYTES + output.0.capacity());
@@ -1728,6 +1741,236 @@ async fn page_session_target_list_and_events_are_scoped() {
     assert!(!broker.wait_terminal().await);
 }
 
+#[tokio::test]
+async fn page_discovery_delivers_only_owned_targets_while_enabled() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut page = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Viewer,
+        "observer",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"primary"}));
+
+    send(
+        &page,
+        &broker,
+        r#"{"id":1,"method":"Target.setDiscoverTargets","params":{"discover":true}}"#,
+    )
+    .await;
+    let targets = next_request(&mut engine).await;
+    assert_eq!(targets["method"], "Target.getTargets");
+    assert!(targets.get("sessionId").is_none());
+    engine.reply(
+        request_id(&targets),
+        json!({"targetInfos":[
+            {"targetId":"page-a","type":"page","url":"https://a.invalid/"},
+            {"targetId":"child-a","type":"iframe","openerFrameId":"page-a"},
+            {"targetId":"page-b","type":"page","url":"https://b.invalid/"},
+            {"targetId":"browser","type":"browser"}
+        ]}),
+    );
+    for target in ["page-a", "child-a"] {
+        let event = next_frame(&mut page).await;
+        assert_eq!(event["method"], "Target.targetCreated");
+        assert_eq!(event["params"]["targetInfo"]["targetId"], target);
+        assert!(event.get("sessionId").is_none());
+    }
+    assert_eq!(next_frame(&mut page).await, json!({"id":1,"result":{}}));
+
+    send(
+        &page,
+        &broker,
+        r#"{"id":2,"method":"Target.attachToTarget","params":{"targetId":"page-a","flatten":true}}"#,
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    assert_eq!(attach["method"], "Target.attachToTarget");
+    assert_eq!(attach["params"]["targetId"], "page-a");
+    engine.reply(request_id(&attach), json!({"sessionId":"explicit"}));
+    assert_eq!(
+        next_frame(&mut page).await["result"]["sessionId"],
+        "explicit"
+    );
+    engine.event(json!({"method":"Page.loadEventFired","sessionId":"primary","params":{}}));
+    let direct = next_frame(&mut page).await;
+    assert_eq!(direct["method"], "Page.loadEventFired");
+    assert!(direct.get("sessionId").is_none());
+    engine.raw(r#"{"method":"Page.loadEventFired","sessionId":"foreign","session\u0049d":"explicit","params":{}}"#.to_string());
+    let event = timeout(WAIT, page.frames.recv()).await.unwrap().unwrap();
+    let ClientCommand::Text(text, _lease) = event else {
+        panic!("expected explicit session event");
+    };
+    assert!(!text.contains("foreign"));
+    let explicit: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(explicit["method"], "Page.loadEventFired");
+    assert_eq!(explicit["sessionId"], "explicit");
+
+    engine.event(json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"page-b","type":"page"}}}));
+    engine.event(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"page-a","type":"page","openerId":"page-a","openerFrameId":"page-b"}}}));
+    engine.raw(r#"{"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"page-a","openerId":"page-b","openerId":"page-a"}}}"#.to_string());
+    engine.raw(r#"{"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"page-b"}},"params":{"targetInfo":{"targetId":"page-a"}}}"#.to_string());
+    engine.event(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"page-a","type":"page"}}}));
+    engine.event(json!({"method":"Target.targetDestroyed","params":{"targetId":"child-a"}}));
+    assert_eq!(
+        next_frame(&mut page).await["method"],
+        "Target.targetInfoChanged"
+    );
+    assert_eq!(next_frame(&mut page).await["params"]["targetId"], "child-a");
+    expect_silence(&mut page).await;
+
+    send(
+        &page,
+        &broker,
+        r#"{"id":3,"method":"Target.setDiscoverTargets","params":{"discover":false}}"#,
+    )
+    .await;
+    assert_eq!(next_frame(&mut page).await, json!({"id":3,"result":{}}));
+    engine.event(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"page-a","type":"page"}}}));
+    expect_silence(&mut page).await;
+    expect_no_request(&mut engine).await;
+
+    send(
+        &page,
+        &broker,
+        r#"{"id":4,"method":"Target.setDiscoverTargets","params":{"discover":true}}"#,
+    )
+    .await;
+    let targets = next_request(&mut engine).await;
+    send(
+        &page,
+        &broker,
+        r#"{"id":5,"method":"Target.setDiscoverTargets","params":{"discover":false}}"#,
+    )
+    .await;
+    assert_eq!(next_frame(&mut page).await, json!({"id":5,"result":{}}));
+    engine.reply(
+        request_id(&targets),
+        json!({"targetInfos":[{"targetId":"page-a","type":"page"}]}),
+    );
+    assert_eq!(next_frame(&mut page).await, json!({"id":4,"result":{}}));
+    expect_silence(&mut page).await;
+
+    send(
+        &page,
+        &broker,
+        r#"{"id":6,"method":"Target.setDiscoverTargets","params":{"discover":true,"filter":[{"type":"page"}]}}"#,
+    )
+    .await;
+    let invalid = next_frame(&mut page).await;
+    assert_eq!(invalid["id"], 6);
+    assert_eq!(invalid["error"]["code"], -32602);
+    assert!(message(&invalid).contains("filter"));
+    expect_no_request(&mut engine).await;
+
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn version_probe_reconnect_waits_for_actual_controller_release() {
+    for endpoint in [
+        Endpoint::Browser,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+    ] {
+        let mut engine = fake_engine().await;
+        let broker = broker(&engine).await;
+        let mut probe = connect(&broker, endpoint.clone(), Role::Controller, "same").await;
+        if matches!(endpoint, Endpoint::Page { .. }) {
+            let attach = next_method(&mut engine, "Target.attachToTarget").await;
+            engine.reply(request_id(&attach), json!({"sessionId":"primary"}));
+        }
+        send(&probe, &broker, r#"{"id":1,"method":"Browser.getVersion"}"#).await;
+        let request = next_method(&mut engine, "Browser.getVersion").await;
+        engine.reply(request_id(&request), json!({"product":"Kitesurf/0.6.0"}));
+        assert_eq!(next_frame(&mut probe).await["id"], 1);
+
+        let reservation = ReserveRequest {
+            endpoint: endpoint.clone(),
+            role: Role::Controller,
+            owner: "same".into(),
+        };
+        let other = ReserveRequest {
+            owner: "other".into(),
+            ..reservation.clone()
+        };
+        assert!(broker
+            .reserve_once(other, false)
+            .await
+            .unwrap_err()
+            .retry_after
+            .is_none());
+
+        let reconnect = broker.reserve(reservation.clone());
+        tokio::pin!(reconnect);
+        // Poll the replacement while the first WebSocket still appears open to the actor.
+        assert!(timeout(Duration::from_millis(20), &mut reconnect)
+            .await
+            .is_err());
+        let competing = broker.reserve_once(reservation, false).await.unwrap_err();
+        assert!(competing.retry_after.is_none());
+
+        broker.closed(probe.id);
+        let replacement = timeout(WAIT, reconnect).await.unwrap().unwrap();
+        broker.rollback(replacement.id());
+        engine.kill();
+        assert!(!broker.wait_terminal().await);
+    }
+}
+
+#[tokio::test]
+async fn version_probe_reconnect_never_replaces_a_live_controller() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut controller = connect(&broker, Endpoint::Browser, Role::Controller, "same").await;
+    send(
+        &controller,
+        &broker,
+        r#"{"id":1,"method":"Browser.getVersion"}"#,
+    )
+    .await;
+    let request = next_method(&mut engine, "Browser.getVersion").await;
+    engine.reply(request_id(&request), json!({}));
+    assert_eq!(next_frame(&mut controller).await["id"], 1);
+    let reservation = ReserveRequest {
+        endpoint: Endpoint::Browser,
+        role: Role::Controller,
+        owner: "same".into(),
+    };
+    let reconnect = broker.reserve(reservation.clone());
+    tokio::pin!(reconnect);
+    assert!(timeout(Duration::from_millis(20), &mut reconnect)
+        .await
+        .is_err());
+    let error = timeout(WAIT, reconnect).await.unwrap().unwrap_err();
+    assert_eq!(error.message(), "Controller is already connected");
+
+    send(
+        &controller,
+        &broker,
+        r#"{"id":2,"method":"Target.getTargets"}"#,
+    )
+    .await;
+    let request = next_method(&mut engine, "Target.getTargets").await;
+    engine.reply(request_id(&request), json!({"targetInfos":[]}));
+    assert_eq!(next_frame(&mut controller).await["id"], 2);
+    assert!(broker
+        .reserve_once(reservation, false)
+        .await
+        .unwrap_err()
+        .retry_after
+        .is_none());
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
 // 实例级或未按页隔离的方法在 page 连接上明确报错，不转发到引擎。
 #[tokio::test]
 async fn page_session_rejects_instance_and_unscoped_methods() {
@@ -1772,6 +2015,64 @@ async fn page_session_rejects_instance_and_unscoped_methods() {
         );
     }
     expect_no_request(&mut engine).await;
+    engine.kill();
+    assert!(!broker.wait_terminal().await);
+}
+
+#[tokio::test]
+async fn page_session_routes_cookie_commands_through_its_target() {
+    let mut engine = fake_engine().await;
+    let broker = broker(&engine).await;
+    let mut page = connect(
+        &broker,
+        Endpoint::Page {
+            target_id: "page-a".into(),
+        },
+        Role::Controller,
+        "alice",
+    )
+    .await;
+    let attach = next_request(&mut engine).await;
+    engine.reply(request_id(&attach), json!({"sessionId":"session-a"}));
+    for (id, command) in ["getCookies", "setCookies"].into_iter().enumerate() {
+        send(
+            &page,
+            &broker,
+            &json!({"id":id, "method":format!("Storage.{command}")}).to_string(),
+        )
+        .await;
+        let rejected = next_frame(&mut page).await;
+        assert_eq!(rejected["id"], id);
+        assert!(message(&rejected).contains("page-session connection"));
+        expect_no_request(&mut engine).await;
+
+        send(
+            &page,
+            &broker,
+            &json!({"id":id, "method":format!("Network.{command}")}).to_string(),
+        )
+        .await;
+        let request = next_request(&mut engine).await;
+        assert_eq!(request["method"], format!("Network.{command}"));
+        assert_eq!(request["sessionId"], "session-a");
+        engine.reply(request_id(&request), json!({}));
+        assert_eq!(next_frame(&mut page).await["id"], id);
+    }
+
+    let mut browser = connect(&broker, Endpoint::Browser, Role::Controller, "admin").await;
+    for (id, command) in ["getCookies", "setCookies"].into_iter().enumerate() {
+        send(
+            &browser,
+            &broker,
+            &json!({"id":id, "method":format!("Storage.{command}")}).to_string(),
+        )
+        .await;
+        let request = next_request(&mut engine).await;
+        assert_eq!(request["method"], format!("Storage.{command}"));
+        assert!(request.get("sessionId").is_none());
+        engine.reply(request_id(&request), json!({}));
+        assert_eq!(next_frame(&mut browser).await["id"], id);
+    }
     engine.kill();
     assert!(!broker.wait_terminal().await);
 }

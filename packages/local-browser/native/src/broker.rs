@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::{Instant, MissedTickBehavior};
+use tokio::time::{timeout, Instant, MissedTickBehavior};
 
 use crate::attachments::{AttachmentReservation, Attachments, QuarantineResult, Registration};
 use crate::observe::Observer;
@@ -136,6 +136,8 @@ const TICK: Duration = Duration::from_millis(50);
 const FRAME_CAPACITY: usize = 8;
 const COMMAND_CAPACITY: usize = 256;
 
+const VERSION_PROBE_RECONNECT_TIMEOUT: Duration = Duration::from_millis(150);
+
 const PAGE_SESSION_CONTROL_MESSAGE: &str = "Another controller owns this page session";
 /// 显式接管 page session 时，旧控制者收到可解析的关闭帧而不是无原因的 1006。
 const PAGE_SESSION_TAKEOVER_CODE: u16 = 4001;
@@ -166,13 +168,14 @@ const PAGE_SESSION_DENIED_METHODS: &[&str] = &[
     "Storage.clearCookies",
     "Storage.clearDataForOrigin",
     "Storage.clearTrustTokens",
+    "Storage.getCookies",
+    "Storage.setCookies",
     "Target.attachToBrowserTarget",
     "Target.createBrowserContext",
     "Target.createTarget",
     "Target.disposeBrowserContext",
     "Target.getBrowserContexts",
     "Target.setAutoAttach",
-    "Target.setDiscoverTargets",
     "Target.setRemoteLocations",
 ];
 
@@ -520,6 +523,7 @@ pub struct ReserveError {
     message: String,
     controller: Option<String>,
     target: Option<String>,
+    retry_after: Option<watch::Receiver<bool>>,
 }
 
 impl ReserveError {
@@ -528,6 +532,7 @@ impl ReserveError {
             message: message.into(),
             controller: None,
             target: None,
+            retry_after: None,
         }
     }
 
@@ -536,6 +541,7 @@ impl ReserveError {
             message: message.into(),
             controller,
             target: None,
+            retry_after: None,
         }
     }
 
@@ -544,6 +550,7 @@ impl ReserveError {
             message: PAGE_SESSION_CONTROL_MESSAGE.to_string(),
             controller,
             target: Some(target.to_string()),
+            retry_after: None,
         }
     }
 
@@ -783,6 +790,29 @@ impl BrokerHandle {
 
     /// `takeover` 只对 page 端点控制器生效；预留本身不改变控制权，提交时才退休旧控制者。
     pub async fn reserve_with_takeover(
+        &self,
+        request: ReserveRequest,
+        takeover: bool,
+    ) -> Result<Reservation, ReserveError> {
+        let mut result = self.reserve_once(request.clone(), takeover).await;
+        if let Err(error) = &mut result {
+            if let Some(mut released) = error.retry_after.take() {
+                if matches!(
+                    timeout(
+                        VERSION_PROBE_RECONNECT_TIMEOUT,
+                        released.wait_for(|closed| *closed)
+                    )
+                    .await,
+                    Ok(Ok(_))
+                ) {
+                    return self.reserve_once(request, takeover).await;
+                }
+            }
+        }
+        result
+    }
+
+    async fn reserve_once(
         &self,
         request: ReserveRequest,
         takeover: bool,
@@ -1185,6 +1215,14 @@ impl Request {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeTraffic {
+    Fresh,
+    VersionOnly,
+    ReconnectWaiting,
+    Other,
+}
+
 struct Client {
     slots: Arc<Semaphore>,
     ids: Arc<Mutex<std::collections::HashSet<i64>>>,
@@ -1204,6 +1242,8 @@ struct Client {
     output_bytes: Arc<Semaphore>,
     pending: usize,
     discover: bool,
+    discovery_epoch: u64,
+    probe_traffic: ProbeTraffic,
     closed: bool,
     retired: bool,
     writer_gone: bool,
@@ -1240,6 +1280,7 @@ enum PendingKind {
     /// page session 的 Target.getTargets：在 broker 内过滤上游全量结果。
     TargetsForClient {
         page: String,
+        discovery: Option<u64>,
     },
     /// 会话范围内的发现请求（HTTP 入口）；过滤后返回持有的 targetInfos。
     ScopedTargets {
@@ -1698,8 +1739,10 @@ impl Broker {
                             ));
                         }
                     }
-                    if self.active_controller.is_some() {
-                        return Err(ReserveError::other("Controller is already connected"));
+                    if let Some(active) = self.active_controller {
+                        let mut error = ReserveError::other("Controller is already connected");
+                        error.retry_after = self.version_probe_release(active, &request.owner);
+                        return Err(error);
                     }
                 }
                 Endpoint::Page { target_id } => {
@@ -1707,11 +1750,16 @@ impl Broker {
                     if self.page_controller_reserved(target_id) {
                         return Err(ReserveError::other("Control change is in progress"));
                     }
-                    if self.page_session_controller(target_id).is_some() && !takeover {
-                        return Err(ReserveError::page_conflict(
+                    if let Some(active) = self
+                        .page_session_controller(target_id)
+                        .filter(|_| !takeover)
+                    {
+                        let mut error = ReserveError::page_conflict(
                             self.page_session_owner(target_id),
                             target_id,
-                        ));
+                        );
+                        error.retry_after = self.version_probe_release(active, &request.owner);
+                        return Err(error);
                     }
                 }
             }
@@ -1727,6 +1775,20 @@ impl Broker {
         };
         self.reservations.insert(id, reservation.clone());
         Ok(reservation)
+    }
+
+    /// 版本探测断开与下一次握手可能交错；仅允许同一控制者等待真实释放一次。
+    fn version_probe_release(
+        &mut self,
+        active: ClientId,
+        owner: &str,
+    ) -> Option<watch::Receiver<bool>> {
+        let client = self.clients.get_mut(&active)?;
+        if client.owner != owner || client.probe_traffic != ProbeTraffic::VersionOnly {
+            return None;
+        }
+        client.probe_traffic = ProbeTraffic::ReconnectWaiting;
+        Some(client.cancel.subscribe())
     }
 
     /// page 端点主目标只能是未归属（或同页）的顶层 page；实例与子目标一律拒绝。
@@ -1888,6 +1950,8 @@ impl Broker {
             output_bytes: Arc::new(Semaphore::new(CLIENT_QUEUE_BYTES)),
             pending: 0,
             discover: false,
+            discovery_epoch: 0,
+            probe_traffic: ProbeTraffic::Fresh,
             closed: false,
             retired: false,
             writer_gone: false,
@@ -1914,9 +1978,21 @@ impl Broker {
             self.disconnect_client(client_id, 1011, "Payload budget exhausted", true);
             return;
         };
-        let Some(value) =
-            Request::parse_with_metadata(text, ingress, metadata, &self.upstream.handle.budget)
-        else {
+        let value =
+            Request::parse_with_metadata(text, ingress, metadata, &self.upstream.handle.budget);
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            let version_probe = value.as_ref().is_some_and(|request| {
+                request.id.is_some()
+                    && request.method() == Some("Browser.getVersion")
+                    && request.session().is_none()
+            });
+            if !version_probe {
+                client.probe_traffic = ProbeTraffic::Other;
+            } else if client.probe_traffic == ProbeTraffic::Fresh {
+                client.probe_traffic = ProbeTraffic::VersionOnly;
+            }
+        }
+        let Some(value) = value else {
             self.send_error(client_id, 0, -32000, "Invalid CDP request", None);
             return;
         };
@@ -2048,7 +2124,52 @@ impl Broker {
         }
         let session = error_session(&request);
         if method == "Target.getTargets" && self.client_has_page(client_id) {
-            self.request_page_targets(client_id, request, external_id, session);
+            self.request_page_targets(client_id, request, external_id, session, None);
+            return;
+        }
+        if method == "Target.setDiscoverTargets" && self.client_has_page(client_id) {
+            let Some(discover) = request.observed.discover else {
+                self.send_error(
+                    client_id,
+                    external_id,
+                    -32602,
+                    "Invalid discover parameter",
+                    session,
+                );
+                return;
+            };
+            let has_filter = {
+                let mut scratch = self.upstream.handle.budget.json_scratch();
+                request
+                    .raw
+                    .as_ref()
+                    .and_then(|raw| raw.node("params"))
+                    .and_then(|params| params.field("filter", &mut scratch))
+                    .is_some()
+            };
+            if has_filter {
+                self.send_error(
+                    client_id,
+                    external_id,
+                    -32602,
+                    "The filter parameter is not supported on a page-session connection",
+                    session,
+                );
+                return;
+            }
+            let snapshot = {
+                let state = self.clients.get_mut(&client_id).expect("admitted client");
+                if !discover {
+                    state.discover = false;
+                    state.discovery_epoch = state.discovery_epoch.saturating_add(1);
+                }
+                (discover && !state.discover).then_some(state.discovery_epoch)
+            };
+            if let Some(snapshot) = snapshot {
+                self.request_page_targets(client_id, request, external_id, session, Some(snapshot));
+            } else {
+                self.send_reply(client_id, external_id, json!({}), session);
+            }
             return;
         }
         // page 连接的 Target.getTargetInfo 默认指向本会话的主 target，而不是浏览器 target。
@@ -2581,12 +2702,26 @@ impl Broker {
         let budget = self.upstream.handle.budget.clone();
         let serialized = {
             let mut scratch = budget.json_scratch();
-            cdp_raw::serialize_event(
-                &value.raw,
-                matches!(state.endpoint, Endpoint::Page { .. }),
-                &budget,
-                &mut scratch,
-            )
+            let session = match state.endpoint {
+                Endpoint::Browser => cdp_raw::EventSession::Browser,
+                Endpoint::Page { .. } => {
+                    let mut buffer = [0; 4096];
+                    let explicit = value.outer.filter(|span| {
+                        value
+                            .raw
+                            .at(*span)
+                            .identity_text(&mut buffer, &mut scratch)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|session| {
+                                state.primary.as_deref() != Some(session)
+                                    && self.attachments.owner(session) == Some(client)
+                            })
+                    });
+                    cdp_raw::EventSession::Page(explicit)
+                }
+            };
+            cdp_raw::serialize_event(&value.raw, session, &budget, &mut scratch)
         };
         let Ok((text, lease)) = serialized else {
             self.disconnect_client(client, 1011, "Payload budget exhausted", true);
@@ -2601,7 +2736,46 @@ impl Broker {
             Some(EventMethod::Attached) => self.page_has_session(client, value, value.session),
             // detached_event 已按被移除 attachment 的 owner 选定唯一接收者。
             Some(EventMethod::Detached) => true,
-            // 无 session 的发现事件只广播给 Browser 端点；这里只放行本连接自己的会话。
+            Some(EventMethod::Discovery) => {
+                let mut scratch = self.upstream.handle.budget.json_scratch();
+                self.clients
+                    .get(&client)
+                    .filter(|state| state.discover)
+                    .and_then(|state| state.page.as_deref())
+                    .is_some_and(|page| {
+                        let owned = |target: &str| {
+                            !INSTANCE_TARGET_IDS.contains(&target)
+                                && self.attachments.owns_page_target(page, target)
+                        };
+                        let Ok([Some(params)]) = value
+                            .raw
+                            .backing()
+                            .node()
+                            .unique_fields(["params"], &mut scratch)
+                        else {
+                            return false;
+                        };
+                        let Ok([info, target]) =
+                            params.unique_fields(["targetInfo", "targetId"], &mut scratch)
+                        else {
+                            return false;
+                        };
+                        match (info, target) {
+                            (Some(info), None) => {
+                                scoped_target_info(info, &mut scratch, &owned).unwrap_or(false)
+                            }
+                            (None, Some(target)) if value.destroyed => {
+                                let mut buffer = [0; 4096];
+                                target
+                                    .identity_text(&mut buffer, &mut scratch)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(owned)
+                            }
+                            _ => false,
+                        }
+                    })
+            }
             _ => self.page_has_session(client, value, value.outer),
         }
     }
@@ -2666,6 +2840,9 @@ impl Broker {
             return;
         };
         state.closed = true;
+        if state.probe_traffic == ProbeTraffic::ReconnectWaiting {
+            state.cancel.send_replace(true);
+        }
         state.page_queue.clear();
         state.page_queue_bytes = 0;
         self.management_queue.retain(|work| work.client != client);
@@ -2971,6 +3148,7 @@ impl Broker {
         request: Request,
         external_id: i64,
         session: Option<String>,
+        discovery: Option<u64>,
     ) {
         let Some((page, role, epoch)) = self.clients.get(&client_id).and_then(|state| {
             state
@@ -2988,7 +3166,7 @@ impl Broker {
             epoch,
             seq: None,
             method: "Target.getTargets".to_string(),
-            kind: PendingKind::TargetsForClient { page },
+            kind: PendingKind::TargetsForClient { page, discovery },
             deadline: self.client_deadline,
         };
         let lease = request.lease.clone();
@@ -3125,6 +3303,7 @@ impl Broker {
         page: &str,
         session: Option<String>,
         value: &Received,
+        discovery: Option<u64>,
     ) {
         self.record_target_infos(value);
         if value.has_error() {
@@ -3135,7 +3314,8 @@ impl Broker {
         let filtered = {
             let mut scratch = budget.json_scratch();
             scoped_target_infos(value, &budget, &mut scratch, |target| {
-                target == page || self.attachments.owns_page_target(page, target)
+                !INSTANCE_TARGET_IDS.contains(&target)
+                    && (target == page || self.attachments.owns_page_target(page, target))
             })
         };
         let Ok(raw) = filtered else {
@@ -3148,6 +3328,21 @@ impl Broker {
             );
             return;
         };
+        if let Some(snapshot) = discovery {
+            let Some(state) = self.clients.get_mut(&client) else {
+                return;
+            };
+            if state.discovery_epoch == snapshot
+                && !state.discover
+                && !state.closed
+                && !state.retired
+            {
+                state.discover = true;
+                self.send_page_discovery_snapshot(client, &raw);
+            }
+            self.send_reply(client, external_id, json!({}), session);
+            return;
+        }
         let list = {
             let mut scratch = budget.json_scratch();
             raw.raw(raw.full_span(), &mut scratch)
@@ -3173,6 +3368,46 @@ impl Broker {
             TargetList { target_infos: list },
             session,
         );
+    }
+
+    fn send_page_discovery_snapshot(&mut self, client: ClientId, targets: &LeasedRaw) {
+        #[derive(serde::Serialize)]
+        struct TargetCreated<'a> {
+            method: &'static str,
+            params: TargetCreatedParams<'a>,
+        }
+        #[derive(serde::Serialize)]
+        struct TargetCreatedParams<'a> {
+            #[serde(rename = "targetInfo")]
+            target_info: &'a RawValue,
+        }
+        let budget = self.upstream.handle.budget.clone();
+        let Some(mut infos) = targets.node().array(&mut budget.json_scratch()) else {
+            return;
+        };
+        loop {
+            let next = {
+                let mut scratch = budget.json_scratch();
+                infos
+                    .next(&mut scratch)
+                    .and_then(|info| info.map(|info| info.raw(&mut scratch)).transpose())
+            };
+            let Ok(Some(target_info)) = next else {
+                return;
+            };
+            let event = TargetCreated {
+                method: "Target.targetCreated",
+                params: TargetCreatedParams { target_info },
+            };
+            let Some((text, lease)) = crate::transport::serialize_payload(&budget, &event, false)
+            else {
+                self.disconnect_client(client, 1011, "Payload budget exhausted", true);
+                return;
+            };
+            if !self.enqueue(client, text, lease) {
+                return;
+            }
+        }
     }
 
     /// 拒绝跨 session attach 后收回上游 session；不登记 attachment，只等结算。
@@ -3368,23 +3603,21 @@ impl Broker {
             self.detached_event(value);
             return;
         }
-        if method == EventMethod::Discovery {
+        if method == EventMethod::Discovery && !value.destroyed {
             self.record_target_relation(&value);
         }
         if value.outer.is_none() && method == EventMethod::Discovery {
             let recipients = self
                 .clients
                 .iter()
-                .filter(|(_, state)| {
-                    state.discover
-                        && !state.closed
-                        && !state.retired
-                        && matches!(state.endpoint, Endpoint::Browser)
-                })
+                .filter(|(_, state)| state.discover && !state.closed && !state.retired)
                 .map(|(client, _)| *client)
                 .collect::<Vec<_>>();
             for client in recipients {
                 self.deliver_event(client, &value);
+            }
+            if value.destroyed {
+                self.record_target_relation(&value);
             }
             return;
         }
@@ -3405,6 +3638,9 @@ impl Broker {
         };
         if let Some(owner) = owner {
             self.deliver_event(owner, &value);
+        }
+        if method == EventMethod::Discovery && value.destroyed {
+            self.record_target_relation(&value);
         }
     }
 
@@ -4037,7 +4273,7 @@ impl Broker {
                 let result = targets_from(value, &self.upstream.handle.budget);
                 let _ = reply.send(result);
             }
-            PendingKind::TargetsForClient { page } => {
+            PendingKind::TargetsForClient { page, discovery } => {
                 if let Some(client) = pending.client {
                     self.send_page_targets(
                         client,
@@ -4045,6 +4281,7 @@ impl Broker {
                         &page,
                         pending.explicit_session.clone(),
                         value,
+                        discovery,
                     );
                 }
             }
@@ -5047,15 +5284,9 @@ fn scoped_target_infos(
         .node()
         .array(scratch)
         .ok_or(cdp_raw::RawError::Invalid)?;
-    let mut buffer = [0; 4096];
     let mut first = true;
     while let Some(info) = array.next(scratch)? {
-        let target = info
-            .field("targetId", scratch)
-            .map(|node| node.identity_text(&mut buffer, scratch))
-            .transpose()?
-            .flatten();
-        if !target.is_some_and(&owned) {
+        if !scoped_target_info(info, scratch, &owned)? {
             continue;
         }
         if !first {
@@ -5066,6 +5297,25 @@ fn scoped_target_infos(
     }
     text.push(']');
     LeasedRaw::new(text, lease)
+}
+
+fn scoped_target_info(
+    info: cdp_raw::RawNode<'_>,
+    scratch: &mut crate::transport::JsonScratchGuard<'_>,
+    owned: &impl Fn(&str) -> bool,
+) -> Result<bool, cdp_raw::RawError> {
+    let mut buffer = [0; 4096];
+    let [target, opener, opener_frame] =
+        info.unique_fields(["targetId", "openerId", "openerFrameId"], scratch)?;
+    let Some(target) = target else {
+        return Ok(false);
+    };
+    for id in [Some(target), opener, opener_frame].into_iter().flatten() {
+        if !id.identity_text(&mut buffer, scratch)?.is_some_and(owned) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn targets_from(value: &Received, budget: &PayloadBudget) -> Result<LeasedTargets, String> {

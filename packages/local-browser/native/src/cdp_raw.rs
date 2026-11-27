@@ -172,6 +172,26 @@ impl<'a> RawNode<'a> {
         })
     }
 
+    pub fn unique_fields<const N: usize>(
+        self,
+        names: [&str; N],
+        scratch: &mut JsonScratchGuard<'_>,
+    ) -> Result<[Option<Self>; N]> {
+        Ok(select_fields(
+            self.backing,
+            self.span,
+            names,
+            DuplicatePolicy::Reject,
+            scratch,
+        )?
+        .map(|field| {
+            field.span().map(|span| Self {
+                backing: self.backing,
+                span,
+            })
+        }))
+    }
+
     pub fn raw(self, scratch: &mut JsonScratchGuard<'_>) -> Result<&'a RawValue> {
         self.backing.raw(self.span, scratch)
     }
@@ -882,23 +902,29 @@ pub fn upstream_id(raw: &RawValue, _scratch: &mut JsonScratchGuard<'_>) -> Optio
 }
 
 /// 两遍同步输出：先计长再租用固定容量，callback 不得重入 JSON 扫描。
+#[derive(Clone, Copy)]
+pub enum EventSession {
+    Browser,
+    Page(Option<RawSpan>),
+}
+
 pub fn serialize_event(
     envelope: &RawEnvelope,
-    page: bool,
+    session: EventSession,
     budget: &PayloadBudget,
     scratch: &mut JsonScratchGuard<'_>,
 ) -> Result<(String, PayloadLease)> {
     fn emit(
         raw: &LeasedRaw,
-        page: bool,
+        session: EventSession,
         scratch: &mut JsonScratchGuard<'_>,
         out: &mut dyn Write,
     ) -> Result<()> {
-        if !page {
+        let EventSession::Page(explicit) = session else {
             return out
                 .write_all(raw.as_str().as_bytes())
                 .map_err(|_| RawError::Limit);
-        }
+        };
         out.write_all(b"{").map_err(|_| RawError::Limit)?;
         let mut first = true;
         visit_object(raw, raw.full_span(), scratch, |key, value, text| {
@@ -915,6 +941,15 @@ pub fn serialize_event(
             out.write_all(value.get().as_bytes())
                 .map_err(|_| RawError::Limit)
         })?;
+        if let Some(span) = explicit {
+            if !first {
+                out.write_all(b",").map_err(|_| RawError::Limit)?;
+            }
+            out.write_all(b"\"sessionId\":")
+                .map_err(|_| RawError::Limit)?;
+            out.write_all(raw.text(span)?.as_bytes())
+                .map_err(|_| RawError::Limit)?;
+        }
         out.write_all(b"}").map_err(|_| RawError::Limit)
     }
     struct Count(usize);
@@ -932,13 +967,13 @@ pub fn serialize_event(
         }
     }
     let mut count = Count(0);
-    emit(envelope.backing(), page, scratch, &mut count)?;
+    emit(envelope.backing(), session, scratch, &mut count)?;
     let lease = budget.try_acquire(count.0, false).ok_or(RawError::Budget)?;
     let mut writer = FixedWriter {
         bytes: Vec::with_capacity(count.0),
         limit: count.0,
     };
-    emit(envelope.backing(), page, scratch, &mut writer)?;
+    emit(envelope.backing(), session, scratch, &mut writer)?;
     Ok((
         String::from_utf8(writer.bytes).map_err(|_| RawError::Invalid)?,
         lease,
