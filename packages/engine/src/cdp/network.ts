@@ -10,6 +10,8 @@ import { entryToCdp, setCdpCookie, type CookieJar } from "../cookies.ts";
 import { jarForContextId, jarForTarget, localStorageForTarget } from "./target.ts";
 import { localStorageOrigin } from "../state/local-storage.ts";
 
+import { syncDocumentCookies } from "./document-cookies.ts";
+
 export async function handleNetwork(ctx: DispatchCtx, req: CdpRequest): Promise<unknown> {
   switch (req.method) {
     case "Network.enable":
@@ -73,13 +75,24 @@ export async function handleNetwork(ctx: DispatchCtx, req: CdpRequest): Promise<
 
     case "Network.setCookie": {
       const jar = jarForTarget(ctx, resolveNetworkTarget(ctx, req.sessionId));
-      return { success: setCdpCookie(jar, req.params) !== null };
+      const revision = jar.revision;
+      const success = setCdpCookie(jar, req.params) !== null;
+      if (jar.revision !== revision) await syncDocumentCookies(ctx.browser, jar);
+      return { success };
     }
 
-    case "Network.setCookies": {
-      const jar = jarForTarget(ctx, resolveNetworkTarget(ctx, req.sessionId));
+    case "Network.setCookies":
+    case "Storage.setCookies": {
+      const jar =
+        req.method === "Storage.setCookies"
+          ? jarForContextId(ctx, req.params?.browserContextId)
+          : jarForTarget(ctx, resolveNetworkTarget(ctx, req.sessionId));
       const list: unknown = req.params?.cookies;
-      if (Array.isArray(list)) for (const c of list) setCdpCookie(jar, c);
+      if (Array.isArray(list) && list.length > 0) {
+        const revision = jar.revision;
+        for (const c of list) setCdpCookie(jar, c);
+        if (jar.revision !== revision) await syncDocumentCookies(ctx.browser, jar);
+      }
       return {};
     }
 
@@ -87,18 +100,25 @@ export async function handleNetwork(ctx: DispatchCtx, req: CdpRequest): Promise<
       const p = req.params!;
       if (!p.name) return {};
       const jar = jarForTarget(ctx, resolveNetworkTarget(ctx, req.sessionId));
-      jar.remove({
+      const removed = jar.remove({
         name: p.name,
         url: p.url,
         domain: p.domain,
         path: p.path,
       });
+      if (removed > 0) await syncDocumentCookies(ctx.browser, jar);
       return {};
     }
 
-    case "Network.clearBrowserCookies": {
-      const jar = jarForTarget(ctx, resolveNetworkTarget(ctx, req.sessionId));
+    case "Network.clearBrowserCookies":
+    case "Storage.clearCookies": {
+      const jar =
+        req.method === "Storage.clearCookies"
+          ? jarForContextId(ctx, req.params?.browserContextId)
+          : jarForTarget(ctx, resolveNetworkTarget(ctx, req.sessionId));
+      const revision = jar.revision;
       jar.clear();
+      if (jar.revision !== revision) await syncDocumentCookies(ctx.browser, jar);
       return {};
     }
 
@@ -107,23 +127,11 @@ export async function handleNetwork(ctx: DispatchCtx, req: CdpRequest): Promise<
       return { cookies: sjar.getAll().map(entryToCdp) };
     }
 
-    case "Storage.setCookies": {
-      const sjar = jarForContextId(ctx, req.params?.browserContextId);
-      const list: unknown = req.params?.cookies;
-      if (Array.isArray(list)) for (const c of list) setCdpCookie(sjar, c);
-      return {};
-    }
-
-    case "Storage.clearCookies": {
-      jarForContextId(ctx, req.params?.browserContextId).clear();
-      return {};
-    }
-
     case "Storage.clearDataForOrigin": {
       const origin = req.params?.origin;
       const url = typeof origin === "string" ? parseUrl(origin) : null;
       if (!url) throw new Error(`${String(origin)} is not a valid URL`);
-      clearOriginData(ctx, req.sessionId, url, req.params?.storageTypes);
+      await clearOriginData(ctx, req.sessionId, url, req.params?.storageTypes);
       return {};
     }
 
@@ -133,7 +141,7 @@ export async function handleNetwork(ctx: DispatchCtx, req: CdpRequest): Promise<
       const partitioned = typeof key === "string" && key.includes("^");
       const url = typeof key === "string" ? parseUrl(key.split("^", 1)[0] ?? "") : null;
       if (!url) throw new Error("Invalid Storage Key given.");
-      clearOriginData(ctx, req.sessionId, partitioned ? null : url, req.params?.storageTypes);
+      await clearOriginData(ctx, req.sessionId, partitioned ? null : url, req.params?.storageTypes);
       return {};
     }
 
@@ -191,12 +199,12 @@ const STORAGE_TYPES = new Set([
 // Storage.clearDataFor*: the browser session clears the default context, a page or frame session
 // its own context. A null `url` validates the request and clears nothing. Open pages see a
 // localStorage clear from their next navigation on.
-function clearOriginData(
+async function clearOriginData(
   ctx: DispatchCtx,
   sessionId: string | undefined,
   url: URL | null,
   storageTypes: unknown,
-): void {
+): Promise<void> {
   const target = storageSessionTarget(ctx, sessionId);
   const types = new Set(
     typeof storageTypes === "string"
@@ -209,7 +217,12 @@ function clearOriginData(
   if (types.size === 0) throw new Error("No valid storage type specified");
   if (!url) return;
   const all = types.has("all");
-  if (all || types.has("cookies")) clearCookiesForHost(jarForTarget(ctx, target), url.hostname);
+  if (all || types.has("cookies")) {
+    const jar = jarForTarget(ctx, target);
+    const revision = jar.revision;
+    clearCookiesForHost(jar, url.hostname);
+    if (jar.revision !== revision) await syncDocumentCookies(ctx.browser, jar);
+  }
   const origin = localStorageOrigin(url.href);
   if (origin && (all || types.has("local_storage"))) {
     localStorageForTarget(ctx, target).apply(origin, [{ op: "clear" }]);
@@ -255,6 +268,7 @@ function resolveNetworkTarget(
   if (sessionId) {
     for (const t of ctx.browser.targets.values()) {
       if (t.sessions.has(sessionId)) return t;
+      for (const f of t.frames.values()) if (f.sessions.has(sessionId)) return t;
     }
   }
   for (const t of ctx.browser.targets.values()) {

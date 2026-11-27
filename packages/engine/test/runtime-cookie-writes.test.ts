@@ -24,8 +24,14 @@ function heldStub(stamp?: string) {
         resolve({ ok: true, type: "string", valueJson: '"x"', cookieWrites }),
       ),
     );
-  const stub = { evaluate: call, callFunctionOn: call, runScript: call, isolateStamp: stamp };
-  // oxlint-disable-next-line kitesurf/no-chained-type-assertions -- only the three eval methods are stubbed.
+  const stub = {
+    evaluate: call,
+    callFunctionOn: call,
+    runScript: call,
+    syncCookies: async () => ({ ok: true }),
+    isolateStamp: stamp,
+  };
+  // oxlint-disable-next-line kitesurf/no-chained-type-assertions -- only runtime methods are stubbed.
   return { stub: stub as unknown as PageScriptStub, held };
 }
 
@@ -151,6 +157,7 @@ describe("an out-of-process frame's reply cookie writes", () => {
     });
     frame.pageScript = child.stub;
     frame.pageScriptUrl = CHILD;
+    frame.pageScriptSandbox = frame.sandbox;
     frame.execContextId = 7;
     h.target.frames.set("C", frame);
     const req = oopifRequests[0]!;

@@ -24,6 +24,7 @@ import {
 } from "./target.ts";
 import { handlePage } from "./page.ts";
 import { handleRuntime } from "./runtime.ts";
+import { syncBrowserCookieViews } from "./document-cookies.ts";
 import { handleDom } from "./dom.ts";
 import { handleNetwork } from "./network.ts";
 import { handleLog } from "./log.ts";
@@ -102,6 +103,14 @@ export async function dispatch(ctx: DispatchCtx, req: CdpRequest): Promise<CdpRe
   ctx.browser.networkEvents.drain();
 
   try {
+    if (
+      req.method === "Runtime.evaluate" ||
+      req.method === "Runtime.callFunctionOn" ||
+      req.method === "Runtime.runScript"
+    ) {
+      const cookieSync = syncBrowserCookieViews(ctx.browser);
+      if (cookieSync) await cookieSync;
+    }
     if (req.method === "Browser.getVersion") {
       return {
         id: req.id,

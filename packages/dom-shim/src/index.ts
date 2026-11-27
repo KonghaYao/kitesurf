@@ -35,6 +35,7 @@ import { elementAttributes } from "./element/element.js";
 import {
   installInitialNamedGlobals,
   installNamedPropertiesObject,
+  applyLocalCookieWrite,
   installWindow,
 } from "./window.js";
 import {
@@ -922,6 +923,8 @@ const buildDocumentBody = function buildDocument(dom: DomHandle, opts: BuildDocu
     },
     setCookieString: (s: string) => {
       setCookieString(s);
+      // The engine snapshot cannot include writes this isolate has not sent yet.
+      for (const raw of cookieWrites) applyLocalCookieWrite(raw);
     },
     nodeFor: (id: number) => nodeFor(id),
     notifyImageResults: (nodeIds: Iterable<unknown> | null | undefined, ok: boolean) =>

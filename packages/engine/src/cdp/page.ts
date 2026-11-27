@@ -107,6 +107,7 @@ import {
   originOf,
 } from "./frames.ts";
 import { emitChildFrameAttachAndStart } from "./iframe-events.ts";
+import { harvestDocumentCookies } from "./document-cookies.ts";
 import {
   consoleEntryToCdpEvent,
   exceptionEntryToCdpEvent,
@@ -720,8 +721,9 @@ type InternalHistoryNavigateRequest = Omit<
 export async function handlePage(
   ctx: DispatchCtx,
   req: CdpRequest | InternalHistoryNavigateRequest,
+  explicitTarget?: TargetState,
 ): Promise<unknown> {
-  const target = resolveTarget(ctx, req.sessionId);
+  const target = explicitTarget ?? resolveTarget(ctx, req.sessionId);
 
   switch (req.method) {
     case "Page.enable":
@@ -850,6 +852,9 @@ export async function handlePage(
           throw new Error("Cannot navigate to invalid URL");
         }
       }
+      const initialDocument = explicitTarget
+        ? { url: target.url, loaderId: target.loaderId, frames: target.frames }
+        : null;
       // Abort the previous signal so its redirect walk and egress request can stop.
       target.pendingNavAbort?.abort();
       const navAbort = new AbortController();
@@ -870,6 +875,7 @@ export async function handlePage(
           url = parsedNavUrl.toString();
         }
         if (
+          !initialDocument &&
           ksParams?._kitesurfInternal !== true &&
           applyTtyNavParams(parsedNavUrl.searchParams, ctx.browser)
         ) {
@@ -897,7 +903,9 @@ export async function handlePage(
       ctx.browser.networkEvents.setTargetAttribution(
         target.frameId,
         loaderId,
-        targetSessionsNetwork(target, req.sessionId),
+        initialDocument
+          ? Array.from(target.sessions)
+          : targetSessionsNetwork(target, req.sessionId),
       );
       ctx.browser.networkEvents.dropStaleLoaderBodies(target.frameId);
 
@@ -947,10 +955,12 @@ export async function handlePage(
         }
       }
 
-      emitFrameStartedLoading(ctx, target, mainFrame(target), req.sessionId);
-
       let releaseNavigationGate: (() => void) | null = null;
+      // Document reads on a just-created target wait from the start of its
+      // initial request. Discovery, attach, and navigation commands stay live.
+      const releaseInitialNavigation = initialDocument ? beginNavigationGate(target) : null;
       try {
+        emitFrameStartedLoading(ctx, target, mainFrame(target), req.sessionId);
         const reqHeaders: Record<string, string> = {
           "user-agent":
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
@@ -1150,12 +1160,19 @@ export async function handlePage(
           clearPendingNavAbort(target, navAbort);
           return navigateReply(target.frameId, loaderId, "net::ERR_ABORTED");
         }
+        if (initialDocument && resp.body) {
+          // Closing the target or replacing its initial navigation must also
+          // cancel an in-progress body read and release its byte budget.
+          const body = resp.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>(), {
+            signal: navAbort.signal,
+          });
+          resp = new Response(body, resp);
+        }
         const finalUrl = currentUrl;
         target.url = finalUrl;
         target.docReferrerPolicy = resp.headers.get("referrer-policy");
         target.docCsp = resp.headers.get("content-security-policy");
         target.docCspReportOnly = resp.headers.get("content-security-policy-report-only");
-        recordNavigationHistory(target, finalUrl, navTransitionType);
 
         const setCookies = readSetCookieHeaders(resp);
         for (const sc of setCookies) {
@@ -1163,19 +1180,24 @@ export async function handlePage(
         }
 
         const ct = resp.headers.get("content-type") ?? "text/html";
+        const read = await (docKind === "html"
+          ? traceSpan(ctx.env.HOST_TRACER, "navigate.read_document_body", () =>
+              readCappedBytes(resp, MAX_DOCUMENT_BYTES, ctx.connectionId),
+            )
+          : readCappedBytes(resp, MAX_DOCUMENT_BYTES, ctx.connectionId));
+        if (!read.ok || navAbort.signal.aborted) {
+          const errorText =
+            !read.ok && !navAbort.signal.aborted
+              ? cappedErrorText(read.failure)
+              : "net::ERR_ABORTED";
+          ctx.browser.networkEvents.failRequest(requestId, errorText);
+          clearPendingNavAbort(target, navAbort);
+          return navigateReply(target.frameId, loaderId, errorText);
+        }
         let pageHtml: string;
         let docScan: DocScan;
         let networkBody: { body: string; length: number } | null = null;
         if (docKind === "html") {
-          const read = await traceSpan(ctx.env.HOST_TRACER, "navigate.read_document_body", () =>
-            readCappedBytes(resp, MAX_DOCUMENT_BYTES, ctx.connectionId),
-          );
-          if (!read.ok) {
-            const errorText = cappedErrorText(read.failure);
-            ctx.browser.networkEvents.failRequest(requestId, errorText);
-            clearPendingNavAbort(target, navAbort);
-            return navigateReply(target.frameId, loaderId, errorText);
-          }
           const buf = read.bytes;
           const decoded = decodeHtmlBytes(buf, ct);
           let html = decoded.html;
@@ -1196,13 +1218,6 @@ export async function handlePage(
           target.title = docScan.title;
           pageHtml = html;
         } else {
-          const read = await readCappedBytes(resp, MAX_DOCUMENT_BYTES, ctx.connectionId);
-          if (!read.ok) {
-            const errorText = cappedErrorText(read.failure);
-            ctx.browser.networkEvents.failRequest(requestId, errorText);
-            clearPendingNavAbort(target, navAbort);
-            return navigateReply(target.frameId, loaderId, errorText);
-          }
           let wrapper: string;
           if (docKind === "image") {
             const base64 = bytesToBase64(read.bytes);
@@ -1240,6 +1255,7 @@ export async function handlePage(
         // Drain Network completion before Page.frameNavigated for the main frame.
         ctx.browser.networkEvents.drain();
 
+        recordNavigationHistory(target, finalUrl, navTransitionType);
         releaseNavigationGate = beginNavigationGate(target);
         {
           const mf = mainFrame(target);
@@ -1296,11 +1312,13 @@ export async function handlePage(
           docScan,
           armedIframeGate,
         );
+        navAbort.signal.throwIfAborted();
         if (target.pageScript) {
           releaseTargetDom(target);
           releaseFallbackHtml(target);
         }
         await backfillIframeOwnerNodeIds(target);
+        navAbort.signal.throwIfAborted();
         emitFrameDclComplete(ctx, target, mainFrame(target), req.sessionId);
         scheduleLoadCompleteEmit(ctx, target, req.sessionId, armedIframeGate);
         emitExecutionContextCreated(ctx, target, req.sessionId);
@@ -1315,7 +1333,30 @@ export async function handlePage(
         const errorText = err instanceof Error ? err.message : String(err);
         return navigateReply(target.frameId, loaderId, errorText);
       } finally {
+        if (
+          initialDocument &&
+          !releaseNavigationGate &&
+          target.loaderId === loaderId &&
+          ctx.browser.targets.get(target.targetId) === target &&
+          !ctx.browser.wsClosing
+        ) {
+          target.url = initialDocument.url;
+          target.loaderId = initialDocument.loaderId;
+          target.frames = initialDocument.frames;
+          target.docReferrerPolicy = null;
+          target.docReferrer = null;
+          target.docCsp = null;
+          target.docCspReportOnly = null;
+          target.refetchOnPushState = false;
+          ctx.browser.networkEvents.setTargetAttribution(
+            target.frameId,
+            target.loaderId,
+            Array.from(target.sessions),
+          );
+        }
+        if (initialDocument) clearPendingNavAbort(target, navAbort);
         releaseNavigationGate?.();
+        releaseInitialNavigation?.();
       }
     }
 
@@ -2005,11 +2046,13 @@ async function pushNavigateToPageScriptInner(
         budget: ctx.browser.workerBudget,
       });
       for (const e of harvest?.console ?? []) consoleAcc.push(e);
-      if (retiringUrl) {
-        for (const raw of harvest?.cookieWrites ?? []) {
-          jarForTarget(ctx, target).setFromDocumentCookie(retiringUrl, raw);
-        }
-      }
+      const cookieSync = harvestDocumentCookies(
+        ctx.browser,
+        target,
+        retiringUrl,
+        harvest?.cookieWrites,
+      );
+      if (cookieSync) ctx.ctx.waitUntil(cookieSync);
     }
   } finally {
     target.wheelTeardownDepth -= 1;
@@ -2417,7 +2460,8 @@ async function pushNavigateToPageScriptInner(
   }
 
   try {
-    const initialCookies = jarForTarget(ctx, target).documentCookieString(url);
+    const cookieJar = jarForTarget(ctx, target);
+    const initialCookies = cookieJar.documentCookieString(url);
     const ps = pendingPageScript;
     const raNavStart = ctx.analytics.now();
     const summary = await traceSpan(ctx.env.HOST_TRACER, "init.pagescript_navigate", async (s) => {
@@ -2540,11 +2584,7 @@ async function pushNavigateToPageScriptInner(
     if (summary.console) {
       for (const e of summary.console) consoleAcc.push(e);
     }
-    if (summary.cookieWrites && summary.cookieWrites.length > 0) {
-      for (const raw of summary.cookieWrites) {
-        jarForTarget(ctx, target).setFromDocumentCookie(url, raw);
-      }
-    }
+    const peerCookies = harvestDocumentCookies(ctx.browser, target, url, summary.cookieWrites);
     const cdpMutations =
       summary.cdpMutations && summary.cdpMutations.length > 0 ? summary.cdpMutations : undefined;
 
@@ -2606,6 +2646,16 @@ async function pushNavigateToPageScriptInner(
         { budget: ctx.browser.workerBudget },
       )
     ) {
+      return { console: consoleAcc };
+    }
+    // Writes may have landed after the new document took its startup snapshot.
+    // Publish first so subsequent writes can reach this isolate while the update is in flight.
+    const currentCookies = cookieJar.documentCookieString(url);
+    if (currentCookies !== initialCookies || summary.cookieWrites?.length) {
+      await pendingPageScript.syncCookies(currentCookies).catch(() => {});
+    }
+    if (peerCookies) await peerCookies;
+    if (target.navigateGeneration !== generation || target.pageScript !== pendingPageScript) {
       return { console: consoleAcc };
     }
     ctx.browser.screencasts.get(target.targetId)?.wake?.();
@@ -3153,11 +3203,14 @@ function scheduleLoadCompleteEmit(
       target.diagSpans.closeAll("load-complete");
       target.diagSpans = null;
     }
-    if (summary.cookieWrites && summary.cookieWrites.length > 0 && urlAtSchedule) {
-      for (const raw of summary.cookieWrites) {
-        jarForTarget(ctx, target).setFromDocumentCookie(urlAtSchedule, raw);
-      }
-    }
+    const cookieSync = harvestDocumentCookies(
+      browser,
+      target,
+      urlAtSchedule,
+      summary.cookieWrites,
+      pageScript,
+    );
+    if (cookieSync) ctx.ctx.waitUntil(cookieSync);
     if (summary.console && summary.console.length > 0) {
       emitCapturedConsole(ctx, target, summary.console, sessionId);
     }
@@ -3201,12 +3254,14 @@ export function pumpBackgroundEvents(ctx: DispatchCtx, target: TargetState): voi
       if (ctx.browser.wsClosing) return;
       if (target.pageScript !== pageScript) return;
       // target.url already names the next document while a navigate fetches it.
-      const cookieUrl = target.pageScriptUrl;
-      if (summary.cookieWrites && summary.cookieWrites.length > 0 && cookieUrl) {
-        for (const raw of summary.cookieWrites) {
-          jarForTarget(ctx, target).setFromDocumentCookie(cookieUrl, raw);
-        }
-      }
+      const cookieSync = harvestDocumentCookies(
+        ctx.browser,
+        target,
+        target.pageScriptUrl,
+        summary.cookieWrites,
+        pageScript,
+      );
+      if (cookieSync) ctx.ctx.waitUntil(cookieSync);
       if (summary.console && summary.console.length > 0) {
         emitCapturedConsole(ctx, target, summary.console, undefined);
       }

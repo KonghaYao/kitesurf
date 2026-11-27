@@ -29,6 +29,7 @@ import { stopSceneStreams } from "./scene-stream.ts";
 import { DynamicWorkerBudget } from "../eval/worker-budget.ts";
 import { DedicatedWorkers } from "./dedicated-workers.ts";
 import { createCookieJar } from "../cookies.ts";
+import { syncBrowserCookieViews } from "./document-cookies.ts";
 import {
   NetworkEventTracker,
   registerTracker,
@@ -455,6 +456,8 @@ export class BrowserSession {
     if (!ctx || browser.targets.size === 0) return;
     browser.networkEvents.drain();
     drainInterception(this.id);
+    const cookieSync = syncBrowserCookieViews(browser);
+    if (cookieSync) ctx.ctx.waitUntil(cookieSync);
     for (const t of browser.targets.values()) {
       pumpBackgroundEvents(ctx, t);
     }

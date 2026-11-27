@@ -33,6 +33,7 @@ import { stopSceneStreams } from "./scene-stream.ts";
 import { cancelAndRemoveTargetWheelQueues, stopAndRemoveWheelQueue } from "./wheel-queue.ts";
 import { unregisterIsolateLimitListenersForTarget } from "../eval/limit-registry.ts";
 import { registerCookieJar, unregisterCookieJar, cookieKeyFor } from "./cookie-jar-registry.ts";
+import { handlePage } from "./page.ts";
 
 const BROWSER_TARGET_ID = "browser";
 
@@ -198,17 +199,55 @@ export async function handleTarget(ctx: DispatchCtx, req: CdpRequest): Promise<u
 
     case "Target.createTarget": {
       const url = req.params?.url ?? "about:blank";
+      const navigate = url !== "" && url !== "about:blank";
       const bctx = req.params?.browserContextId;
       if (bctx && !ctx.browser.contexts.has(bctx)) {
         throw new Error(`Failed to find browser context with id ${bctx}`);
       }
-      const target = createPageTarget(ctx, url, bctx || undefined);
+      if (navigate) {
+        try {
+          new URL(url);
+        } catch {
+          throw new Error("Cannot navigate to invalid URL");
+        }
+      }
+      const target = createPageTarget(ctx, "about:blank", bctx || undefined);
       ctx.emit({
         method: "Target.targetCreated",
         params: { targetInfo: targetInfo(ctx, target) },
       });
       if (ctx.client.autoAttach) {
         autoAttachTarget(ctx, target);
+      }
+      if (navigate) {
+        // The initial navigation belongs to the new target, not to an opener's
+        // session or to the first page selected by an unscoped Page command.
+        const navigationCtx: DispatchCtx = {
+          ...ctx,
+          emit: (event) => {
+            if (event.sessionId || event.method.startsWith("Target.")) ctx.emit(event);
+          },
+        };
+        const blankLoaderId = target.loaderId;
+        const navigation = handlePage(
+          navigationCtx,
+          { id: req.id, method: "Page.navigate", params: { url } },
+          target,
+        ).then((result) => {
+          const { loaderId, errorText } = result as Protocol.Page.NavigateResponse;
+          const restoredBlank = errorText !== undefined && target.loaderId === blankLoaderId;
+          if (
+            ctx.browser.targets.get(target.targetId) !== target ||
+            (loaderId !== target.loaderId && !restoredBlank)
+          ) {
+            return;
+          }
+          ctx.emit({
+            method: "Target.targetInfoChanged",
+            params: { targetInfo: targetInfo(ctx, target) },
+          });
+        });
+        ctx.ctx.waitUntil(navigation);
       }
       return { targetId: target.targetId };
     }

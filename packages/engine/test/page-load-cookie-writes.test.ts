@@ -74,12 +74,14 @@ function fakePageScript() {
     markUnloadStarted = r;
   });
   const hooks: { onNavigate?: () => void } = {};
+  const syncCookies = vi.fn(async (_cookies: string) => ({ ok: true as const }));
   const stub = {
     navigate: async () => {
       hooks.onNavigate?.();
       return {};
     },
     awaitLoad: () => load.promise,
+    syncCookies,
     unload: async () => {
       markUnloadStarted();
       return unload.promise;
@@ -88,8 +90,15 @@ function fakePageScript() {
     killIsolate: () => {},
     queryDom: async () => ({ pumped: -1 }),
   };
-  // oxlint-disable-next-line kitesurf/no-chained-type-assertions -- only the RPC verbs this path calls.
-  return { stub: stub as unknown as PageScriptStub, load, unload, unloadStarted, hooks };
+  return {
+    // oxlint-disable-next-line kitesurf/no-chained-type-assertions -- only the RPC verbs this path calls.
+    stub: stub as unknown as PageScriptStub,
+    load,
+    unload,
+    unloadStarted,
+    hooks,
+    syncCookies,
+  };
 }
 
 function setup() {
@@ -180,6 +189,7 @@ describe("a load summary stays with its answering document", () => {
     await Promise.all(h.background);
 
     expect(h.documentCookies()).toEqual({ first: "a=1", next: "" });
+    expect(a.syncCookies).toHaveBeenCalledWith("a=1");
   });
 });
 

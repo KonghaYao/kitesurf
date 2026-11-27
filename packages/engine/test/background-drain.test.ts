@@ -18,6 +18,7 @@ function setup(cookieWrites: string[]) {
   // oxlint-disable-next-line kitesurf/no-chained-type-assertions -- only the drain method is stubbed.
   const stub = {
     drainConsole: async () => ({ console: [], cookieWrites }),
+    syncCookies: async () => ({ ok: true }),
   } as unknown as PageScriptStub;
   const target = {
     type: "page",
@@ -27,12 +28,13 @@ function setup(cookieWrites: string[]) {
     url: FIRST,
     pageScriptUrl: FIRST,
     pageScript: stub,
+    frames: new Map(),
     domEnabledSessions: new Set(["S"]),
   } as TargetState;
   const cookies = createCookieJar();
   // oxlint-disable-next-line kitesurf/no-chained-type-assertions -- only the fields the drain reads are set.
   const ctx = {
-    browser: { wsClosing: false, cookies, contexts: new Map() },
+    browser: { wsClosing: false, cookies, contexts: new Map(), targets: new Map([["T", target]]) },
     ctx: { waitUntil: (p: Promise<unknown>) => background.push(p) },
     emit: () => {},
     client: testClient(),

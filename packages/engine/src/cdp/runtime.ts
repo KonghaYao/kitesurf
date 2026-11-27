@@ -17,7 +17,7 @@ import { emitScriptParsed, hasDebuggerListeners, makeCompiledScriptMeta } from "
 import { emitMutations } from "./dom.ts";
 import { retryableContextDestroyed } from "./errors.ts";
 import { sessionOf } from "./page-session.ts";
-import { jarForTarget } from "./target.ts";
+import { harvestDocumentCookies } from "./document-cookies.ts";
 import { emitFrameDclComplete, emitFrameLoadComplete } from "./page.ts";
 import { traceSpan } from "../tracing.ts";
 import type { Protocol } from "devtools-protocol";
@@ -362,7 +362,13 @@ export async function handleRuntime(ctx: DispatchCtx, req: CdpRequest): Promise<
         if (!oopifStub) {
           replayReopenedLifecycle(ctx, target, result, req.sessionId);
         }
-        applyCookieWrites(ctx, target, result.cookieWrites, ps, oopifStub ? oopifFrame : null);
+        await applyCookieWrites(
+          ctx,
+          target,
+          result.cookieWrites,
+          ps,
+          oopifStub ? oopifFrame : null,
+        );
         if (!oopifStub && target) {
           emitMutations(ctx, target, result.cdpMutations);
         }
@@ -452,10 +458,11 @@ export async function handleRuntime(ctx: DispatchCtx, req: CdpRequest): Promise<
         if (!childFrame) {
           replayReopenedLifecycle(ctx, target, result, req.sessionId);
         }
-        applyCookieWrites(ctx, target, result.cookieWrites, ps, childFrame);
+        const cookieSync = applyCookieWrites(ctx, target, result.cookieWrites, ps, childFrame);
         if (!childFrame && target) {
           emitMutations(ctx, target, result.cdpMutations);
         }
+        if (cookieSync) await cookieSync;
         return pageScriptResultToCdp(result, returnByValue);
       } catch (err) {
         throwIfContextDestroyed(childFrame || target, ps, target);
@@ -612,8 +619,9 @@ export async function handleRuntime(ctx: DispatchCtx, req: CdpRequest): Promise<
         });
         emitCapturedConsole(ctx, result.console, req.sessionId);
         if (!childFrame) replayReopenedLifecycle(ctx, target, result, req.sessionId);
-        applyCookieWrites(ctx, target, result.cookieWrites, ps, childFrame);
+        const cookieSync = applyCookieWrites(ctx, target, result.cookieWrites, ps, childFrame);
         if (!childFrame && target) emitMutations(ctx, target, result.cdpMutations);
+        if (cookieSync) await cookieSync;
         return pageScriptResultToCdp(result, returnByValue);
       } catch (err) {
         return loaderFailureResponse(err);
@@ -640,15 +648,12 @@ function applyCookieWrites(
   cookieWrites: string[] | undefined,
   ps: PageScriptStub,
   oopifFrame: FrameState | null,
-): void {
-  if (!target || !cookieWrites || cookieWrites.length === 0) return;
+): Promise<unknown> | undefined {
+  if (!target || !cookieWrites?.length) return;
+  if (oopifFrame && !oopifFrame.pageScriptSandbox?.sameOrigin) return;
   if ((oopifFrame ?? target).pageScript !== ps) return;
   const url = oopifFrame ? oopifFrame.pageScriptUrl : target.pageScriptUrl;
-  if (!url) return;
-  const jar = jarForTarget(ctx, target);
-  for (const raw of cookieWrites) {
-    jar.setFromDocumentCookie(url, raw);
-  }
+  return harvestDocumentCookies(ctx.browser, target, url, cookieWrites, ps);
 }
 
 function emitCapturedConsole(

@@ -12,6 +12,7 @@ function makeTarget(over: Partial<TargetState> = {}): TargetState {
   return {
     type: "page",
     sessions: new Set<string>(),
+    frames: new Map(),
     extraHttpHeaders: {},
     userAgentOverride: "",
     ...over,

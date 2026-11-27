@@ -142,6 +142,105 @@ async function rawSession() {
   return { ws, events, send, newPage };
 }
 
+test("Target.createTarget stays attachable while its initial document request is paused", async () => {
+  const { ws, events, send, newPage } = await rawSession();
+  try {
+    const opener = await newPage();
+    const url = "https://ks.invalid/initial-target-document";
+    let onPaused: (requestId: string) => void;
+    const nextPaused = () =>
+      new Promise<string>((resolve) => {
+        onPaused = resolve;
+      });
+    ws.addEventListener("message", ({ data }) => {
+      const text = typeof data === "string" ? data : new TextDecoder().decode(data);
+      const event = JSON.parse(text) as CdpMessage;
+      if (event.method === "Fetch.requestPaused" && typeof event.params?.requestId === "string") {
+        onPaused(event.params.requestId);
+      }
+    });
+    expect(
+      await send("Fetch.enable", { patterns: [{ urlPattern: url, resourceType: "Document" }] }),
+    ).toMatchObject({ result: {} });
+    const before = await send("Target.getTargets");
+    const paused = nextPaused();
+    const created = await send("Target.createTarget", { url });
+    expect(created).toMatchObject({ result: { targetId: expect.any(String) } });
+    const targetId = created.result!.targetId as string;
+    const requestId = await paused;
+    expect((await send("Target.getTargets")).result?.targetInfos).toContainEqual(
+      expect.objectContaining({ targetId }),
+    );
+    const attached = await send("Target.attachToTarget", { targetId, flatten: true });
+    expect(attached).toMatchObject({ result: { sessionId: expect.any(String) } });
+    const sessionId = attached.result!.sessionId as string;
+    expect(
+      await send(
+        "Runtime.evaluate",
+        { expression: "location.href", returnByValue: true },
+        opener.sessionId,
+      ),
+    ).toMatchObject({ result: { result: { value: "about:blank" } } });
+    await send("Runtime.enable", {}, sessionId);
+
+    const evaluation = send(
+      "Runtime.evaluate",
+      {
+        expression: "[document.title, document.querySelector('#passenger')?.value, history.length]",
+        returnByValue: true,
+      },
+      sessionId,
+    );
+    expect(
+      await send("Fetch.fulfillRequest", {
+        requestId,
+        responseCode: 200,
+        responseHeaders: [{ name: "content-type", value: "text/html" }],
+        body: btoa('<title>Initial target</title><input id="passenger" value="ready">'),
+      }),
+    ).toMatchObject({ result: {} });
+    expect(await evaluation).toMatchObject({
+      result: { result: { value: ["Initial target", "ready", 1] } },
+    });
+    expect(events.filter((event) => event.method === "Page.frameNavigated")).toEqual([
+      expect.objectContaining({
+        sessionId,
+        params: { frame: expect.objectContaining({ url }), type: "Navigation" },
+      }),
+    ]);
+
+    const invalid = await send("Target.createTarget", { url: "not a URL" });
+    expect(invalid.error?.message).toContain("Cannot navigate to invalid URL");
+    expect((await send("Target.getTargets")).result?.targetInfos).toHaveLength(
+      (before.result?.targetInfos as unknown[]).length + 1,
+    );
+
+    const secondPause = nextPaused();
+    const second = await send("Target.createTarget", { url });
+    const secondTargetId = second.result!.targetId as string;
+    const secondAttachment = await send("Target.attachToTarget", {
+      targetId: secondTargetId,
+      flatten: true,
+    });
+    const secondSessionId = secondAttachment.result!.sessionId as string;
+    const secondRequestId = await secondPause;
+    const replacementUrl = "data:text/html,<title>Replacement</title>";
+    expect(await send("Page.navigate", { url: replacementUrl }, secondSessionId)).toMatchObject({
+      result: { frameId: secondTargetId, loaderId: expect.any(String) },
+    });
+    await send("Fetch.failRequest", { requestId: secondRequestId, errorReason: "Aborted" });
+    expect(
+      await send(
+        "Runtime.evaluate",
+        { expression: "document.title", returnByValue: true },
+        secondSessionId,
+      ),
+    ).toMatchObject({ result: { result: { value: "Replacement" } } });
+  } finally {
+    ws.close();
+  }
+}, 120_000);
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 test("closeTarget during the navigate window: the waiting eval never answers and leaks no isolate", async () => {

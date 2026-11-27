@@ -31,6 +31,7 @@ export interface RequestContext {
 }
 
 export interface CookieJar {
+  readonly revision: number;
   /** Returns cookies matching the URL and optional SameSite request context. */
   getForUrl(urlStr: string, ctx?: RequestContext): CookieEntry[];
   cookieHeaderForUrl(urlStr: string, ctx?: RequestContext): string | null;
@@ -58,6 +59,12 @@ export function createCookieJar(
   }
 
   let warned = false;
+  let revision = 0;
+  function didChange(): void {
+    revision++;
+    changed();
+  }
+
   function warnOnce(msg: string): void {
     if (warned) return;
     warned = true;
@@ -100,7 +107,17 @@ export function createCookieJar(
       (c) => c.name === entry.name && c.path === entry.path && c.hostOnly === entry.hostOnly,
     );
     if (idx >= 0) {
-      entry.createdAt = list[idx]!.createdAt;
+      const previous = list[idx]!;
+      if (
+        previous.value === entry.value &&
+        previous.secure === entry.secure &&
+        previous.httpOnly === entry.httpOnly &&
+        previous.sameSite === entry.sameSite &&
+        previous.expiresAt === entry.expiresAt
+      ) {
+        return previous;
+      }
+      entry.createdAt = previous.createdAt;
       list[idx] = entry;
     } else {
       if (totalEntries() >= MAX_COOKIES_TOTAL) {
@@ -120,7 +137,7 @@ export function createCookieJar(
       list.push(entry);
     }
     byHost.set(entry.host, list);
-    changed();
+    didChange();
     return entry;
   }
 
@@ -493,16 +510,20 @@ export function createCookieJar(
         else byHost.set(h, kept);
       }
     }
-    if (removed) changed();
+    if (removed) didChange();
     return removed;
   }
 
   function clear(): void {
+    if (byHost.size === 0) return;
     byHost.clear();
-    changed();
+    didChange();
   }
 
   return {
+    get revision() {
+      return revision;
+    },
     getForUrl,
     cookieHeaderForUrl,
     setFromHeader,
